@@ -810,6 +810,20 @@ Creates the following files:
 
 Errors if `.sandcastle/` already exists to prevent overwriting customizations.
 
+### `sandcastle run`
+
+Runs the full issue workflow for one GitHub Issue — the normal entry point after `init` (usually via `npm run sandcastle`). It requires the `github-issues` issue tracker, an installed and authenticated `gh` CLI, and the `Sandcastle` label on the repository — all checked up front, before any agent work.
+
+Interactively, `run` lists open issues labeled `Sandcastle` and lets you pick exactly one. Non-interactively (CI, scripts), `--issue <number>` selects the issue deterministically; without a TTY and without the flag it fails fast.
+
+For the selected issue, Sandcastle then owns the whole sequence (ADR 0023/0024): the configured agent implements it on a dedicated `sandcastle/issue-<number>` branch in its own worktree — the agent never sees issue-closing instructions — the configured verification commands run in that worktree, the result is merged in a separate integration worktree based on the target branch's current tip, verification runs again on the integrated tree, and the target branch is updated only after integrated verification passes and a freshness check confirms the target hasn't moved (fast-forward when it's your current checkout, atomic compare-and-swap otherwise — never a force-update).
+
+Only after landing does Sandcastle post a Vietnamese completion report (outcome, landed commits and change summary, executed verification, cautions) and then close the issue. On any pre-landing failure it posts a Vietnamese failure report instead, keeps the issue open, preserves the source branch and worktree under `.sandcastle/` for recovery, and never leaves your active checkout conflicted.
+
+| Option    | Required | Default                  | Description                                               |
+| --------- | -------- | ------------------------ | --------------------------------------------------------- |
+| `--issue` | No       | Interactive issue picker | GitHub issue number to implement — skips the issue picker |
+
 ### `sandcastle docker build-image`
 
 Rebuilds the Docker image from an existing `.sandcastle/` directory. Use this after modifying the Dockerfile. On Linux/macOS, the build automatically passes `--build-arg AGENT_UID=$(id -u)` and `AGENT_GID=$(id -g)` so the image's `agent` user matches the host UID — this prevents permission errors on image-built files without runtime chown.

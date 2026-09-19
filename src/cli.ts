@@ -43,6 +43,8 @@ import {
   INIT_STOPPED_MESSAGE,
 } from "./discoveryPicker.js";
 import { probeGhReadiness, createSandcastleLabel } from "./githubSetup.js";
+import { runIssueWorkflow } from "./WorkflowRun.js";
+import type { GithubIssue } from "./githubIssues.js";
 import type { ModelSource, VerificationStatus } from "./ProjectSettings.js";
 import { ConfigDirError, InitError } from "./errors.js";
 import { VERSION } from "./version.js";
@@ -1165,6 +1167,76 @@ const podmanCommand = Command.make("podman", {}, () =>
   Command.withSubcommands([podmanBuildImageCommand, podmanRemoveImageCommand]),
 );
 
+// --- Run command ---
+
+/**
+ * `sandcastle run` — implement one GitHub Issue end to end (ADR 0023/0024/0026).
+ *
+ * `--issue <number>` selects deterministically (non-interactive/CI). Without
+ * it, a TTY picker lists open `Sandcastle`-labeled issues. The workflow
+ * itself lives in `WorkflowRun.ts`; this handler only bridges the clack
+ * picker and Display service into the service's callbacks, then maps the
+ * structured result onto exit status.
+ */
+const runIssueOption = Options.integer("issue").pipe(
+  Options.withDescription(
+    "GitHub issue number to implement — skips the issue picker",
+  ),
+  Options.optional,
+);
+
+const runCommand = Command.make("run", { issue: runIssueOption }, ({ issue }) =>
+  Effect.gen(function* () {
+    const d = yield* Display;
+    const cwd = process.cwd();
+    const isInteractive = process.stdin.isTTY === true;
+
+    const result = yield* Effect.tryPromise({
+      try: () =>
+        runIssueWorkflow({
+          cwd,
+          issueNumber: issue._tag === "Some" ? issue.value : undefined,
+          // The picker seam is only wired when a TTY exists — without it the
+          // service requires --issue (or reports no eligible issues).
+          ...(isInteractive
+            ? {
+                selectIssue: async (issues: readonly GithubIssue[]) => {
+                  const picked = await clack.select<number>({
+                    message: "Chọn issue để Sandcastle thực hiện:",
+                    options: issues.map((i) => ({
+                      value: i.number,
+                      label: `#${i.number} ${i.title}`,
+                    })),
+                  });
+                  return clack.isCancel(picked) ? undefined : picked;
+                },
+              }
+            : {}),
+          onStatus: (message, severity) => {
+            Effect.runSync(d.status(message, severity));
+          },
+        }),
+      catch: (e) =>
+        new InitError({
+          message: e instanceof Error ? e.message : String(e),
+        }),
+    });
+
+    switch (result.outcome) {
+      case "landed":
+        yield* d.status(result.message, "success");
+        break;
+      case "no-issues":
+        yield* d.status(result.message, "info");
+        break;
+      case "failed":
+        // The failure report was already posted to the issue; the process
+        // exits non-zero so scripts/CI observe the failed run.
+        return yield* Effect.fail(new InitError({ message: result.message }));
+    }
+  }),
+);
+
 // --- Root command ---
 
 const rootCommand = Command.make("sandcastle", {}, () =>
@@ -1176,7 +1248,12 @@ const rootCommand = Command.make("sandcastle", {}, () =>
 );
 
 export const sandcastle = rootCommand.pipe(
-  Command.withSubcommands([initCommand, dockerCommand, podmanCommand]),
+  Command.withSubcommands([
+    initCommand,
+    runCommand,
+    dockerCommand,
+    podmanCommand,
+  ]),
 );
 
 export const cli = Command.run(sandcastle, {
