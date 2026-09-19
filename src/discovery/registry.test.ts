@@ -75,6 +75,15 @@ const READY_EXEC = async (
       });
     return ok(out.join("\n"));
   }
+  if (key === "agy --version") return ok("1.2.7\n");
+  if (key === "agy --help") {
+    return ok(
+      "Usage of agy:\n  --input-format   Input format for print mode\n  mic-serve      Serve this machine's microphone\n",
+    );
+  }
+  if (key === "agy models") {
+    return ok("gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n");
+  }
   return { stdout: "", stderr: "unknown", exitCode: 1 };
 };
 
@@ -86,6 +95,15 @@ describe("discovery registry", () => {
     expect(codex?.executable).toBe("codex");
     expect(codex?.installGuidance).toContain("npm install -g");
     expect(codex?.loginGuidance).toContain("codex login");
+  });
+
+  it("registers the Antigravity adapter", () => {
+    const adapters = listDiscoveryAdapters();
+    expect(adapters.map((a) => a.agent)).toContain("antigravity");
+    const agy = getDiscoveryAdapter("antigravity");
+    expect(agy?.executable).toBe("agy");
+    expect(agy?.installGuidance).toContain("antigravity.google/cli/install.sh");
+    expect(agy?.loginGuidance).toContain("`agy`");
   });
 
   it("returns undefined for agents without an adapter", async () => {
@@ -105,6 +123,10 @@ describe("discovery registry", () => {
     const reports = await discoverAgents(READY_EXEC);
     expect(reports).toHaveLength(listDiscoveryAdapters().length);
     expect(reports[0]?.agent).toBe("codex");
+    expect(reports.map((r) => r.agent)).toContain("antigravity");
+    expect(
+      reports.find((r) => r.agent === "antigravity")?.state,
+    ).toBe("ready");
   });
 
   it("converts a throwing boundary into an error report instead of rejecting", async () => {

@@ -3,6 +3,7 @@ import type {
   AgentDiscoveryReport,
   DiscoveryExec,
 } from "./contract.js";
+import { antigravityDiscoveryAdapter } from "./antigravity.js";
 import { codexDiscoveryAdapter } from "./codex.js";
 import { nodeDiscoveryExec } from "./nodeExec.js";
 
@@ -17,6 +18,7 @@ import { nodeDiscoveryExec } from "./nodeExec.js";
  */
 const DISCOVERY_ADAPTERS: readonly AgentDiscoveryAdapter[] = [
   codexDiscoveryAdapter,
+  antigravityDiscoveryAdapter,
 ];
 
 /** All registered discovery adapters, in display order. */

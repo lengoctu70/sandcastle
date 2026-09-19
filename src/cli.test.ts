@@ -667,4 +667,164 @@ if (key === "--version") {
       expect(await readdir(hostDir)).not.toContain(".sandcastle");
     }
   });
+
+  // ---------------------------------------------------------------------
+  // Host-mode discovery for `--agent antigravity`: a fake `agy` executable
+  // answers --version / --help / models like the real CLI. No real binary or
+  // subscription is ever touched.
+  // ---------------------------------------------------------------------
+
+  const AGY_HELP = `Usage of agy:
+  --dangerously-skip-permissions  Auto-approve all tool permission requests
+  --effort                        Reasoning effort (low|medium|high)
+  --input-format                  Input format for print mode (text, stream-json)
+  --model                         Model for the current CLI session
+  --prompt-interactive            Run an initial prompt interactively
+
+Available subcommands:
+  mic-serve       Serve this machine's microphone
+  models          List available models
+`;
+
+  const AGY_CATALOG = `Fetching available models...
+gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+gemini-3.8-flash-medium	Gemini 3.8 Flash (Medium)
+claude-sonnet-4-6	Claude Sonnet 4.6 (Thinking)
+`;
+
+  /**
+   * Write a fake `agy` executable (a node script) into `dir`. `auth` toggles
+   * `agy models` between the TSV catalog and the real sign-in notice.
+   */
+  const writeFakeAgy = async (dir: string, auth: boolean) => {
+    const shim = join(dir, "agy");
+    const modelsBranch = auth
+      ? `console.log(${JSON.stringify(AGY_CATALOG)}); process.exit(0);`
+      : `console.log("Please sign in to view available models. Launch the CLI without arguments to sign in."); process.exit(0);`;
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const key = process.argv.slice(2).join(" ");
+if (key === "--version") {
+  console.log("1.2.7");
+  process.exit(0);
+} else if (key === "--help") {
+  console.log(${JSON.stringify(AGY_HELP)});
+  process.exit(0);
+} else if (key === "models") {
+  ${modelsBranch}
+} else {
+  process.exit(1);
+}
+`,
+    );
+    await chmod(shim, 0o755);
+    return shim;
+  };
+
+  it("init --sandbox host --agent antigravity discovers and persists the recommended model and effort", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-agy-"));
+    await writeFakeAgy(shimDir, true);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent antigravity --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Cảnh báo chế độ host");
+    expect(stdout).toContain("Khởi tạo xong");
+
+    // Discovered defaults: the catalog's first model + its slug-encoded effort.
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "antigravity",
+      model: "gemini-3.8-flash-high",
+      effort: "high",
+      modelSource: "discovered",
+      sandbox: "host",
+    });
+
+    // Generated main calls the antigravity factory with the discovered effort.
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain(
+      'antigravity("gemini-3.8-flash-high", { effort: "high" })',
+    );
+    expect(main).toContain("sandboxes/no-sandbox");
+    expect(main).toContain("noSandbox()");
+  });
+
+  it("init --sandbox host --agent antigravity rejects an effort the model does not support", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-agy-"));
+    await writeFakeAgy(shimDir, true);
+
+    try {
+      // claude-sonnet-4-6 exposes no effort choices — like the real CLI, which
+      // rejects --effort for this model outright.
+      await execAsync(
+        `node ${cliPath} init --agent antigravity --model claude-sonnet-4-6 --effort high --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain('"high"');
+      expect(output).toContain("không được model");
+    }
+  });
+
+  it("init --sandbox host --agent antigravity fails with login guidance when unauthenticated", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-agy-"));
+    await writeFakeAgy(shimDir, false);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent antigravity --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("Chạy `agy`");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  it("init --sandbox host --agent antigravity fails with install guidance when agy is not on PATH", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const bareShimDir = await mkdtemp(join(tmpdir(), "empty-path-"));
+    const barePath = `${bareShimDir}:${dirname(process.execPath)}`;
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent antigravity --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: barePath } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("Chưa tìm thấy Antigravity CLI");
+      expect(output).toContain("antigravity.google/cli/install.sh");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
 });

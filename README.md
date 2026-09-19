@@ -712,7 +712,7 @@ console.log(result.output.score); // typed as number
 
 When extraction or validation fails, `run()` throws a `StructuredOutputError`. Alongside `tag`, `rawMatched`, `cause`, `commits`, `branch`, and `preservedWorktreePath`, the error carries the `sessionId` (and `sessionFilePath`, when the session was captured) of the run that produced the bad output.
 
-Pass `maxRetries` to have Sandcastle handle the retry loop for you. Each retry resumes the same agent session and feeds back a token-efficient description of the error, so the agent can re-emit a corrected tag without redoing the work. Retries require an agent provider that supports session resumption (`claudeCode`, `codex`, `pi`) — calling `run()` with `maxRetries > 0` against a non-resumable provider (`cursor`, `opencode`, `copilot`) throws immediately.
+Pass `maxRetries` to have Sandcastle handle the retry loop for you. Each retry resumes the same agent session and feeds back a token-efficient description of the error, so the agent can re-emit a corrected tag without redoing the work. Retries require an agent provider that supports session resumption (`claudeCode`, `codex`, `pi`) — calling `run()` with `maxRetries > 0` against a non-resumable provider (`cursor`, `opencode`, `copilot`, `antigravity`) throws immediately.
 
 ```ts
 const result = await run({
@@ -767,7 +767,7 @@ Select a template during `sandcastle init` when prompted, or re-run init in a fr
 
 Scaffolds the `.sandcastle/` config directory and builds the container image. This is the first command you run in a new repo. You choose a sandbox provider (Host, Docker, or Podman) during init — selecting Podman writes a `Containerfile` instead of `Dockerfile` and uses `sandcastle podman build-image` for the build step. Selecting **Host** runs the agent directly on your machine via `noSandbox()` — it reuses your agent CLI's existing login (no API key to copy), writes no Dockerfile/Containerfile, builds no image, and pins `branchStrategy: { type: "merge-to-head" }` so the agent works in a separate git worktree. In the parallel planner templates every concurrent implementer instead gets its own explicit `{ type: "branch" }` branch and host worktree, with review sharing the implementation's worktree and no container-only setup generated. A worktree is **not** OS isolation — the agent keeps your user privileges, so choose Docker or Podman when you need a real security boundary.
 
-In host mode, init also _discovers_ agents that support it (currently Codex): it verifies the executable on `PATH` is the real CLI, checks you're logged in, and reads the live model catalog so you pick a model and reasoning effort that actually exist — the choice is persisted to `settings.json` and generated into `main.mts`. If discovery fails, init tells you what to fix (install or log in) instead of guessing.
+In host mode, init also _discovers_ agents that support it (currently Codex and Antigravity): it verifies the executable on `PATH` is the real CLI, checks you're logged in, and reads the live model catalog so you pick a model and reasoning effort that actually exist — the choice is persisted to `settings.json` and generated into `main.mts`. If discovery fails, init tells you what to fix (install or log in) instead of guessing.
 
 Init detects your host package manager (npm, pnpm, yarn, or bun) from a `packageManager` field or lockfile, defaulting to npm. Templates whose `main` file imports a host dependency — the planner templates import [Zod](https://zod.dev) for their `<plan>` output schema — prompt you to install it with that package manager when it isn't already in your `package.json`, so the first `npx tsx .sandcastle/main.ts` doesn't fail with `ERR_MODULE_NOT_FOUND`.
 
@@ -776,7 +776,7 @@ Every interactive prompt has a paired `--flag` so the entire init can run non-in
 | Option                    | Required | Default                      | Description                                                                                                                                 |
 | ------------------------- | -------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--image-name`            | No       | `sandcastle:<repo-dir-name>` | Docker image name                                                                                                                           |
-| `--agent`                 | No       | Interactive prompt           | Agent to use (`claude-code`, `pi`, `codex`, `cursor`, `opencode`, `copilot`)                                                                |
+| `--agent`                 | No       | Interactive prompt           | Agent to use (`claude-code`, `pi`, `codex`, `cursor`, `opencode`, `copilot`, `antigravity`)                                                 |
 | `--model`                 | No       | Agent's default model        | Model to use (e.g. `claude-sonnet-4-6`). Defaults to agent's default                                                                        |
 | `--effort`                | No       | Model's default effort       | Reasoning effort (e.g. `low`, `medium`, `high`). With `--sandbox host` and a discoverable agent, validated against the model's live catalog |
 | `--sandbox`               | No       | Interactive prompt           | Sandbox provider to use (`host`, `docker`, `podman`)                                                                                        |
@@ -836,7 +836,7 @@ Removes the Podman image.
 
 | Option                     | Type               | Default                       | Description                                                                                                                                                                                                                  |
 | -------------------------- | ------------------ | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `agent`                    | AgentProvider      | —                             | **Required.** Agent provider (e.g. `claudeCode("claude-opus-4-8")`, `pi("claude-sonnet-4-6")`, `codex("gpt-5.4")`, `cursor("composer-2")`, `opencode("opencode/big-pickle")`, `copilot("claude-sonnet-4.5")`)                |
+| `agent`                    | AgentProvider      | —                             | **Required.** Agent provider (e.g. `claudeCode("claude-opus-4-8")`, `pi("claude-sonnet-4-6")`, `codex("gpt-5.4")`, `cursor("composer-2")`, `opencode("opencode/big-pickle")`, `copilot("claude-sonnet-4.5")`, `antigravity("gemini-3.8-flash-high")`) |
 | `sandbox`                  | SandboxProvider    | —                             | **Required.** Sandbox provider (e.g. `docker()`, `podman()`, `docker({ imageName: "sandcastle:local" })`)                                                                                                                    |
 | `cwd`                      | string             | `process.cwd()`               | Host repo directory — anchor for `.sandcastle/` artifacts and git operations. Relative paths resolve against `process.cwd()`.                                                                                                |
 | `prompt`                   | string             | —                             | Inline prompt (mutually exclusive with `promptFile`)                                                                                                                                                                         |
@@ -999,6 +999,21 @@ agent: pi("claude-sonnet-4-6", { thinking: "high" });
 | `thinking`        | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` | —       | Pi reasoning effort level via the `--thinking` flag      |
 | `env`             | `Record<string, string>`                                                 | `{}`    | Environment variables injected by this agent provider    |
 | `captureSessions` | `boolean`                                                                | `true`  | Capture pi session JSONL to host for `pi --session <id>` |
+
+### `AntigravityOptions`
+
+The `antigravity()` factory drives the Google Antigravity CLI (`agy`) in its headless stream-json mode — the prompt travels on stdin as one NDJSON `user` message, so large prompts never hit argv size limits:
+
+```typescript
+agent: antigravity("gemini-3.8-flash-high", { effort: "high" });
+```
+
+| Option   | Type                     | Default | Description                                                                                                                                                                                                                                       |
+| -------- | ------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `effort` | `string`                 | —       | Reasoning effort via `--effort` (`low`, `medium`, `high`). Model-dependent: agy encodes effort in the model slug (`gemini-3.8-flash-high` requires `high`); models without a suffix (e.g. `claude-sonnet-4-6`) reject `--effort` entirely            |
+| `env`    | `Record<string, string>` | `{}`    | Environment variables injected by this agent provider                                                                                                                                                                                              |
+
+Antigravity stores conversations as SQLite databases indexed by a shared `conversation_summaries.db`, so a single session file cannot be transferred host↔sandbox while preserving resume state ([ADR 0016](docs/adr/0016-resume-requires-filesystem-backed-sessions.md)). The provider is therefore **non-resumable** for now (`resumeSession`, `RunResult.resume`, and `RunResult.fork` are unavailable), even though `agy --conversation <id>` works natively on the host. Install `agy` via `curl -fsSL https://antigravity.google/cli/install.sh | bash` and sign in by launching `agy` interactively; in containers, `GEMINI_API_KEY` plus `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` authenticates without OAuth.
 
 ### Provider `env`
 

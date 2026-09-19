@@ -71,6 +71,8 @@ export type {
   OpenCodeOptions,
   PiOptions,
 } from "./AgentProvider.js";
+export { antigravity } from "./agents/antigravity.js";
+export type { AntigravityOptions } from "./agents/antigravity.js";
 export {
   createBindMountSandboxProvider,
   createIsolatedSandboxProvider,
@@ -134,6 +136,7 @@ export type {
 // model/effort catalog) — Promise-based and Effect-free like the settings
 // seam above. `sandcastle init` uses it to verify host-mode agents.
 export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
+export { antigravityDiscoveryAdapter } from "./discovery/antigravity.js";
 export { codexDiscoveryAdapter } from "./discovery/codex.js";
 export {
   listDiscoveryAdapters,
