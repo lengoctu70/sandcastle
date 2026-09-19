@@ -1,3 +1,7 @@
 dist
 node_modules
 .changeset
+
+# Captured CLI fixtures must stay byte-for-byte as the real tool emitted them
+# (e.g. codex debug models is single-line JSON — prettier would reflow it).
+src/discovery/fixtures/

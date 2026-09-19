@@ -130,3 +130,25 @@ export type {
   SandboxProviderChoice,
   WorkflowRole,
 } from "./ProjectSettings.js";
+// The agent-discovery contract (identity fingerprint, auth readiness, live
+// model/effort catalog) — Promise-based and Effect-free like the settings
+// seam above. `sandcastle init` uses it to verify host-mode agents.
+export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
+export { codexDiscoveryAdapter } from "./discovery/codex.js";
+export {
+  listDiscoveryAdapters,
+  getDiscoveryAdapter,
+  discoverAgent,
+  discoverAgents,
+} from "./discovery/registry.js";
+export { nodeDiscoveryExec } from "./discovery/nodeExec.js";
+export type {
+  AgentDiscoveryAdapter,
+  AgentDiscoveryReport,
+  DiscoveredEffort,
+  DiscoveredModel,
+  DiscoveryExec,
+  DiscoveryExecOptions,
+  DiscoveryExecResult,
+  DiscoveryState,
+} from "./discovery/contract.js";

@@ -1,7 +1,7 @@
 import { exec } from "node:child_process";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
@@ -358,5 +358,240 @@ describe("sandcastle CLI", () => {
       await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
     );
     expect(settings.sandbox).toBe("host");
+  });
+
+  // ---------------------------------------------------------------------
+  // Host-mode agent discovery (ADR 0021): `init --agent codex --sandbox host`
+  // probes the `codex` executable on PATH — fingerprint, login status, and
+  // the live model catalog — then persists the selection. These tests use a
+  // fake `codex` executable in a temp shim dir prepended to PATH; no real
+  // CLI or subscription is ever touched.
+  // ---------------------------------------------------------------------
+
+  /**
+   * Write a fake `codex` executable (a node script) into `dir`. `auth`
+   * toggles `codex login status` between the real logged-in line and a
+   * logged-out failure. The app-server branch answers the piped JSON-RPC
+   * `initialize`/`model/list` requests with a two-model catalog.
+   */
+  const writeFakeCodex = async (dir: string, auth: boolean) => {
+    const shim = join(dir, "codex");
+    const loginLine = auth
+      ? `console.log("Logged in using ChatGPT"); process.exit(0);`
+      : `console.error("Not logged in"); process.exit(1);`;
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const key = process.argv.slice(2).join(" ");
+if (key === "--version") {
+  console.log("codex-cli 0.150.1");
+  process.exit(0);
+} else if (key === "login status") {
+  ${loginLine}
+} else if (key === "app-server") {
+  let buf = "";
+  process.stdin.on("data", (d) => (buf += d));
+  process.stdin.on("end", () => {
+    for (const line of buf.split("\\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      let msg;
+      try { msg = JSON.parse(t); } catch { continue; }
+      if (msg.id === undefined) continue;
+      if (msg.method === "initialize") {
+        console.log(JSON.stringify({ id: msg.id, result: {
+          codexHome: "/tmp", platformFamily: "unix",
+          platformOs: "macos", userAgent: "fake-codex" } }));
+      } else if (msg.method === "model/list") {
+        console.log(JSON.stringify({ id: msg.id, result: { data: [
+          { id: "gpt-5.6-sol", model: "gpt-5.6-sol",
+            displayName: "GPT-5.6-Sol", description: "Everyday workhorse",
+            isDefault: true, hidden: false, defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: [
+              { reasoningEffort: "low", description: "Fast" },
+              { reasoningEffort: "medium", description: "Balanced" },
+              { reasoningEffort: "high", description: "Deep" },
+              { reasoningEffort: "xhigh", description: "Deepest" }] },
+          { id: "gpt-5.6-terra", model: "gpt-5.6-terra",
+            displayName: "GPT-5.6-Terra", description: "Hardest problems",
+            isDefault: false, hidden: false, defaultReasoningEffort: "xhigh",
+            supportedReasoningEfforts: [
+              { reasoningEffort: "medium" },
+              { reasoningEffort: "xhigh" }] },
+        ], nextCursor: null } }));
+      }
+    }
+    // Let the process exit naturally once stdin closes so piped stdout
+    // fully flushes.
+  });
+} else {
+  process.exit(1);
+}
+`,
+    );
+    await chmod(shim, 0o755);
+    return shim;
+  };
+
+  /** PATH containing the shim dir plus node's own dir (for /usr/bin/env node). */
+  const shimmedPath = (shimDir: string) =>
+    `${shimDir}:${dirname(process.execPath)}:${process.env.PATH}`;
+
+  it("init --sandbox host --agent codex discovers and persists the recommended model and effort", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, true);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Cảnh báo chế độ host");
+    expect(stdout).toContain("Khởi tạo xong");
+
+    // Discovered defaults: catalog's isDefault model + its default effort.
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "codex",
+      model: "gpt-5.6-sol",
+      effort: "medium",
+      modelSource: "discovered",
+      sandbox: "host",
+    });
+
+    // And the generated main passes both to the codex() factory — no manual
+    // edits needed for the discovered choices to reach the CLI.
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('codex("gpt-5.6-sol", { effort: "medium" })');
+    expect(main).toContain("noSandbox()");
+  });
+
+  it("init --sandbox host --agent codex honors --model/--effort validated against the live catalog", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, true);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent codex --model gpt-5.6-terra --effort xhigh --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      model: "gpt-5.6-terra",
+      effort: "xhigh",
+      modelSource: "discovered",
+    });
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('codex("gpt-5.6-terra", { effort: "xhigh" })');
+  });
+
+  it("init --sandbox host --agent codex rejects a model missing from the live catalog", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, true);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent codex --model gpt-4-turbo --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("gpt-4-turbo");
+      expect(output).toContain("không có trong catalog");
+      expect(output).toContain("gpt-5.6-sol");
+      expect(output).toContain("gpt-5.6-terra");
+    }
+  });
+
+  it("init --sandbox host --agent codex rejects an effort the model does not support", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, true);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent codex --model gpt-5.6-terra --effort low --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain('"low"');
+      expect(output).toContain("không được model");
+      // terra only supports medium/xhigh in the fake catalog
+      expect(output).toContain("xhigh");
+    }
+  });
+
+  it("init --sandbox host --agent codex fails with login guidance when unauthenticated", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, false);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("codex login");
+      // Nothing was scaffolded — the stop happens before any writes.
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  it("init --sandbox host --agent codex fails with install guidance when codex is not on PATH", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    // A PATH with only node's own directory — no codex anywhere.
+    const bareShimDir = await mkdtemp(join(tmpdir(), "empty-path-"));
+    const barePath = `${bareShimDir}:${dirname(process.execPath)}`;
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: barePath } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("Chưa tìm thấy Codex CLI");
+      expect(output).toContain("npm install -g @openai/codex");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
   });
 });

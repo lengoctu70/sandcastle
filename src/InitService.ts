@@ -215,6 +215,15 @@ export interface AgentEntry {
    * sandbox image isn't built yet), so the user must have the CLI installed.
    */
   readonly setupCommand: string;
+  /**
+   * Name of the factory-options field that receives the reasoning-effort
+   * value — `"effort"` for `codex("gpt-5.6-sol", { effort: "xhigh" })`.
+   * When set and init resolved an effort (flag or discovery), the generated
+   * `main` passes it to the factory so the persisted `settings.json` value
+   * actually reaches the agent CLI. Agents without an effort option leave it
+   * unset — their generated call keeps the single-argument form.
+   */
+  readonly effortOption?: string;
 }
 
 const CLAUDE_CODE_DOCKERFILE = `FROM node:22-bookworm
@@ -425,6 +434,7 @@ const AGENT_REGISTRY: AgentEntry[] = [
     label: "Claude Code",
     defaultModel: "claude-opus-4-8",
     factoryImport: "claudeCode",
+    effortOption: "effort",
     dockerfileTemplate: CLAUDE_CODE_DOCKERFILE,
     envExample: `# Claude Code OAuth token — get one by running \`claude setup-token\` on your host.
 # Lets the agent use your Claude subscription instead of an API key.
@@ -448,6 +458,7 @@ ANTHROPIC_API_KEY=`,
     label: "Codex",
     defaultModel: "gpt-5.4",
     factoryImport: "codex",
+    effortOption: "effort",
     dockerfileTemplate: CODEX_DOCKERFILE,
     envExample: `# OpenAI API key
 OPENAI_KEY=`,
@@ -479,6 +490,7 @@ OPENCODE_API_KEY=`,
     label: "GitHub Copilot CLI",
     defaultModel: "claude-sonnet-4.5",
     factoryImport: "copilot",
+    effortOption: "effort",
     dockerfileTemplate: COPILOT_DOCKERFILE,
     envExample: `# GitHub token with the "Copilot Requests" permission
 # (a fine-grained PAT, or any token from \`gh auth login\`).
@@ -977,6 +989,7 @@ const rewriteMainTs = (
   configDir: string,
   agent: AgentEntry,
   model: string,
+  effort: string | undefined,
   sandboxProvider: SandboxProviderEntry,
   mainFilename: string,
 ): Effect.Effect<void, Error, FileSystem.FileSystem> =>
@@ -1003,14 +1016,22 @@ const rewriteMainTs = (
     // and all factory calls with the correct model.
     // Templates always use claudeCode as the placeholder factory.
     content = content.replace(/\bclaudeCode\b/g, agent.factoryImport);
-    // Replace model strings in factory calls: factoryImport("any-model")
+    // Replace model strings in factory calls: factoryImport("any-model").
+    // When init resolved a reasoning effort and the agent's factory accepts
+    // one, it is emitted as the options argument — `codex("gpt-5.6-sol",
+    // { effort: "xhigh" })` — so the persisted settings.json value reaches
+    // the agent CLI without the user editing generated code.
+    const optionsSuffix =
+      effort !== undefined && agent.effortOption !== undefined
+        ? `, { ${agent.effortOption}: ${JSON.stringify(effort)} }`
+        : "";
     const factoryCallRe = new RegExp(
       `${agent.factoryImport}\\(["']([^"']+)["']\\)`,
       "g",
     );
     content = content.replace(
       factoryCallRe,
-      `${agent.factoryImport}("${model}")`,
+      () => `${agent.factoryImport}("${model}"${optionsSuffix})`,
     );
 
     // Replace the sandbox provider. Templates always use `docker` as the
@@ -1370,11 +1391,13 @@ export const scaffold = (
       }),
     );
 
-    // Rewrite main file with the selected agent factory, model, and sandbox provider
+    // Rewrite main file with the selected agent factory, model, effort, and
+    // sandbox provider
     yield* rewriteMainTs(
       configDir,
       agent,
       model,
+      settingsOverrides?.effort,
       sandboxProvider,
       mainFilename,
     );
