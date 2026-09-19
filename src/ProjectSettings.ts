@@ -116,7 +116,12 @@ const MODEL_SOURCES: readonly ModelSource[] = [
   "discovered",
   "manual-unverified",
 ];
-const WORKFLOW_ROLES: readonly WorkflowRole[] = [
+/**
+ * All workflow roles that may carry a {@link RoleOverride}, in canonical
+ * order — `configure` iterates this for the role submenu and `--set-role`
+ * validation.
+ */
+export const WORKFLOW_ROLES: readonly WorkflowRole[] = [
   "planner",
   "implementer",
   "reviewer",
