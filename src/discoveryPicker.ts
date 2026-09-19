@@ -480,7 +480,18 @@ export const resolveDiscoveredSelection = (params: {
         (e) => e.id === requested,
       );
       if (!supported) {
-        if (!allowUnverified) {
+        if (chosenModel.effortChoicesExhaustive === false) {
+          // The list is a partial observed suggestion set, not the model's
+          // authoritative catalog (e.g. Grok's --reasoning-effort, whose CLI
+          // never enumerates its valid values). A newer CLI's legitimate
+          // effort name must not be rejected — accept it, but honestly mark
+          // the selection unverified rather than discovered.
+          yield* d.status(
+            `Effort "${requested}" không nằm trong danh sách đã quan sát được của ${agentLabel} — ghi nhận là chưa xác minh.`,
+            "warn",
+          );
+          modelVerified = false;
+        } else if (!allowUnverified) {
           const values = chosenModel.effortChoices.map((e) => e.id).join(", ");
           return yield* Effect.fail(
             new InitError({
@@ -489,10 +500,11 @@ export const resolveDiscoveredSelection = (params: {
                 (values.length > 0 ? ` Có sẵn: ${values}` : ""),
             }),
           );
+        } else {
+          // Accepted unverified — the whole selection is marked accordingly so
+          // an unchecked effort is never presented as discovered truth.
+          modelVerified = false;
         }
-        // Accepted unverified — the whole selection is marked accordingly so
-        // an unchecked effort is never presented as discovered truth.
-        modelVerified = false;
       }
       effort = requested;
     } else if (chosenModel.effortChoices.length > 0) {

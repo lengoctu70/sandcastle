@@ -31,6 +31,7 @@ import {
 } from "./discoveryPicker.js";
 import { getDiscoveryAdapter } from "./discovery/registry.js";
 import type {
+  AgentDiscoveryReport,
   DiscoveredModel,
   DiscoveryExec,
   DiscoveryExecOptions,
@@ -607,6 +608,68 @@ describe("resolveDiscoveredSelection", () => {
         model: "gpt-5.6-terra",
         effort: "low",
         modelSource: "manual-unverified",
+      },
+    });
+  });
+
+  it("an unlisted effort on a non-exhaustive list (Grok) is accepted as unverified, not rejected", async () => {
+    // Grok's --reasoning-effort capability is verified but the CLI never
+    // enumerates its valid values — the bundled list is only an observed
+    // suggestion set. A newer CLI's effort name must not be rejected: the
+    // flag passes through with modelSource "manual-unverified", no
+    // --allow-unverified required.
+    const grokReport: AgentDiscoveryReport = {
+      agent: "grok",
+      executable: "grok",
+      state: "ready",
+      version: "1.0.30",
+      models: [
+        {
+          id: "grok-4.6",
+          displayName: "grok-4.6",
+          effortChoices: [
+            { id: "low" },
+            { id: "medium" },
+            { id: "high" },
+            { id: "xhigh" },
+          ],
+          effortChoicesExhaustive: false,
+        },
+      ],
+      recommendedModel: "grok-4.6",
+    };
+    const resolveGrok = (effort: string) =>
+      resolveDiscoveredSelection({
+        adapter: getDiscoveryAdapter("grok")!,
+        agentLabel: "Grok",
+        defaultModel: "grok-code-fast-1",
+        modelFlag: Option.some("grok-4.6"),
+        effortFlag: Option.some(effort),
+        isInteractive: false,
+        allowUnverified: false,
+        // The pre-fetched report skips the probe — resolution itself is
+        // what's under test.
+        initialReport: grokReport,
+      }).pipe(Effect.provide(SilentDisplay.layer(displayRef())));
+
+    const outcome = await Effect.runPromise(resolveGrok("ultra"));
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        model: "grok-4.6",
+        effort: "ultra",
+        modelSource: "manual-unverified",
+      },
+    });
+    // A listed value still verifies fully — the suggestion list is not a
+    // free pass for the whole agent.
+    const verified = await Effect.runPromise(resolveGrok("high"));
+    expect(verified).toEqual({
+      kind: "selection",
+      selection: {
+        model: "grok-4.6",
+        effort: "high",
+        modelSource: "discovered",
       },
     });
   });

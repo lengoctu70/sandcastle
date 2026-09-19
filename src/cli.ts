@@ -412,12 +412,20 @@ const initCommand = Command.make(
         if (!isInteractive) {
           yield* failIfNonInteractive("--sandbox");
         }
+        // Host is the recommended entry (ADR 0021): it leads the registry,
+        // gets the "(khuyến nghị)" marker, and is the picker's initial value —
+        // mirroring the workflow picker's recommended-option handling.
+        const recommended =
+          sandboxProviders.find((p) => p.recommended === true) ??
+          sandboxProviders[0]!;
         const selected = yield* Effect.promise(() =>
           clack.select({
             message: "Chọn nơi chạy agent:",
+            initialValue: recommended.name,
             options: sandboxProviders.map((p) => ({
               value: p.name,
-              label: p.label,
+              label:
+                p.recommended === true ? `${p.label} (khuyến nghị)` : p.label,
               ...(p.selectHint !== undefined ? { hint: p.selectHint } : {}),
             })),
           }),

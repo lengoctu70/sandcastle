@@ -45,11 +45,13 @@ const PROBE_TIMEOUT_MS = 10_000;
 const CATALOG_TIMEOUT_MS = 15_000;
 
 /**
- * Effort values Grok accepts via `--reasoning-effort`. The CLI help does not
- * enumerate them; this list is the observed set from the binary's own
- * invalid-value error on grok 1.0.30 (`xhigh, high, medium, low`), sorted
- * ascending. The provider's `effort` option stays free-form — init validates
- * against this discovered list.
+ * Effort values Grok accepts via `--reasoning-effort`, as observed on
+ * grok 1.0.30 (`xhigh, high, medium, low`, from the binary's own
+ * invalid-value error), sorted ascending. The CLI help never enumerates the
+ * valid set, so this list is a suggestion set, not an authoritative catalog —
+ * every emitted model carries `effortChoicesExhaustive: false`, and the init
+ * picker accepts unlisted values as unverified rather than rejecting a newer
+ * CLI's legitimate effort names.
  */
 const GROK_EFFORT_CHOICES: readonly DiscoveredEffort[] = [
   { id: "low" },
@@ -257,7 +259,14 @@ const parseGrokModelsCatalog = (
     const bullet = /^[*-]\s+(\S+)/.exec(line);
     if (bullet) {
       const id = bullet[1]!;
-      models.push({ id, displayName: id, effortChoices });
+      models.push({
+        id,
+        displayName: id,
+        effortChoices,
+        // Suggestions only — the CLI never enumerates its valid effort set,
+        // so unlisted values are accepted as unverified, not rejected.
+        effortChoicesExhaustive: false,
+      });
       if (/\(default\)/.test(line) && defaultModel === undefined) {
         defaultModel = id;
       }

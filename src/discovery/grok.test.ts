@@ -88,6 +88,11 @@ describe("grokDiscoveryAdapter", () => {
       "high",
       "xhigh",
     ]);
+    // The list is an observed suggestion set, not the CLI's authoritative
+    // catalog — models say so explicitly so the picker accepts unlisted
+    // values as unverified rather than rejecting them.
+    expect(report.models[0]!.effortChoicesExhaustive).toBe(false);
+    expect(report.models[1]!.effortChoicesExhaustive).toBe(false);
   });
 
   it("reports unauthenticated when `models` prints the not-authenticated marker", async () => {

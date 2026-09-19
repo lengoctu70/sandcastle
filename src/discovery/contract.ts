@@ -121,6 +121,16 @@ export interface DiscoveredModel {
   readonly provider?: string;
   /** Effort choices this model supports, in catalog order. Empty when the model exposes none. */
   readonly effortChoices: readonly DiscoveredEffort[];
+  /**
+   * `true` (or absent) when `effortChoices` is the model's authoritative
+   * catalog — an unlisted value is genuinely unsupported. `false` when the
+   * list is only a partial, observed suggestion set: the capability to pass
+   * an effort value was verified, but the CLI does not enumerate its valid
+   * set (e.g. Grok's `--reasoning-effort`, whose help names the flag but
+   * never its values). The init picker then accepts an unlisted effort as
+   * `manual-unverified` instead of rejecting it outright.
+   */
+  readonly effortChoicesExhaustive?: boolean;
   /** The catalog's default effort for this model, when it declares one. */
   readonly defaultEffort?: string;
 }
