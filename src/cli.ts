@@ -33,12 +33,12 @@ import type {
   IssueTrackerEntry,
   SandboxProviderEntry,
 } from "./InitService.js";
-import { discoverAgent, getDiscoveryAdapter } from "./discovery/registry.js";
-import { nodeDiscoveryExec } from "./discovery/nodeExec.js";
-import type {
-  AgentDiscoveryAdapter,
-  AgentDiscoveryReport,
-} from "./discovery/contract.js";
+import { getDiscoveryAdapter } from "./discovery/registry.js";
+import {
+  pickHostAgent,
+  resolveDiscoveredSelection,
+  INIT_STOPPED_MESSAGE,
+} from "./discoveryPicker.js";
 import type { ModelSource } from "./ProjectSettings.js";
 import { ConfigDirError, InitError } from "./errors.js";
 import { VERSION } from "./version.js";
@@ -127,6 +127,17 @@ const initEffortOption = Options.text("effort").pipe(
   Options.optional,
 );
 
+// Non-interactive parity for the interactive "manual entry (unverified)"
+// recovery choice: with this flag, a --model/--effort pair that discovery
+// could not verify (agent unavailable, or values outside the live catalog)
+// is accepted and persisted as modelSource "manual-unverified" instead of
+// failing. Without it, unverifiable selections fail fast with guidance.
+const allowUnverifiedOption = Options.boolean("allow-unverified").pipe(
+  Options.withDescription(
+    "Host mode: accept --model/--effort without live-catalog verification (marked unverified). Without it, discovery failures exit non-zero",
+  ),
+);
+
 const sandboxOption = Options.text("sandbox").pipe(
   Options.withDescription(
     "Sandbox provider to use (e.g. host, docker, podman)",
@@ -180,262 +191,6 @@ const choiceToTriBool = (
 ): Option.Option<boolean> =>
   opt._tag === "Some" ? Option.some(opt.value === "true") : Option.none();
 
-/** The model/effort selection init resolved through agent discovery. */
-interface DiscoveredSelection {
-  readonly model: string;
-  readonly effort?: string;
-  readonly modelSource: ModelSource;
-}
-
-const discoveryCancelledMessage =
-  "Đã dừng khởi tạo — chưa có tệp nào được tạo.";
-
-/**
- * Run one adapter's discovery through the real process boundary, showing a
- * spinner while the CLI probes run. Never fails — adapters report every
- * outcome via `report.state`.
- */
-const runDiscovery = (
-  adapter: AgentDiscoveryAdapter,
-  agentLabel: string,
-): Effect.Effect<AgentDiscoveryReport, never, Display> =>
-  Effect.gen(function* () {
-    const d = yield* Display;
-    return yield* d.spinner(
-      `Đang kiểm tra ${agentLabel} trên máy này…`,
-      Effect.promise(() => discoverAgent(adapter.agent, nodeDiscoveryExec)),
-    );
-  }).pipe(
-    Effect.map(
-      (report) =>
-        report ??
-        ({
-          agent: adapter.agent,
-          executable: adapter.executable,
-          state: "error",
-          models: [],
-          detail: "Không có adapter nào đăng ký cho agent này.",
-        } satisfies AgentDiscoveryReport),
-    ),
-  );
-
-/**
- * Resolve the model and effort for a host-mode agent through live discovery
- * (ADR 0021). Non-interactive runs fail with the report's Vietnamese guidance
- * on any non-ready state; interactive runs offer retry / manual-unverified
- * entry / safe stop before anything is scaffolded.
- */
-const resolveDiscoveredSelection = (params: {
-  readonly adapter: AgentDiscoveryAdapter;
-  readonly agentLabel: string;
-  /** Registry default used when the agent has no model catalog to pick from. */
-  readonly defaultModel: string;
-  readonly modelFlag: Option.Option<string>;
-  readonly effortFlag: Option.Option<string>;
-  readonly isInteractive: boolean;
-}): Effect.Effect<DiscoveredSelection, InitError, Display> =>
-  Effect.gen(function* () {
-    const d = yield* Display;
-    const {
-      adapter,
-      agentLabel,
-      defaultModel,
-      modelFlag,
-      effortFlag,
-      isInteractive,
-    } = params;
-
-    let report = yield* runDiscovery(adapter, agentLabel);
-
-    // Every state except "ready" needs either a flag answer or an
-    // interactive choice before init may continue.
-    while (report.state !== "ready") {
-      const reason =
-        report.guidance ??
-        report.detail ??
-        `Không khám phá được ${agentLabel}.`;
-      if (!isInteractive) {
-        return yield* Effect.fail(new InitError({ message: reason }));
-      }
-      yield* d.status(reason, "warn");
-      const action = yield* Effect.promise(() =>
-        clack.select({
-          message: "Bạn muốn tiếp tục thế nào?",
-          options: [
-            { value: "retry", label: "Thử lại" },
-            {
-              value: "manual",
-              label: "Nhập model thủ công (chưa xác minh)",
-            },
-            { value: "stop", label: "Dừng lại" },
-          ],
-        }),
-      );
-      if (clack.isCancel(action) || action === "stop") {
-        return yield* Effect.fail(
-          new InitError({ message: discoveryCancelledMessage }),
-        );
-      }
-      if (action === "retry") {
-        report = yield* runDiscovery(adapter, agentLabel);
-        continue;
-      }
-
-      // "manual" — an explicitly unverified entry (ADR 0021). A passed --model
-      // flag counts as the manual entry; otherwise prompt for it.
-      let model =
-        modelFlag._tag === "Some" ? modelFlag.value.trim() : undefined;
-      if (model === undefined || model.length === 0) {
-        const entered = yield* Effect.promise(() =>
-          clack.text({
-            message: `Nhập model cho ${agentLabel} (sẽ được đánh dấu chưa xác minh):`,
-            validate: (value) =>
-              value === undefined || value.trim().length === 0
-                ? "Model không được để trống."
-                : undefined,
-          }),
-        );
-        if (clack.isCancel(entered)) {
-          return yield* Effect.fail(
-            new InitError({ message: discoveryCancelledMessage }),
-          );
-        }
-        model = entered.trim();
-      }
-      let effort =
-        effortFlag._tag === "Some" ? effortFlag.value.trim() : undefined;
-      // An explicitly-empty --effort (" ") counts as absent — prompt for it.
-      if (effort === undefined || effort.length === 0) {
-        const entered = yield* Effect.promise(() =>
-          clack.text({
-            message: `Nhập effort cho ${model} (để trống nếu không dùng):`,
-          }),
-        );
-        if (clack.isCancel(entered)) {
-          return yield* Effect.fail(
-            new InitError({ message: discoveryCancelledMessage }),
-          );
-        }
-        effort = entered.trim().length > 0 ? entered.trim() : undefined;
-      }
-      return { model, effort, modelSource: "manual-unverified" };
-    }
-
-    // --- state === "ready": pick from the live catalog ---
-    const catalog = report.models;
-    yield* d.status(
-      `${agentLabel} ${report.version ?? ""} — đã xác minh và đăng nhập`.trim(),
-      "success",
-    );
-
-    if (catalog.length === 0) {
-      // The agent is verified and signed in, but its CLI exposes no model
-      // catalog (e.g. Claude Code, Copilot). The model can never be verified
-      // against a live list, so selection stays on the static path — the
-      // --model flag or the registry default — and is persisted as
-      // "manual-unverified" rather than "discovered" (ADR 0021).
-      if (report.guidance !== undefined) {
-        yield* d.status(report.guidance, "warn");
-      }
-      const model =
-        modelFlag._tag === "Some" && modelFlag.value.trim().length > 0
-          ? modelFlag.value.trim()
-          : defaultModel;
-      const effort =
-        effortFlag._tag === "Some" && effortFlag.value.trim().length > 0
-          ? effortFlag.value.trim()
-          : undefined;
-      return { model, effort, modelSource: "manual-unverified" };
-    }
-
-    let model: string;
-    if (modelFlag._tag === "Some") {
-      const requested = modelFlag.value.trim();
-      const found = catalog.some((m) => m.id === requested);
-      if (!found) {
-        const names = catalog.map((m) => m.id).join(", ");
-        return yield* Effect.fail(
-          new InitError({
-            message: `Model "${requested}" không có trong catalog của ${agentLabel}. Có sẵn: ${names}`,
-          }),
-        );
-      }
-      model = requested;
-    } else if (isInteractive) {
-      const selected = yield* Effect.promise(() =>
-        clack.select({
-          message: `Chọn model cho ${agentLabel}:`,
-          initialValue: report.recommendedModel,
-          options: catalog.map((m) => {
-            // Multi-provider agents (e.g. OpenCode) surface the model
-            // provider in the hint so the picker reads grouped by provider —
-            // the catalog already arrives in provider order.
-            const hint = [m.provider, m.description]
-              .filter((s): s is string => s !== undefined)
-              .join(" — ");
-            return {
-              value: m.id,
-              label: m.displayName,
-              ...(hint.length > 0 ? { hint } : {}),
-            };
-          }),
-        }),
-      );
-      if (clack.isCancel(selected)) {
-        return yield* Effect.fail(
-          new InitError({ message: discoveryCancelledMessage }),
-        );
-      }
-      model = selected as string;
-    } else {
-      model = report.recommendedModel ?? catalog[0]!.id;
-    }
-    const chosenModel = catalog.find((m) => m.id === model)!;
-
-    let effort: string | undefined;
-    if (effortFlag._tag === "Some" && effortFlag.value.trim().length > 0) {
-      const requested = effortFlag.value.trim();
-      const supported = chosenModel.effortChoices.some(
-        (e) => e.id === requested,
-      );
-      if (!supported) {
-        const values = chosenModel.effortChoices.map((e) => e.id).join(", ");
-        return yield* Effect.fail(
-          new InitError({
-            message:
-              `Effort "${requested}" không được model "${model}" hỗ trợ.` +
-              (values.length > 0 ? ` Có sẵn: ${values}` : ""),
-          }),
-        );
-      }
-      effort = requested;
-    } else if (chosenModel.effortChoices.length > 0) {
-      if (isInteractive) {
-        const selected = yield* Effect.promise(() =>
-          clack.select({
-            message: `Chọn effort cho ${model}:`,
-            initialValue: chosenModel.defaultEffort,
-            options: chosenModel.effortChoices.map((e) => ({
-              value: e.id,
-              label: e.id,
-              ...(e.description !== undefined ? { hint: e.description } : {}),
-            })),
-          }),
-        );
-        if (clack.isCancel(selected)) {
-          return yield* Effect.fail(
-            new InitError({ message: discoveryCancelledMessage }),
-          );
-        }
-        effort = selected as string;
-      } else {
-        effort = chosenModel.defaultEffort;
-      }
-    }
-
-    return { model, effort, modelSource: "discovered" };
-  });
-
 const initCommand = Command.make(
   "init",
   {
@@ -444,6 +199,7 @@ const initCommand = Command.make(
     agent: agentOption,
     model: initModelOption,
     effort: initEffortOption,
+    allowUnverified: allowUnverifiedOption,
     sandbox: sandboxOption,
     issueTracker: issueTrackerOption,
     createLabel: createLabelOption,
@@ -456,6 +212,7 @@ const initCommand = Command.make(
     agent: agentFlag,
     model: modelFlag,
     effort: effortFlag,
+    allowUnverified,
     sandbox: sandboxFlag,
     issueTracker: issueTrackerFlag,
     createLabel: createLabelFlag,
@@ -509,6 +266,22 @@ const initCommand = Command.make(
         }
       }
 
+      // --agent validates up front too — an unknown agent name must error
+      // before any prompt, even though the agent itself is resolved after the
+      // sandbox choice below (host mode's picker needs it first).
+      const agents = listAgents();
+      if (agentFlag._tag === "Some") {
+        const valid = getAgent(agentFlag.value);
+        if (!valid) {
+          const names = agents.map((a) => a.name).join(", ");
+          yield* Effect.fail(
+            new InitError({
+              message: `Unknown agent "${agentFlag.value}". Available: ${names}`,
+            }),
+          );
+        }
+      }
+
       const createLabelChoice = choiceToTriBool(createLabelFlag);
       const buildImageChoice = choiceToTriBool(buildImageFlag);
       const installTemplateDepsChoice = choiceToTriBool(
@@ -551,44 +324,9 @@ const initCommand = Command.make(
           return confirmed === true;
         });
 
-      // Resolve agent: CLI flag > interactive select
-      const agents = listAgents();
-      let selectedAgent: AgentEntry;
-      if (agentFlag._tag === "Some") {
-        const entry = getAgent(agentFlag.value);
-        if (!entry) {
-          const names = agents.map((a) => a.name).join(", ");
-          yield* Effect.fail(
-            new InitError({
-              message: `Unknown agent "${agentFlag.value}". Available: ${names}`,
-            }),
-          );
-        }
-        selectedAgent = entry!;
-      } else {
-        if (!isInteractive) {
-          yield* failIfNonInteractive("--agent");
-        }
-        const selected = yield* Effect.promise(() =>
-          clack.select({
-            message: "Select an agent:",
-            initialValue: "claude-code",
-            options: agents.map((a) => ({
-              value: a.name,
-              label: a.label,
-              hint: `Default model: ${a.defaultModel}`,
-            })),
-          }),
-        );
-        if (clack.isCancel(selected)) {
-          yield* Effect.fail(
-            new InitError({ message: "Agent selection cancelled." }),
-          );
-        }
-        selectedAgent = getAgent(selected as string)!;
-      }
-
-      // Resolve sandbox provider: CLI flag > interactive select (no default — user must choose)
+      // Resolve sandbox provider first: CLI flag > interactive select (no
+      // default — user must choose). It runs before the agent picker because
+      // host mode's agent list is built from live discovery results.
       const sandboxProviders = listSandboxProviders();
       let selectedSandboxProvider: SandboxProviderEntry;
       if (sandboxFlag._tag === "Some") {
@@ -599,7 +337,7 @@ const initCommand = Command.make(
         }
         const selected = yield* Effect.promise(() =>
           clack.select({
-            message: "Select a sandbox provider:",
+            message: "Chọn nơi chạy agent:",
             options: sandboxProviders.map((p) => ({
               value: p.name,
               label: p.label,
@@ -608,11 +346,7 @@ const initCommand = Command.make(
           }),
         );
         if (clack.isCancel(selected)) {
-          yield* Effect.fail(
-            new InitError({
-              message: "Sandbox provider selection cancelled.",
-            }),
-          );
+          yield* Effect.fail(new InitError({ message: INIT_STOPPED_MESSAGE }));
         }
         selectedSandboxProvider = getSandboxProvider(selected as string)!;
       }
@@ -624,41 +358,108 @@ const initCommand = Command.make(
         yield* d.status(HOST_MODE_WARNING, "warn");
       }
 
-      // Resolve model + effort. In host mode with a discovery adapter, the
-      // agent's live catalog is the source of truth (ADR 0021) — the agent's
-      // executable is fingerprinted, its login verified, and the chosen
-      // model/effort persisted as `modelSource: "discovered"`. Agents whose
-      // CLI exposes no catalog report `ready` with an empty model list and
-      // keep the flag-or-default selection, marked "manual-unverified".
-      // Everything else keeps the static registry default, marked
-      // "manual-unverified" since it was never checked against the agent.
-      let selectedModel: string;
+      // Resolve agent + model + effort. In host mode the agent's live
+      // discovery state drives the picker: `--agent` still wins when passed
+      // (single-adapter probe), and without it every registered adapter is
+      // probed in parallel so verified-ready agents list first while
+      // missing/unauthenticated ones sit behind an "other agents" choice
+      // with guidance + recheck. Container sandboxes keep the static picker —
+      // probing host CLIs says nothing about what the image installs.
+      // Definite-assignment assertions: every branch below assigns through
+      // applySelection (or fails), which control-flow analysis can't see.
+      let selectedAgent!: AgentEntry;
+      let selectedModel!: string;
       let selectedEffort: string | undefined;
       let modelSource: ModelSource = "manual-unverified";
-      const discoveryAdapter = selectedSandboxProvider.runsOnHost
-        ? getDiscoveryAdapter(selectedAgent.name)
-        : undefined;
-      if (discoveryAdapter !== undefined) {
-        const selection = yield* resolveDiscoveredSelection({
-          adapter: discoveryAdapter,
-          agentLabel: selectedAgent.label,
-          defaultModel: selectedAgent.defaultModel,
-          modelFlag,
-          effortFlag,
-          isInteractive,
-        });
+
+      const applySelection = (
+        agent: AgentEntry,
+        selection: {
+          model: string;
+          effort?: string;
+          modelSource: ModelSource;
+        },
+      ) => {
+        selectedAgent = agent;
         selectedModel = selection.model;
         selectedEffort = selection.effort;
         modelSource = selection.modelSource;
-      } else {
-        selectedModel =
-          modelFlag._tag === "Some"
-            ? modelFlag.value
-            : selectedAgent.defaultModel;
-        selectedEffort =
+      };
+
+      const staticSelection = (agent: AgentEntry) => ({
+        model: modelFlag._tag === "Some" ? modelFlag.value : agent.defaultModel,
+        effort:
           effortFlag._tag === "Some" && effortFlag.value.trim().length > 0
             ? effortFlag.value.trim()
-            : undefined;
+            : undefined,
+        modelSource: "manual-unverified" as const,
+      });
+
+      if (agentFlag._tag === "Some") {
+        // Already validated above.
+        selectedAgent = getAgent(agentFlag.value)!;
+        const adapter = selectedSandboxProvider.runsOnHost
+          ? getDiscoveryAdapter(selectedAgent.name)
+          : undefined;
+        if (adapter !== undefined) {
+          const outcome = yield* resolveDiscoveredSelection({
+            adapter,
+            agentLabel: selectedAgent.label,
+            defaultModel: selectedAgent.defaultModel,
+            modelFlag,
+            effortFlag,
+            isInteractive,
+            allowUnverified,
+            // Interactive flag users can fall back to the live picker when
+            // their chosen agent isn't usable on this machine.
+            offerBack: isInteractive,
+          });
+          if (outcome.kind === "back") {
+            const picked = yield* pickHostAgent({
+              agents,
+              modelFlag,
+              effortFlag,
+              allowUnverified,
+            });
+            applySelection(picked.agent, picked.selection);
+          } else {
+            applySelection(selectedAgent, outcome.selection);
+          }
+        } else {
+          applySelection(selectedAgent, staticSelection(selectedAgent));
+        }
+      } else {
+        if (!isInteractive) {
+          yield* failIfNonInteractive("--agent");
+        }
+        if (selectedSandboxProvider.runsOnHost) {
+          const picked = yield* pickHostAgent({
+            agents,
+            modelFlag,
+            effortFlag,
+            allowUnverified,
+          });
+          applySelection(picked.agent, picked.selection);
+        } else {
+          const selected = yield* Effect.promise(() =>
+            clack.select({
+              message: "Chọn agent:",
+              initialValue: "claude-code",
+              options: agents.map((a) => ({
+                value: a.name,
+                label: a.label,
+                hint: `Default model: ${a.defaultModel}`,
+              })),
+            }),
+          );
+          if (clack.isCancel(selected)) {
+            yield* Effect.fail(
+              new InitError({ message: INIT_STOPPED_MESSAGE }),
+            );
+          }
+          const entry = getAgent(selected as string)!;
+          applySelection(entry, staticSelection(entry));
+        }
       }
 
       // Resolve issue tracker: CLI flag > interactive select (already validated above)
@@ -672,7 +473,7 @@ const initCommand = Command.make(
         }
         const selected = yield* Effect.promise(() =>
           clack.select({
-            message: "Select an issue tracker:",
+            message: "Chọn issue tracker:",
             initialValue: "github-issues",
             options: issueTrackers.map((b) => ({
               value: b.name,
@@ -681,11 +482,7 @@ const initCommand = Command.make(
           }),
         );
         if (clack.isCancel(selected)) {
-          yield* Effect.fail(
-            new InitError({
-              message: "Issue tracker selection cancelled.",
-            }),
-          );
+          yield* Effect.fail(new InitError({ message: INIT_STOPPED_MESSAGE }));
         }
         selectedIssueTracker = getIssueTracker(selected as string)!;
       }
@@ -700,7 +497,7 @@ const initCommand = Command.make(
         }
         const selected = yield* Effect.promise(() =>
           clack.select({
-            message: "Select a template:",
+            message: "Chọn template:",
             initialValue: "blank",
             options: templates.map((tmpl) => ({
               value: tmpl.name,
@@ -710,9 +507,7 @@ const initCommand = Command.make(
           }),
         );
         if (clack.isCancel(selected)) {
-          yield* Effect.fail(
-            new InitError({ message: "Template selection cancelled." }),
-          );
+          yield* Effect.fail(new InitError({ message: INIT_STOPPED_MESSAGE }));
         }
         selectedTemplate = selected as string;
       }
@@ -725,8 +520,8 @@ const initCommand = Command.make(
           choice: createLabelChoice,
           flag: "--create-label",
           promptMessage:
-            'Create a "Sandcastle" GitHub label? (Templates filter issues by this label)',
-          cancelMessage: "Label selection cancelled.",
+            'Tạo label "Sandcastle" trên GitHub? (Các template lọc issue theo label này)',
+          cancelMessage: INIT_STOPPED_MESSAGE,
         });
 
         if (shouldCreateLabel) {
@@ -742,7 +537,7 @@ const initCommand = Command.make(
       }
 
       const scaffoldResult = yield* d.spinner(
-        "Scaffolding .sandcastle/ config directory...",
+        "Đang tạo thư mục cấu hình .sandcastle/…",
         scaffold(cwd, {
           agent: selectedAgent,
           model: selectedModel,
@@ -779,8 +574,8 @@ const initCommand = Command.make(
           const shouldInstall = yield* resolveConfirmFlag({
             choice: installTemplateDepsChoice,
             flag: "--install-template-deps",
-            promptMessage: `The ${selectedTemplate} template needs a schema validator. Install zod now (\`${installCmd}\`)?`,
-            cancelMessage: "Install-template-deps selection cancelled.",
+            promptMessage: `Template ${selectedTemplate} cần một schema validator. Cài zod ngay (\`${installCmd}\`)?`,
+            cancelMessage: INIT_STOPPED_MESSAGE,
           });
           if (shouldInstall) {
             const installed = yield* Effect.sync(() => {
@@ -792,9 +587,9 @@ const initCommand = Command.make(
               }
             });
             yield* installed
-              ? d.status(`Installed zod with ${packageManager}.`, "success")
+              ? d.status(`Đã cài zod bằng ${packageManager}.`, "success")
               : d.status(
-                  `Couldn't install zod automatically. Run \`${installCmd}\` before running the agent.`,
+                  `Không cài được zod tự động. Chạy \`${installCmd}\` trước khi chạy agent.`,
                   "warn",
                 );
           }
@@ -811,8 +606,8 @@ const initCommand = Command.make(
       if (selectedIssueTracker.name === "custom") {
         yield* d.status(
           cliNamespace === undefined
-            ? "Init complete! Your custom issue tracker isn't configured yet — see the steps below."
-            : "Init complete! Your custom issue tracker isn't configured yet — see the steps below before building.",
+            ? "Khởi tạo xong! Issue tracker tùy chỉnh của bạn chưa được cấu hình — xem các bước bên dưới."
+            : "Khởi tạo xong! Issue tracker tùy chỉnh của bạn chưa được cấu hình — xem các bước bên dưới trước khi build.",
           "success",
         );
       } else if (cliNamespace === undefined) {
@@ -826,32 +621,29 @@ const initCommand = Command.make(
         const shouldBuild = yield* resolveConfirmFlag({
           choice: buildImageChoice,
           flag: "--build-image",
-          promptMessage: `Build the default ${providerLabel} image now?`,
-          cancelMessage: "Build-image selection cancelled.",
+          promptMessage: `Build image ${providerLabel} mặc định ngay bây giờ?`,
+          cancelMessage: INIT_STOPPED_MESSAGE,
         });
 
         if (shouldBuild) {
           const containerfileDir = join(cwd, CONFIG_DIR);
           if (selectedSandboxProvider.name === "podman") {
             yield* d.spinner(
-              `Building ${providerLabel} image '${imageName}'...`,
+              `Đang build image ${providerLabel} '${imageName}'…`,
               podmanBuildImage(imageName, containerfileDir),
             );
           } else {
             yield* d.spinner(
-              `Building ${providerLabel} image '${imageName}'...`,
+              `Đang build image ${providerLabel} '${imageName}'…`,
               buildImage(imageName, containerfileDir, {
                 buildArgs: defaultUidBuildArgs(),
               }),
             );
           }
-          yield* d.status(
-            "Init complete! Image built successfully.",
-            "success",
-          );
+          yield* d.status("Khởi tạo xong! Image đã được build.", "success");
         } else {
           yield* d.status(
-            `Init complete! Run \`sandcastle ${cliNamespace} build-image\` to build the ${providerLabel} image later.`,
+            `Khởi tạo xong! Chạy \`sandcastle ${cliNamespace} build-image\` để build image ${providerLabel} sau.`,
             "success",
           );
         }

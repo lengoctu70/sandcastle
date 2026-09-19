@@ -10,7 +10,11 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { NodeFileSystem } from "@effect/platform-node";
+import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
+
+import { loadProjectSettings } from "./ProjectSettings.js";
 
 const execAsync = promisify(exec);
 
@@ -244,7 +248,7 @@ describe("sandcastle CLI", () => {
       hostDir,
     );
 
-    expect(stdout).toContain("Init complete");
+    expect(stdout).toContain("Khởi tạo xong");
     const entries = await readdir(join(hostDir, ".sandcastle"));
     expect(entries).toContain("Dockerfile");
     expect(entries).toContain("prompt.md");
@@ -260,7 +264,7 @@ describe("sandcastle CLI", () => {
       hostDir,
     );
 
-    expect(stdout).toContain("Init complete");
+    expect(stdout).toContain("Khởi tạo xong");
     const settings = JSON.parse(
       await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
     );
@@ -322,7 +326,7 @@ describe("sandcastle CLI", () => {
       hostDir,
     );
 
-    expect(stdout).toContain("Init complete");
+    expect(stdout).toContain("Khởi tạo xong");
     const entries = await readdir(join(hostDir, ".sandcastle"));
     expect(entries).toContain("SETUP_ISSUE_TRACKER.md");
   });
@@ -768,6 +772,140 @@ if (key === "--version") {
       expect(output).toContain("npm install -g @openai/codex");
       expect(await readdir(hostDir)).not.toContain(".sandcastle");
     }
+  });
+
+  // ---------------------------------------------------------------------
+  // --allow-unverified (ADR 0021): the non-interactive parity for the
+  // picker's "manual entry (unverified)" recovery choice. With it, a
+  // --model/--effort pair that discovery could not verify is accepted and
+  // honestly marked `manual-unverified` in settings.json; without it the
+  // same situations exit non-zero with the actionable guidance.
+  // ---------------------------------------------------------------------
+
+  it("init --help exposes --allow-unverified", async () => {
+    const { stdout } = await runCli("init --help", process.cwd());
+    expect(stdout).toContain("--allow-unverified");
+  });
+
+  it("init --sandbox host --agent codex --allow-unverified accepts --model/--effort when unauthenticated", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, false);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent codex --model custom-model --effort ultra --template blank --sandbox host --issue-tracker beads --allow-unverified`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    // The values were never checked against a live catalog — settings must
+    // say manual-unverified, and must keep saying it when reloaded later.
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "codex",
+      model: "custom-model",
+      effort: "ultra",
+      modelSource: "manual-unverified",
+      sandbox: "host",
+    });
+    const loaded = await Effect.runPromise(
+      loadProjectSettings(hostDir).pipe(Effect.provide(NodeFileSystem.layer)),
+    );
+    expect(loaded.modelSource).toBe("manual-unverified");
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('codex("custom-model", { effort: "ultra" })');
+  });
+
+  it("init --sandbox host --agent codex --allow-unverified without --model still fails naming the flag", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, false);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads --allow-unverified`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      // The actionable guidance plus the flag that makes the manual entry
+      // explicit — no silent default is ever substituted.
+      expect(output).toContain("codex login");
+      expect(output).toContain("--model");
+      expect(output).toContain("--allow-unverified");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  it("init --sandbox host --agent codex --allow-unverified accepts a model outside the live catalog", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, true);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent codex --model gpt-4-turbo --template blank --sandbox host --issue-tracker beads --allow-unverified`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      model: "gpt-4-turbo",
+      modelSource: "manual-unverified",
+    });
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('codex("gpt-4-turbo")');
+  });
+
+  it("init --sandbox host --agent codex --allow-unverified keeps an unsupported effort as manual-unverified", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+    await writeFakeCodex(shimDir, true);
+
+    // terra only supports medium/xhigh in the fake catalog — "low" is
+    // accepted but the whole selection is honestly marked unverified.
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent codex --model gpt-5.6-terra --effort low --template blank --sandbox host --issue-tracker beads --allow-unverified`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      model: "gpt-5.6-terra",
+      effort: "low",
+      modelSource: "manual-unverified",
+    });
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('codex("gpt-5.6-terra", { effort: "low" })');
   });
 
   // ---------------------------------------------------------------------
