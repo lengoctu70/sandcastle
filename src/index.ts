@@ -60,6 +60,8 @@ export {
   opencode,
   pi,
 } from "./AgentProvider.js";
+export { devin } from "./agents/devin.js";
+export type { DevinOptions } from "./agents/devin.js";
 export type {
   AgentProvider,
   AgentCommandOptions,
@@ -135,6 +137,7 @@ export type {
 // seam above. `sandcastle init` uses it to verify host-mode agents.
 export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
 export { codexDiscoveryAdapter } from "./discovery/codex.js";
+export { devinDiscoveryAdapter } from "./discovery/devin.js";
 export {
   listDiscoveryAdapters,
   getDiscoveryAdapter,
