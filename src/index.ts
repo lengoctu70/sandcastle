@@ -36,11 +36,15 @@ export type { AgentStreamEvent } from "./AgentStreamEmitter.js";
 export {
   transferClaudeSession,
   transferCodexSession,
+  transferGrokSessionFile,
   encodeProjectPath,
+  encodeGrokSessionDir,
   claudeHostSessionPath,
   claudeSandboxSessionPath,
+  grokSessionDirPath,
   findClaudeSessionOnHost,
   findCodexSessionOnHost,
+  findGrokSessionOnHost,
 } from "./SessionStore.js";
 export type { HostSessionLookup } from "./SessionStore.js";
 export type { SandboxHooks } from "./SandboxLifecycle.js";
@@ -60,6 +64,7 @@ export {
   opencode,
   pi,
 } from "./AgentProvider.js";
+export { grok } from "./agents/grok.js";
 export type {
   AgentProvider,
   AgentCommandOptions,
@@ -71,6 +76,7 @@ export type {
   OpenCodeOptions,
   PiOptions,
 } from "./AgentProvider.js";
+export type { GrokOptions } from "./agents/grok.js";
 export {
   createBindMountSandboxProvider,
   createIsolatedSandboxProvider,
@@ -135,6 +141,7 @@ export type {
 // seam above. `sandcastle init` uses it to verify host-mode agents.
 export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
 export { codexDiscoveryAdapter } from "./discovery/codex.js";
+export { grokDiscoveryAdapter } from "./discovery/grok.js";
 export {
   listDiscoveryAdapters,
   getDiscoveryAdapter,

@@ -177,14 +177,14 @@ Agents without an adapter stay on the static picker until their adapter lands.
 For a new agent provider `foo`:
 
 - [ ] Verify session-ID round-trip stability empirically (see [Resume support](#resume-support-required)).
-- [ ] Factory `foo()` in [`src/AgentProvider.ts`](../../src/AgentProvider.ts), with options interface `FooOptions` (including `captureSessions?: boolean`).
+- [ ] Factory `foo()` in `src/agents/foo.ts`, with options interface `FooOptions` (including `captureSessions?: boolean`). New providers are isolated modules — import the shared helpers (`shellEscape`, `TOOL_ARG_FIELDS`, `extractErrorMessage`, `readSandboxFile`, `writeSandboxFile`) from [`src/AgentProvider.ts`](../../src/AgentProvider.ts) rather than editing it (see `src/agents/grok.ts` for the module pattern).
 - [ ] Stream-parsing helper `parseFooStreamLine` that emits `session_id` events alongside `text` / `result` / `tool_call`.
 - [ ] `sessionStorage` sub-object on the factory's return value, implementing `captureToHost`, `resumeIntoSandbox`, `readHostSession`, `existsOnHost`, `hostSessionFilePath`, and `findByIdOnHost` for `foo`'s on-disk layout.
 - [ ] `buildPrintCommand` honours `resumeSession` by appending `foo`'s native resume CLI flag.
-- [ ] Tests in `src/AgentProvider.test.ts` covering `buildPrintCommand` (both fresh and resume forms), `buildInteractiveArgs`, and stream parsing — including session-ID extraction and error events on stdout if applicable.
+- [ ] Tests in `src/agents/foo.test.ts` covering `buildPrintCommand` (both fresh and resume forms), `buildInteractiveArgs`, and stream parsing — including session-ID extraction and error events on stdout if applicable.
 - [ ] Tests covering `sessionStorage` round-trip: capture host↔sandbox, content preserved (and rewritten correctly if `foo`'s format requires it).
 - [ ] Public export from [`src/index.ts`](../../src/index.ts): the `foo` factory and the `FooOptions` type.
 - [ ] `AGENT_REGISTRY` entry in [`src/InitService.ts`](../../src/InitService.ts).
 - [ ] `FOO_DOCKERFILE` constant in `src/InitService.ts`.
-- [ ] Changeset in `.changeset/` (patch, since pre-1.0). See [`CLAUDE.md`](../../CLAUDE.md).
+- [ ] Changeset in `.changeset/` (minor for a new provider, since pre-1.0). See [`AGENTS.md`](../../AGENTS.md).
 - [ ] `README.md` update if the public-facing list of supported agents is mentioned there.
