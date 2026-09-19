@@ -1,8 +1,112 @@
-import { describe, expect, it } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { exec, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { noSandbox } from "./no-sandbox.js";
+import { run } from "../run.js";
+import type { AgentProvider } from "../AgentProvider.js";
 
 const itPosix = process.platform === "win32" ? it.skip : it;
 const itWindows = process.platform === "win32" ? it : it.skip;
+
+const execAsync = promisify(exec);
+
+/** Whether a pid currently belongs to a live (or zombie) process. */
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Poll a condition until it holds or the deadline passes. */
+const waitFor = async (
+  cond: () => boolean,
+  timeoutMs = 10_000,
+): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return cond();
+};
+
+const readPid = async (path: string): Promise<number> =>
+  parseInt((await readFile(path, "utf-8")).trim(), 10);
+
+/**
+ * Wait for the named pid files to appear in `dir`, then read them. The
+ * commands under test write their own pid and their descendants' pids into
+ * these files so assertions can target the whole process tree.
+ */
+const waitForPids = async (
+  dir: string,
+  ...names: string[]
+): Promise<Record<string, number>> => {
+  const paths = names.map((name) => join(dir, name));
+  const ready = await waitFor(() => paths.every((p) => existsSync(p)));
+  if (!ready) {
+    throw new Error(`Timed out waiting for pid files: ${paths.join(", ")}`);
+  }
+  const pids = await Promise.all(paths.map(readPid));
+  return Object.fromEntries(names.map((name, i) => [name, pids[i]!]));
+};
+
+/** Assert every pid dies within the polling window. */
+const expectTreeDead = async (pids: Record<string, number>) => {
+  for (const [name, pid] of Object.entries(pids)) {
+    expect(
+      await waitFor(() => !pidAlive(pid)),
+      `expected ${name} (pid ${pid}) to be dead`,
+    ).toBe(true);
+  }
+};
+
+const initRepo = async (dir: string) => {
+  await execAsync("git init -b main", { cwd: dir });
+  await execAsync('git config user.email "test@test.com"', { cwd: dir });
+  await execAsync('git config user.name "Test"', { cwd: dir });
+  await writeFile(join(dir, "README.md"), "# test\n");
+  await execAsync("git add README.md && git commit -m init", { cwd: dir });
+};
+
+/**
+ * A fake agent provider whose print command is an arbitrary shell command —
+ * the no-sandbox provider runs it via `sh -c`, which lets tests drive real
+ * host process trees through the full `run()` pipeline.
+ */
+const shellAgent = (command: string): AgentProvider => ({
+  name: "shell-agent",
+  env: {},
+  captureSessions: false,
+  buildPrintCommand: () => ({ command }),
+  parseStreamLine: (line) => [{ type: "result", result: line }],
+});
+
+/**
+ * A command that writes the exec'd shell's pid plus two levels of descendant
+ * pids into `dir` and then blocks: `shell.pid` is the `sh` child,
+ * `child.pid` a nested `sh` (grandchild), `grandchild.pid` a `sleep` inside
+ * it (great-grandchild).
+ */
+const treeCommand = (dir: string) =>
+  `echo $$ > "${join(dir, "shell.pid")}"; ` +
+  `sh -c 'sleep 60 & echo $! > "${join(dir, "grandchild.pid")}"; wait' & ` +
+  `echo $! > "${join(dir, "child.pid")}"; ` +
+  `wait`;
 
 describe("noSandbox", () => {
   it("returns a provider with tag 'none'", () => {
@@ -200,7 +304,7 @@ describe("noSandbox", () => {
       expect(result.stderr).toContain("err-5000");
     });
 
-    it("close is a no-op and does not throw", async () => {
+    it("close resolves when nothing is running and is idempotent", async () => {
       const provider = noSandbox();
       const handle = await provider.create({
         worktreePath: process.cwd(),
@@ -208,6 +312,316 @@ describe("noSandbox", () => {
       });
 
       await expect(handle.close()).resolves.toBeUndefined();
+      await expect(handle.close()).resolves.toBeUndefined();
+    });
+  });
+
+  /**
+   * Process-tree termination. The commands under test write their own pid
+   * and their descendants' pids into files inside the worktree directory so
+   * the tests can verify that the whole tree — not just the direct child —
+   * is gone after teardown:
+   *   shell.pid      = the exec'd `sh` (direct child of the host process)
+   *   child.pid      = a nested `sh` (grandchild)
+   *   grandchild.pid = a `sleep` inside the nested `sh` (great-grandchild)
+   */
+  describe("process tree termination", () => {
+    itPosix("close() kills the shell and every descendant", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "no-sandbox-kill-"));
+      try {
+        const handle = await noSandbox().create({ worktreePath: dir, env: {} });
+        const execPromise = handle.exec(treeCommand(dir));
+        const pids = await waitForPids(
+          dir,
+          "shell.pid",
+          "child.pid",
+          "grandchild.pid",
+        );
+        expect(pidAlive(pids["shell.pid"]!)).toBe(true);
+        expect(pidAlive(pids["child.pid"]!)).toBe(true);
+        expect(pidAlive(pids["grandchild.pid"]!)).toBe(true);
+
+        await handle.close();
+        // The pending exec resolves once the tree is dead — it must not hang.
+        await execPromise;
+        await expectTreeDead(pids);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    itPosix(
+      "aborting the exec signal terminates the whole process tree",
+      async () => {
+        const dir = await mkdtemp(join(tmpdir(), "no-sandbox-abort-"));
+        try {
+          const handle = await noSandbox().create({
+            worktreePath: dir,
+            env: {},
+          });
+          const ac = new AbortController();
+          const execPromise = handle.exec(treeCommand(dir), {
+            signal: ac.signal,
+          });
+          const pids = await waitForPids(
+            dir,
+            "shell.pid",
+            "child.pid",
+            "grandchild.pid",
+          );
+
+          ac.abort();
+          await execPromise;
+          await expectTreeDead(pids);
+          // close() afterwards is still safe.
+          await handle.close();
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    itPosix("escalates to SIGKILL when the tree ignores SIGTERM", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "no-sandbox-sigkill-"));
+      try {
+        const handle = await noSandbox({ terminationGraceMs: 100 }).create({
+          worktreePath: dir,
+          env: {},
+        });
+        // The outer shell ignores SIGTERM and loops forever — only SIGKILL
+        // can reap it. If close() never escalated, this test would fail on
+        // the still-alive shell.
+        const execPromise = handle.exec(
+          `trap "" TERM; echo $$ > "${join(dir, "shell.pid")}"; ` +
+            `while :; do sleep 60; done`,
+        );
+        const pids = await waitForPids(dir, "shell.pid");
+        expect(pidAlive(pids["shell.pid"]!)).toBe(true);
+
+        await handle.close();
+        await execPromise;
+        await expectTreeDead(pids);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    itPosix("close() is idempotent while a process is running", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "no-sandbox-idem-"));
+      try {
+        const handle = await noSandbox().create({ worktreePath: dir, env: {} });
+        const execPromise = handle.exec(treeCommand(dir));
+        const pids = await waitForPids(
+          dir,
+          "shell.pid",
+          "child.pid",
+          "grandchild.pid",
+        );
+
+        // Concurrent and repeated calls must all resolve without throwing.
+        await Promise.all([handle.close(), handle.close()]);
+        await handle.close();
+        await execPromise;
+        await expectTreeDead(pids);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    itPosix(
+      "close() after a successful exec does not signal unrelated processes",
+      async () => {
+        const dir = await mkdtemp(join(tmpdir(), "no-sandbox-success-"));
+        const unrelated = spawn("sleep", ["60"], {
+          detached: true,
+          stdio: "ignore",
+        });
+        try {
+          const handle = await noSandbox().create({
+            worktreePath: dir,
+            env: {},
+          });
+          const result = await handle.exec("echo done");
+          expect(result.exitCode).toBe(0);
+
+          await handle.close();
+          // The finished exec is no longer tracked, so teardown must not
+          // touch this process — it shares nothing with the handle.
+          expect(pidAlive(unrelated.pid!)).toBe(true);
+        } finally {
+          try {
+            process.kill(-unrelated.pid!, "SIGKILL");
+          } catch {
+            /* already gone */
+          }
+          await rm(dir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    itPosix("close() kills a running interactiveExec process", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "no-sandbox-interactive-"));
+      try {
+        const handle = await noSandbox({ terminationGraceMs: 100 }).create({
+          worktreePath: dir,
+          env: {},
+        });
+        const resultPromise = handle.interactiveExec(
+          ["sh", "-c", `echo $$ > "${join(dir, "shell.pid")}"; sleep 60`],
+          {
+            stdin: process.stdin,
+            stdout: process.stdout,
+            stderr: process.stderr,
+          },
+        );
+        const pids = await waitForPids(dir, "shell.pid");
+        expect(pidAlive(pids["shell.pid"]!)).toBe(true);
+
+        await handle.close();
+        await resultPromise;
+        await expectTreeDead(pids);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    itPosix("exec on a closed handle rejects instead of leaking", async () => {
+      const handle = await noSandbox().create({
+        worktreePath: process.cwd(),
+        env: {},
+      });
+      await handle.close();
+      await expect(handle.exec("sleep 60")).rejects.toThrow(/closed/);
+    });
+
+    itWindows(
+      "close() terminates a running exec tree via taskkill",
+      async () => {
+        const handle = await noSandbox().create({
+          worktreePath: process.cwd(),
+          env: {},
+        });
+        const execPromise = handle.exec("ping -n 60 127.0.0.1 > NUL");
+        // Give cmd.exe a moment to spawn the ping child.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        await handle.close();
+        await expect(execPromise).resolves.toBeDefined();
+      },
+    );
+  });
+
+  /**
+   * End-to-end wiring: run()'s cancellation and timeout paths must reach the
+   * no-sandbox handle's termination — nothing may be left running on the host.
+   */
+  describe("run() cancellation and timeouts", () => {
+    let consoleSpy: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      consoleSpy.mockRestore();
+    });
+
+    itPosix("idle timeout terminates the host process tree", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "no-sandbox-run-idle-"));
+      await initRepo(dir);
+      try {
+        const runPromise = run({
+          agent: shellAgent(
+            `echo $$ > "${join(dir, "shell.pid")}"; ` +
+              `sleep 60 & echo $! > "${join(dir, "child.pid")}"; wait`,
+          ),
+          sandbox: noSandbox({ terminationGraceMs: 100 }),
+          prompt: "work",
+          cwd: dir,
+          idleTimeoutSeconds: 0.3,
+          logging: { type: "file", path: join(dir, "run.log") },
+        });
+        const pids = await waitForPids(dir, "shell.pid", "child.pid");
+        // run() surfaces Effect failures as FiberFailure — the embedded cause
+        // message still names the idle timeout.
+        await expect(runPromise).rejects.toThrowError(/idle/i);
+        await expectTreeDead(pids);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    itPosix(
+      "completion timeout terminates the hanging host process tree",
+      async () => {
+        const dir = await mkdtemp(join(tmpdir(), "no-sandbox-run-completion-"));
+        await initRepo(dir);
+        try {
+          const result = await run({
+            agent: shellAgent(
+              `echo "<promise>COMPLETE</promise>"; ` +
+                `echo $$ > "${join(dir, "shell.pid")}"; ` +
+                `sleep 60 & echo $! > "${join(dir, "child.pid")}"; wait`,
+            ),
+            sandbox: noSandbox({ terminationGraceMs: 100 }),
+            prompt: "work",
+            cwd: dir,
+            idleTimeoutSeconds: 30,
+            completionTimeoutSeconds: 0.2,
+            logging: { type: "file", path: join(dir, "run.log") },
+          });
+          // The run force-completes successfully while the process is still
+          // alive; teardown in the release phase must have reaped the tree.
+          expect(result.completionSignal).toBe("<promise>COMPLETE</promise>");
+          const pids = await waitForPids(dir, "shell.pid", "child.pid");
+          await expectTreeDead(pids);
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    itPosix("abort terminates the host process tree before rejecting", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "no-sandbox-run-abort-"));
+      await initRepo(dir);
+      try {
+        const ac = new AbortController();
+        const runPromise = run({
+          agent: shellAgent(treeCommand(dir)),
+          sandbox: noSandbox({ terminationGraceMs: 100 }),
+          prompt: "work",
+          cwd: dir,
+          signal: ac.signal,
+          idleTimeoutSeconds: 30,
+          logging: { type: "file", path: join(dir, "run.log") },
+        });
+        const pids = await waitForPids(
+          dir,
+          "shell.pid",
+          "child.pid",
+          "grandchild.pid",
+        );
+        ac.abort();
+        await expect(runPromise).rejects.toThrow(/abort/i);
+        await expectTreeDead(pids);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    itPosix("a successful run leaves no host processes behind", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "no-sandbox-run-ok-"));
+      await initRepo(dir);
+      try {
+        const result = await run({
+          agent: shellAgent(`echo "<promise>COMPLETE</promise>"`),
+          sandbox: noSandbox(),
+          prompt: "work",
+          cwd: dir,
+          idleTimeoutSeconds: 30,
+          logging: { type: "file", path: join(dir, "run.log") },
+        });
+        expect(result.completionSignal).toBe("<promise>COMPLETE</promise>");
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
     });
   });
 });

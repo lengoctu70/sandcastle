@@ -43,6 +43,12 @@ export interface SandboxService {
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
+      /**
+       * AbortSignal for cancelling this execution. Providers that spawn host
+       * processes (e.g. no-sandbox) terminate the spawned process tree when
+       * the signal aborts; container providers may ignore it.
+       */
+      signal?: AbortSignal;
     },
   ) => Effect.Effect<ExecResult, ExecError>;
 
