@@ -584,6 +584,7 @@ describe("InitService scaffold", () => {
   describe("getNextStepsLines", () => {
     const ghIssues = getIssueTracker("github-issues")!;
     const customManager = getIssueTracker("custom")!;
+    const dockerProvider = getSandboxProvider("docker")!;
     // Non-custom issue tracker keeps the template-driven next steps; the
     // custom branch is exercised separately below.
     const next = (
@@ -597,6 +598,7 @@ describe("InitService scaffold", () => {
         ghIssues,
         claudeCodeAgent,
         packageManager,
+        dockerProvider,
       );
 
     it("blank template returns steps mentioning .env and main filename (not npx sandcastle run)", () => {
@@ -735,6 +737,7 @@ describe("InitService scaffold", () => {
         ghIssues,
         piAgent,
         "npm",
+        dockerProvider,
       ).join("\n");
       const codexLines = getNextStepsLines(
         "blank",
@@ -742,6 +745,7 @@ describe("InitService scaffold", () => {
         ghIssues,
         codexAgent,
         "npm",
+        dockerProvider,
       ).join("\n");
       expect(piLines).not.toContain("claude setup-token");
       expect(piLines).not.toContain("CLAUDE_CODE_OAUTH_TOKEN");
@@ -769,6 +773,7 @@ describe("InitService scaffold", () => {
         customManager,
         claudeCodeAgent,
         "npm",
+        dockerProvider,
       );
       const joined = lines.join("\n");
       expect(joined).toContain("SETUP_ISSUE_TRACKER.md");
@@ -784,10 +789,76 @@ describe("InitService scaffold", () => {
         customManager,
         getAgent("opencode")!,
         "npm",
+        dockerProvider,
       );
       const joined = lines.join("\n");
       expect(joined.toLowerCase()).toContain("host");
       expect(joined).toContain(getAgent("opencode")!.setupCommand);
+    });
+
+    // --- Host mode next steps (ADR 0021/0026) ---
+
+    const hostProvider = getSandboxProvider("host")!;
+    const hostNext = (
+      template: string,
+      mainFilename: string,
+      issueTracker = ghIssues,
+    ) =>
+      getNextStepsLines(
+        template,
+        mainFilename,
+        issueTracker,
+        claudeCodeAgent,
+        "npm",
+        hostProvider,
+      ).join("\n");
+
+    it("host mode next steps are Vietnamese and reuse the host CLI login", () => {
+      const joined = hostNext("blank", "main.mts");
+      expect(joined).toContain("Các bước tiếp theo");
+      expect(joined).toContain("đăng nhập");
+      expect(joined).toContain("dùng lại phiên đăng nhập CLI");
+      expect(joined).toContain("không cần API key");
+    });
+
+    it("host mode next steps never mention images, builds, or API-key setup", () => {
+      for (const template of ["blank", "simple-loop", "parallel-planner"]) {
+        const joined = hostNext(template, "main.mts");
+        expect(joined).not.toContain("build-image");
+        expect(joined).not.toContain("Dockerfile");
+        expect(joined).not.toContain("image");
+        expect(joined).not.toContain("CLAUDE_CODE_OAUTH_TOKEN");
+        expect(joined).not.toContain("claude setup-token");
+        // "không cần API key" is the only permitted mention of API keys —
+        // an explicit statement that none is needed, never a setup step.
+        expect(joined).not.toContain("Set the required env vars");
+        // Package-script and run instructions are retained.
+        expect(joined).toContain("npm run sandcastle");
+      }
+    });
+
+    it("host mode next steps mention env only when the tracker needs it", () => {
+      const beads = getIssueTracker("beads")!;
+      const withGithub = hostNext("blank", "main.mts", ghIssues);
+      const withBeads = hostNext("blank", "main.mts", beads);
+      // github-issues requires GH_TOKEN; beads requires nothing.
+      expect(withGithub).toContain(".env");
+      expect(withBeads).not.toContain(".env.example");
+    });
+
+    it("host mode + custom tracker keeps the English custom setup steps", () => {
+      const joined = getNextStepsLines(
+        "blank",
+        "main.mts",
+        customManager,
+        claudeCodeAgent,
+        "npm",
+        hostProvider,
+      ).join("\n");
+      expect(joined).toContain("SETUP_ISSUE_TRACKER.md");
+      // No image exists, so the "image isn't built yet" aside is dropped.
+      expect(joined).not.toContain("image isn't built yet");
+      expect(joined).not.toContain("build the image");
     });
   });
 
@@ -2385,6 +2456,169 @@ describe("InitService scaffold", () => {
         'import { docker } from "@ai-hero/sandcastle/sandboxes/docker"',
       );
       expect(mainTs).toContain("sandbox: docker()");
+    });
+
+    // --- Host mode (ADR 0021) — backed by the existing noSandbox provider ---
+
+    const hostProvider = getSandboxProvider("host")!;
+
+    it("selecting host writes no Dockerfile or Containerfile", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { sandboxProvider: hostProvider });
+
+      const { access } = await import("node:fs/promises");
+      await expect(
+        access(join(dir, ".sandcastle", "Dockerfile")),
+      ).rejects.toThrow();
+      await expect(
+        access(join(dir, ".sandcastle", "Containerfile")),
+      ).rejects.toThrow();
+    });
+
+    it("selecting host rewrites the main file to import and call noSandbox", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { sandboxProvider: hostProvider });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      // Two-phase rewrite: the import subpath is `no-sandbox` while the
+      // factory identifier is `noSandbox` — a single word replace would
+      // produce `sandboxes/noSandbox`.
+      expect(mainTs).toContain(
+        'import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox"',
+      );
+      expect(mainTs).toContain("sandbox: noSandbox()");
+      expect(mainTs).not.toContain("docker");
+      expect(mainTs).not.toContain("podman");
+    });
+
+    it("selecting host injects merge-to-head into run() calls without a branchStrategy", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { sandboxProvider: hostProvider });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      // The no-sandbox runtime default is `head`; host mode must work in a
+      // separate worktree instead of editing the user's checkout directly.
+      expect(mainTs).toContain('branchStrategy: { type: "merge-to-head" }');
+      // Injected after the sandbox option, inside the run({...}) options.
+      const runCall = mainTs.slice(mainTs.indexOf("run({"));
+      expect(runCall.indexOf("sandbox: noSandbox()")).toBeLessThan(
+        runCall.indexOf('branchStrategy: { type: "merge-to-head" }'),
+      );
+    });
+
+    it("selecting host leaves explicit branchStrategy on run() untouched", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        templateName: "parallel-planner",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("sandbox: noSandbox()");
+      // The per-issue branch strategy is preserved verbatim — not clobbered
+      // by the merge-to-head injection.
+      expect(mainTs).toContain(
+        'branchStrategy: { type: "branch", branch: issue.branch }',
+      );
+      // ...while calls that pinned no strategy (planner, merger) got
+      // merge-to-head injected.
+      expect(
+        mainTs.match(/branchStrategy: \{ type: "merge-to-head" \}/g)!.length,
+      ).toBeGreaterThanOrEqual(2);
+    });
+
+    it("selecting host does not inject branchStrategy into createSandbox calls", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        templateName: "sequential-reviewer",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      // createSandbox takes an explicit `branch`, not `branchStrategy` — the
+      // injector only touches run({...}) calls selecting noSandbox().
+      const createCall = mainTs.slice(
+        mainTs.indexOf("createSandbox({"),
+        mainTs.indexOf("});", mainTs.indexOf("createSandbox({")),
+      );
+      expect(createCall).toContain("sandbox: noSandbox()");
+      expect(createCall).not.toContain("branchStrategy");
+      // Member calls on the reusable sandbox handle carry no sandbox option,
+      // so they are never rewritten.
+      expect(mainTs).toContain("sandbox.run(");
+    });
+
+    it("selecting host omits agent API-key env entries but keeps tracker env", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        issueTracker: getIssueTracker("github-issues"),
+      });
+
+      const envExample = await readFile(
+        join(dir, ".sandcastle", ".env.example"),
+        "utf-8",
+      );
+      // Host mode reuses the agent's existing CLI login — no agent auth env.
+      expect(envExample).not.toContain("CLAUDE_CODE_OAUTH_TOKEN");
+      expect(envExample).not.toContain("ANTHROPIC_API_KEY");
+      expect(envExample).not.toContain("OPENAI_KEY");
+      expect(envExample).toContain("No agent API key is required");
+      // Project-required env (the issue tracker's) is still scaffolded.
+      expect(envExample).toContain("GH_TOKEN=");
+    });
+
+    it("selecting host persists sandbox 'host' in settings.json", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { sandboxProvider: hostProvider });
+
+      const settings = JSON.parse(
+        await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+      );
+      expect(settings.sandbox).toBe("host");
+    });
+
+    it("host + custom tracker writes a setup doc with no image-build step", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        issueTracker: getIssueTracker("custom"),
+      });
+
+      const setup = await readFile(
+        join(dir, ".sandcastle", "SETUP_ISSUE_TRACKER.md"),
+        "utf-8",
+      );
+      expect(setup).not.toContain("build-image");
+      expect(setup).toContain("no sandbox image");
+      // The tracker CLI must live on the host, not in an image.
+      expect(setup).toContain("install and authenticate it on this machine");
+    });
+
+    it("docker + custom tracker keeps the image-build step in the setup doc", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: dockerProvider,
+        issueTracker: getIssueTracker("custom"),
+      });
+
+      const setup = await readFile(
+        join(dir, ".sandcastle", "SETUP_ISSUE_TRACKER.md"),
+        "utf-8",
+      );
+      expect(setup).toContain("sandcastle docker build-image");
     });
   });
 });

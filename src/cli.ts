@@ -83,6 +83,17 @@ const requireConfigDir = (
 
 // --- Init command ---
 
+/**
+ * Host-access warning shown whenever host mode is selected, before the choice
+ * is persisted to settings.json (ADR 0021). Vietnamese per ADR 0026 — it must
+ * never describe a worktree as operating-system isolation.
+ */
+const HOST_MODE_WARNING =
+  "Cảnh báo chế độ host: agent sẽ chạy trực tiếp trên máy của bạn trong một git worktree. " +
+  "Worktree KHÔNG phải là sự cô lập ở cấp hệ điều hành — agent vẫn giữ toàn bộ " +
+  "quyền truy cập tệp và tiến trình của tài khoản bạn. " +
+  "Nếu cần ranh giới bảo mật thực sự, hãy chọn Docker hoặc Podman.";
+
 const templateOption = Options.text("template").pipe(
   Options.withDescription(
     "Template to scaffold (e.g. blank, simple-loop, parallel-planner)",
@@ -103,7 +114,9 @@ const initModelOption = Options.text("model").pipe(
 );
 
 const sandboxOption = Options.text("sandbox").pipe(
-  Options.withDescription("Sandbox provider to use (e.g. docker, podman)"),
+  Options.withDescription(
+    "Sandbox provider to use (e.g. host, docker, podman)",
+  ),
   Options.optional,
 );
 
@@ -324,6 +337,7 @@ const initCommand = Command.make(
             options: sandboxProviders.map((p) => ({
               value: p.name,
               label: p.label,
+              ...(p.selectHint !== undefined ? { hint: p.selectHint } : {}),
             })),
           }),
         );
@@ -335,6 +349,13 @@ const initCommand = Command.make(
           );
         }
         selectedSandboxProvider = getSandboxProvider(selected as string)!;
+      }
+
+      // Host mode runs the agent directly on this machine — surface the
+      // trust warning before the choice is saved to settings.json (ADR 0021).
+      // Shown for both flag and picker selection, interactive or not.
+      if (selectedSandboxProvider.runsOnHost) {
+        yield* d.status(HOST_MODE_WARNING, "warn");
       }
 
       // Resolve issue tracker: CLI flag > interactive select (already validated above)
@@ -479,9 +500,19 @@ const initCommand = Command.make(
       // (and silently ignore --build-image) and let the next steps point the
       // user at the setup doc.
       const providerLabel = selectedSandboxProvider.label;
+      const cliNamespace = selectedSandboxProvider.cliNamespace;
       if (selectedIssueTracker.name === "custom") {
         yield* d.status(
-          "Init complete! Your custom issue tracker isn't configured yet — see the steps below before building.",
+          cliNamespace === undefined
+            ? "Init complete! Your custom issue tracker isn't configured yet — see the steps below."
+            : "Init complete! Your custom issue tracker isn't configured yet — see the steps below before building.",
+          "success",
+        );
+      } else if (cliNamespace === undefined) {
+        // Host mode: there is no image, so no build prompt, no build, and no
+        // build-image next step — --build-image is ignored entirely.
+        yield* d.status(
+          "Khởi tạo xong! Chế độ host chạy agent trực tiếp trên máy của bạn — không có image nào để build.",
           "success",
         );
       } else {
@@ -513,7 +544,7 @@ const initCommand = Command.make(
           );
         } else {
           yield* d.status(
-            `Init complete! Run \`sandcastle ${selectedSandboxProvider.cliNamespace} build-image\` to build the ${providerLabel} image later.`,
+            `Init complete! Run \`sandcastle ${cliNamespace} build-image\` to build the ${providerLabel} image later.`,
             "success",
           );
         }
@@ -526,6 +557,7 @@ const initCommand = Command.make(
         selectedIssueTracker,
         selectedAgent,
         packageManager,
+        selectedSandboxProvider,
       );
       for (const [i, line] of nextSteps.entries()) {
         yield* d.text(i === 0 ? line : styleText("dim", line));

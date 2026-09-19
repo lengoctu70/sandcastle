@@ -15,6 +15,14 @@ worktrees/
 `;
 
 /**
+ * `.env.example` header emitted instead of the agent API-key block for host
+ * mode — the agent reuses its existing host CLI login (ADR 0021). Generated
+ * file content stays English; only interactive surfaces are Vietnamese.
+ */
+const HOST_ENV_NOTE = `# Host mode — the agent reuses its existing CLI login on this machine.
+# No agent API key is required.`;
+
+/**
  * Filename of the setup prompt scaffolded for the `custom` issue tracker.
  * Both the per-agent `setupCommand` and the in-scaffold sentinels point at it,
  * so it is defined once here.
@@ -589,26 +597,90 @@ export const getAgent = (name: string): AgentEntry | undefined =>
 // ---------------------------------------------------------------------------
 
 export interface SandboxProviderEntry {
+  /**
+   * Registry name — the `--sandbox <name>` flag value, the interactive picker
+   * value, and the `sandbox` choice persisted to `settings.json`. Host mode's
+   * name is the user-facing `"host"` (ADR 0021), not the backing provider's
+   * internal `"no-sandbox"` name.
+   */
   readonly name: string;
+  /** Human-facing picker label. */
   readonly label: string;
-  /** Filename written to .sandcastle/ (e.g. "Dockerfile" or "Containerfile") */
-  readonly containerfileName: string;
-  /** CLI namespace for build/remove commands (e.g. "docker" or "podman") */
-  readonly cliNamespace: string;
+  /**
+   * Optional picker hint shown next to the label. New user-facing strings are
+   * Vietnamese per ADR 0026; identifiers stay English.
+   */
+  readonly selectHint?: string;
+  /**
+   * Image file written to `.sandcastle/` (e.g. "Dockerfile" or
+   * "Containerfile"). Absent for providers that never build an image — host
+   * mode writes no Dockerfile/Containerfile at all.
+   */
+  readonly containerfileName?: string;
+  /**
+   * CLI namespace for `build-image`/`remove-image` (e.g. "docker" or
+   * "podman"). Absent for providers with no image commands — host mode skips
+   * every image prompt, build operation, and image-oriented next step.
+   */
+  readonly cliNamespace?: string;
+  /**
+   * `true` when the provider runs the agent on the host itself — ADR 0021
+   * host mode, backed by `noSandbox()`. Host providers reuse the agent's
+   * existing host CLI login, so the scaffold omits the agent API-key env
+   * block; the CLI shows the host-access warning before saving the choice.
+   * Deliberately separate from `cliNamespace`/`containerfileName` presence —
+   * a future remote provider could also lack image commands without sharing
+   * host mode's trust model.
+   */
+  readonly runsOnHost?: boolean;
+  /**
+   * How the provider renders into generated `main` files. Templates always
+   * write `docker()` as the placeholder: `importSubpath` replaces `docker`
+   * inside the `sandboxes/<subpath>` import path, then `factoryImport`
+   * replaces every remaining `docker` identifier (the named import and all
+   * call sites).
+   */
+  readonly codegen: {
+    readonly factoryImport: string;
+    readonly importSubpath: string;
+    /**
+     * When set, `branchStrategy: <literal>` is generated into every
+     * `run({…})` call that selects this provider via `sandbox:` but pins no
+     * `branchStrategy` of its own. Host mode uses it to force
+     * `merge-to-head` — the no-sandbox runtime default is `head`, which would
+     * run the agent directly in the user's checkout instead of a worktree
+     * (ADR 0021 requires a worktree for unattended host runs).
+     */
+    readonly runBranchStrategy?: string;
+  };
 }
 
 const SANDBOX_PROVIDER_REGISTRY: SandboxProviderEntry[] = [
+  {
+    name: "host",
+    label: "Host",
+    selectHint:
+      "Chạy agent trực tiếp trên máy này — dùng lại đăng nhập CLI sẵn có, không cô lập hệ điều hành",
+    runsOnHost: true,
+    codegen: {
+      factoryImport: "noSandbox",
+      importSubpath: "no-sandbox",
+      runBranchStrategy: '{ type: "merge-to-head" }',
+    },
+  },
   {
     name: "docker",
     label: "Docker",
     containerfileName: "Dockerfile",
     cliNamespace: "docker",
+    codegen: { factoryImport: "docker", importSubpath: "docker" },
   },
   {
     name: "podman",
     label: "Podman",
     containerfileName: "Containerfile",
     cliNamespace: "podman",
+    codegen: { factoryImport: "podman", importSubpath: "podman" },
   },
 ];
 
@@ -630,20 +702,35 @@ export function getNextStepsLines(
   issueTracker: IssueTrackerEntry,
   agent: AgentEntry,
   packageManager: PackageManager,
+  sandboxProvider: SandboxProviderEntry,
 ): string[] {
   // The custom issue tracker scaffolds a broken-until-configured project, so
   // its next steps are about running the setup prompt — not the template's
   // normal "set env vars and go" flow. This branch wins over template-specific
-  // steps regardless of the chosen template.
+  // steps regardless of the chosen template. Stays English — the custom flow
+  // is agent-facing setup work, and the setup doc itself is English.
   if (issueTracker.name === "custom") {
+    const hasImage = sandboxProvider.cliNamespace !== undefined;
     return [
       "Next steps:",
       "1. Your custom issue tracker isn't wired up yet — runs hard-fail until you configure it.",
       `2. Feed the setup prompt to ${agent.label} on your host to finish wiring it up:`,
       `   ${agent.setupCommand}`,
-      `   (Runs on the host — you need the ${agent.label} CLI installed locally, since the sandbox image isn't built yet.)`,
-      `3. Follow .sandcastle/${SETUP_ISSUE_TRACKER_DOC} to edit the scaffolded files in place, build the image, and verify.`,
+      `   (Runs on the host — you need the ${agent.label} CLI installed locally${hasImage ? ", since the sandbox image isn't built yet" : ""}.)`,
+      `3. Follow .sandcastle/${SETUP_ISSUE_TRACKER_DOC} to edit the scaffolded files in place${hasImage ? ", build the image," : ""} and verify.`,
     ];
+  }
+  // Host mode (ADR 0021): the agent runs on this machine with its existing
+  // CLI login — no image to build, no API key to set. Vietnamese per ADR 0026;
+  // commands, filenames, and identifiers stay English.
+  if (sandboxProvider.runsOnHost) {
+    return hostNextStepsLines(
+      template,
+      mainFilename,
+      issueTracker,
+      agent,
+      packageManager,
+    );
   }
   if (template === "blank") {
     const lines = [
@@ -696,6 +783,58 @@ export function getNextStepsLines(
     return lines;
   }
 }
+
+/**
+ * Next steps for host mode (ADR 0021) — Vietnamese per ADR 0026. There is no
+ * image to build and no agent API key to set; the agent reuses its existing
+ * host CLI login. Only env the project itself needs (e.g. the issue
+ * tracker's) is mentioned.
+ */
+const hostNextStepsLines = (
+  template: string,
+  mainFilename: string,
+  issueTracker: IssueTrackerEntry,
+  agent: AgentEntry,
+  packageManager: PackageManager,
+): string[] => {
+  const hasReviewer = template.includes("review");
+  const usesPlanSchema = getTemplateDependencies(template).includes("zod");
+  const lines = [
+    "Các bước tiếp theo:",
+    `1. Đảm bảo ${agent.label} đã được cài đặt và đăng nhập trên máy này — host mode dùng lại phiên đăng nhập CLI hiện có, không cần API key.`,
+  ];
+  let step = 2;
+  if (issueTracker.envExample) {
+    lines.push(
+      `${step++}. Đặt các biến môi trường cần thiết trong .sandcastle/.env (xem .sandcastle/.env.example)`,
+    );
+  }
+  if (usesPlanSchema) {
+    lines.push(
+      `${step++}. Cài đặt schema validator cho output \`<plan>\` của planner — template dùng Zod (\`${addDependencyCommand(packageManager, "zod")}\`), nhưng Valibot, ArkType, hoặc một thư viện Standard Schema bất kỳ đều được (https://standardschema.dev)`,
+    );
+  }
+  if (template === "blank") {
+    lines.push(
+      `${step++}. Đọc và chỉnh sửa .sandcastle/prompt.md để mô tả việc bạn muốn agent làm`,
+      `${step++}. Tùy chỉnh .sandcastle/${mainFilename} — file này dùng JS API (\`run()\`) để điều khiển cách agent chạy`,
+    );
+  } else {
+    lines.push(
+      `${step++}. Đọc và chỉnh sửa các tệp prompt trong .sandcastle/ — chúng quyết định việc agent làm`,
+    );
+    if (hasReviewer) {
+      lines.push(
+        `${step++}. Tùy chỉnh .sandcastle/CODING_STANDARDS.md theo chuẩn của dự án — reviewer agent đọc tệp này khi review`,
+      );
+    }
+  }
+  lines.push(
+    `${step++}. Thêm "sandcastle": "npx tsx .sandcastle/${mainFilename}" vào package.json scripts`,
+    `${step++}. Chạy \`npm run sandcastle\` để khởi động agent`,
+  );
+  return lines;
+};
 
 // ---------------------------------------------------------------------------
 // Scaffolding helpers
@@ -759,6 +898,74 @@ const copyTemplateFiles = (
     );
   });
 
+const escapeRegExp = (s: string): string =>
+  s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Find the offset of the `}` matching the `{` at `openIdx` via naive brace
+ * counting — sufficient for generated template mains, where strings inside
+ * option literals only ever contain balanced `${…}` interpolations.
+ */
+const findMatchingBrace = (text: string, openIdx: number): number => {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+};
+
+/**
+ * Insert `branchStrategy: <literal>` into every `run({…})` call that selects
+ * `sandbox: <factory>()` but declares no `branchStrategy` of its own.
+ *
+ * `x.run({…})` member calls (e.g. `sandbox.run(…)` on a reusable handle) match
+ * the `run(` scan but carry no `sandbox:` option, so they're skipped — as are
+ * `createSandbox({…})` calls, which never match `run(` and always take an
+ * explicit `branch`. Calls that already pin a strategy are left untouched.
+ */
+const injectRunBranchStrategy = (
+  content: string,
+  factoryImport: string,
+  branchStrategyLiteral: string,
+): string => {
+  const escapedFactory = escapeRegExp(factoryImport);
+  const callRe = /\brun\s*\(\s*\{/g;
+  const sandboxRe = new RegExp(`\\bsandbox\\s*:\\s*${escapedFactory}\\(\\)`);
+  const sandboxLineRe = new RegExp(
+    `^([ \\t]*)sandbox:\\s*${escapedFactory}\\(\\),`,
+    "m",
+  );
+  let result = "";
+  let cursor = 0;
+  for (
+    let match = callRe.exec(content);
+    match !== null;
+    match = callRe.exec(content)
+  ) {
+    const openBrace = match.index + match[0].length - 1;
+    const closeBrace = findMatchingBrace(content, openBrace);
+    if (closeBrace === -1) break;
+    let callText = content.slice(match.index, closeBrace + 1);
+    if (sandboxRe.test(callText) && !/\bbranchStrategy\b/.test(callText)) {
+      callText = callText.replace(
+        sandboxLineRe,
+        (line, indent: string) =>
+          `${line}\n${indent}// Work in a separate worktree and merge back on success —\n${indent}// the agent never edits your checkout directly.\n${indent}branchStrategy: ${branchStrategyLiteral},`,
+      );
+    }
+    result += content.slice(cursor, match.index) + callText;
+    cursor = closeBrace + 1;
+    // Skip any `run({` matches nested inside the call just processed.
+    callRe.lastIndex = closeBrace + 1;
+  }
+  return result + content.slice(cursor);
+};
+
 /**
  * Replace the agent factory and sandbox provider in a scaffolded main.ts.
  *
@@ -807,12 +1014,33 @@ const rewriteMainTs = (
     );
 
     // Replace the sandbox provider. Templates always use `docker` as the
-    // placeholder, where the registry name doubles as both the factory function
-    // name and the `/sandboxes/<name>` import subpath segment. A single
-    // case-sensitive word-boundary replace therefore rewrites the named import,
-    // the import subpath, and every factory call site — and is a no-op when
-    // docker is selected.
-    content = content.replace(/\bdocker\b/g, sandboxProvider.name);
+    // placeholder — both the factory identifier and the `sandboxes/docker`
+    // import subpath segment. The subpath is rewritten first so the
+    // identifier pass never sees it: host mode's factory (`noSandbox`) differs
+    // from its subpath (`no-sandbox`), and a single word-boundary replace
+    // would wrongly produce `sandboxes/noSandbox`. For docker/podman this is
+    // equivalent to the old one-pass replace (both fields equal the name).
+    content = content.replace(
+      /sandboxes\/docker\b/g,
+      `sandboxes/${sandboxProvider.codegen.importSubpath}`,
+    );
+    content = content.replace(
+      /\bdocker\b/g,
+      sandboxProvider.codegen.factoryImport,
+    );
+
+    // Host mode pins an explicit branch strategy into every generated `run()`
+    // call that doesn't declare one — the no-sandbox runtime default is
+    // `head`, which would run the agent directly in the user's checkout
+    // instead of a worktree (ADR 0021).
+    const runBranchStrategy = sandboxProvider.codegen.runBranchStrategy;
+    if (runBranchStrategy !== undefined) {
+      content = injectRunBranchStrategy(
+        content,
+        sandboxProvider.codegen.factoryImport,
+        runBranchStrategy,
+      );
+    }
 
     yield* fs
       .writeFileString(mainTsPath, content)
@@ -918,10 +1146,33 @@ const substituteTemplateArgs = (
  * Build the `SETUP_ISSUE_TRACKER.md` prompt scaffolded for the `custom` issue
  * tracker. It addresses the user's coding agent and walks it through wiring up
  * the tracker by editing the scaffolded files in place. The build command is
- * provider-parameterized so it names the actual CLI namespace (docker/podman).
+ * provider-parameterized so it names the actual CLI namespace (docker/podman);
+ * host mode has no image, so its variant installs and verifies on the host.
  */
-const buildSetupIssueTrackerDoc = (cliNamespace: string): string =>
-  `# Set up your custom issue tracker
+const buildSetupIssueTrackerDoc = (
+  sandboxProvider: SandboxProviderEntry,
+): string => {
+  const hasImage = sandboxProvider.cliNamespace !== undefined;
+  const trackerToolsEdit = hasImage
+    ? `- **Dockerfile / Containerfile** — replace the line
+
+  \`\`\`
+  ${CUSTOM_TRACKER_TOOLS}
+  \`\`\`
+
+  with the install steps for your tracker's CLI (if it needs one).`
+    : `- **Host machine** — host mode writes no Dockerfile/Containerfile. If your tracker needs a CLI, install and authenticate it on this machine instead (e.g. \`brew install gh\` then \`gh auth login\`).`;
+  const buildStep = hasImage
+    ? `Once the files are wired up, build the sandbox image:
+
+\`\`\`
+sandcastle ${sandboxProvider.cliNamespace} build-image
+\`\`\``
+    : `Nothing to build — host mode runs the agent directly on your machine, so there is no sandbox image.`;
+  const verify = hasImage
+    ? "Run your **list** command inside the built image and confirm it returns the open tasks as JSON. If it errors, fix the command or the auth and rebuild."
+    : "Run your **list** command on the host and confirm it returns the open tasks as JSON. If it errors, fix the command or the host CLI login.";
+  return `# Set up your custom issue tracker
 
 You are a coding agent. Finish wiring up the **custom issue tracker** for this Sandcastle project. It was scaffolded in a deliberately broken-until-configured state: until you complete the steps below, every Sandcastle run hard-fails with a pointer back to this file.
 
@@ -946,13 +1197,7 @@ Work out, together with the user, the shell commands for:
 
 ## 3. Edit the scaffolded files in place
 
-- **Dockerfile / Containerfile** — replace the line
-
-  \`\`\`
-  ${CUSTOM_TRACKER_TOOLS}
-  \`\`\`
-
-  with the install steps for your tracker's CLI (if it needs one).
+${trackerToolsEdit}
 
 - **Prompt files (\`.sandcastle/*.md\`)** — replace the sentinel
 
@@ -966,16 +1211,13 @@ Work out, together with the user, the shell commands for:
 
 ## 4. Build the image
 
-Once the files are wired up, build the sandbox image:
-
-\`\`\`
-sandcastle ${cliNamespace} build-image
-\`\`\`
+${buildStep}
 
 ## 5. Verify
 
-Run your **list** command inside the built image and confirm it returns the open tasks as JSON. If it errors, fix the command or the auth and rebuild.
+${verify}
 `;
+};
 
 // ---------------------------------------------------------------------------
 // Main scaffold function
@@ -1038,7 +1280,10 @@ export const scaffold = (
       templateName = "blank",
       createLabel = true,
       issueTracker = ISSUE_TRACKER_REGISTRY[0]!, // default: github-issues
-      sandboxProvider = SANDBOX_PROVIDER_REGISTRY[0]!, // default: docker
+      // default: docker — pinned explicitly because the registry's first entry
+      // is now host mode (picker order/recommendation), not the default
+      // sandbox for library callers.
+      sandboxProvider = getSandboxProvider("docker")!,
       settings: settingsOverrides,
     } = options;
     const fs = yield* FileSystem.FileSystem;
@@ -1063,8 +1308,13 @@ export const scaffold = (
 
     const templateDir = yield* getTemplateDir(templateName);
 
-    // Build .env.example from agent + issue tracker env blocks
-    const envExampleParts = [agent.envExample];
+    // Build .env.example from agent + issue tracker env blocks. Host mode
+    // reuses the agent's existing host CLI login (ADR 0021), so no agent
+    // API-key block is scaffolded — only env the project itself needs (e.g.
+    // the issue tracker's) is emitted.
+    const envExampleParts = [
+      sandboxProvider.runsOnHost ? HOST_ENV_NOTE : agent.envExample,
+    ];
     if (issueTracker.envExample) {
       envExampleParts.push(issueTracker.envExample);
     }
@@ -1072,12 +1322,18 @@ export const scaffold = (
 
     yield* Effect.all(
       [
-        fs
-          .writeFileString(
-            join(configDir, sandboxProvider.containerfileName),
-            agent.dockerfileTemplate,
-          )
-          .pipe(Effect.mapError((e) => new Error(e.message))),
+        // Providers without an image (host mode) have no containerfileName —
+        // no Dockerfile/Containerfile is written at all.
+        ...(sandboxProvider.containerfileName !== undefined
+          ? [
+              fs
+                .writeFileString(
+                  join(configDir, sandboxProvider.containerfileName),
+                  agent.dockerfileTemplate,
+                )
+                .pipe(Effect.mapError((e) => new Error(e.message))),
+            ]
+          : []),
         fs
           .writeFileString(join(configDir, ".gitignore"), GITIGNORE)
           .pipe(Effect.mapError((e) => new Error(e.message))),
@@ -1139,7 +1395,7 @@ export const scaffold = (
       yield* fs
         .writeFileString(
           join(configDir, SETUP_ISSUE_TRACKER_DOC),
-          buildSetupIssueTrackerDoc(sandboxProvider.cliNamespace),
+          buildSetupIssueTrackerDoc(sandboxProvider),
         )
         .pipe(Effect.mapError((e) => new Error(e.message)));
     }

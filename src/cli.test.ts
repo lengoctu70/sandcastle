@@ -319,4 +319,44 @@ describe("sandcastle CLI", () => {
     const entries = await readdir(join(hostDir, ".sandcastle"));
     expect(entries).toContain("SETUP_ISSUE_TRACKER.md");
   });
+
+  it("init --sandbox host scaffolds host mode with the warning and no image", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    // No --build-image flag: host mode must not prompt for one even
+    // non-interactively — there is no image to build.
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox host --issue-tracker beads",
+      hostDir,
+    );
+
+    // The Vietnamese trust warning is shown before the choice is saved —
+    // a worktree is not OS isolation (ADR 0021).
+    expect(stdout).toContain("Cảnh báo chế độ host");
+    expect(stdout).toContain("KHÔNG phải là sự cô lập");
+    // Vietnamese host-mode completion/next steps, no image instructions.
+    expect(stdout).toContain("Khởi tạo xong");
+    expect(stdout).not.toContain("build-image");
+    expect(stdout).not.toContain("docker build");
+
+    // No image file, and the generated main uses noSandbox + merge-to-head.
+    const entries = await readdir(join(hostDir, ".sandcastle"));
+    expect(entries).not.toContain("Dockerfile");
+    expect(entries).not.toContain("Containerfile");
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain("sandboxes/no-sandbox");
+    expect(main).toContain("noSandbox()");
+    expect(main).toContain('branchStrategy: { type: "merge-to-head" }');
+
+    // The host choice is persisted to settings.
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.sandbox).toBe("host");
+  });
 });
