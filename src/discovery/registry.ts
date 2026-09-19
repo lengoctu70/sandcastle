@@ -10,6 +10,7 @@ import { opencodeDiscoveryAdapter } from "./opencode.js";
 import { devinDiscoveryAdapter } from "./devin.js";
 import { cursorDiscoveryAdapter } from "./cursor.js";
 import { copilotDiscoveryAdapter } from "./copilot.js";
+import { grokDiscoveryAdapter } from "./grok.js";
 import { nodeDiscoveryExec } from "./nodeExec.js";
 
 /**
@@ -29,6 +30,7 @@ const DISCOVERY_ADAPTERS: readonly AgentDiscoveryAdapter[] = [
   devinDiscoveryAdapter,
   cursorDiscoveryAdapter,
   copilotDiscoveryAdapter,
+  grokDiscoveryAdapter,
 ];
 
 /** All registered discovery adapters, in display order. */

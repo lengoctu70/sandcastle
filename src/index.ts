@@ -36,11 +36,15 @@ export type { AgentStreamEvent } from "./AgentStreamEmitter.js";
 export {
   transferClaudeSession,
   transferCodexSession,
+  transferGrokSessionFile,
   encodeProjectPath,
+  encodeGrokSessionDir,
   claudeHostSessionPath,
   claudeSandboxSessionPath,
+  grokSessionDirPath,
   findClaudeSessionOnHost,
   findCodexSessionOnHost,
+  findGrokSessionOnHost,
 } from "./SessionStore.js";
 export type { HostSessionLookup } from "./SessionStore.js";
 export type { SandboxHooks } from "./SandboxLifecycle.js";
@@ -62,6 +66,7 @@ export {
 } from "./AgentProvider.js";
 export { devin } from "./agents/devin.js";
 export type { DevinOptions } from "./agents/devin.js";
+export { grok } from "./agents/grok.js";
 export type {
   AgentProvider,
   AgentCommandOptions,
@@ -73,6 +78,7 @@ export type {
   OpenCodeOptions,
   PiOptions,
 } from "./AgentProvider.js";
+export type { GrokOptions } from "./agents/grok.js";
 export {
   createBindMountSandboxProvider,
   createIsolatedSandboxProvider,
@@ -143,6 +149,7 @@ export { opencodeDiscoveryAdapter } from "./discovery/opencode.js";
 export { devinDiscoveryAdapter } from "./discovery/devin.js";
 export { cursorDiscoveryAdapter } from "./discovery/cursor.js";
 export { copilotDiscoveryAdapter } from "./discovery/copilot.js";
+export { grokDiscoveryAdapter } from "./discovery/grok.js";
 export {
   listDiscoveryAdapters,
   getDiscoveryAdapter,

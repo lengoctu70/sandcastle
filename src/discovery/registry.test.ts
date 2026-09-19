@@ -108,6 +108,7 @@ describe("discovery registry", () => {
       "devin",
       "cursor",
       "copilot",
+      "grok",
     ]);
   });
 
@@ -135,6 +136,7 @@ describe("discovery registry", () => {
       "devin",
       "cursor",
       "copilot",
+      "grok",
     ]);
     // The fake boundary only knows codex; every other adapter still reports
     // its own state (wrong-product here — the exec answers but not as the

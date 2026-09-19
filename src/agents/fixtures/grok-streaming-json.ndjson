@@ -1,0 +1,19 @@
+{"type":"available_commands","tools":["run_terminal_command","read_file","search_replace","list_dir","grep","web_search","web_fetch","write"],"commands":["compact","statusline"]}
+{"type":"thought","data":"The user wants me to run a command and report the output."}
+{"type":"text","data":"I'll"}
+{"type":"text","data":" run"}
+{"type":"text","data":" that"}
+{"type":"text","data":" command"}
+{"type":"text","data":"."}
+{"type":"usage","messageId":"msg-1","stopReason":"tool_use","usage":{"input_tokens":10786,"output_tokens":59,"cache_read_input_tokens":6016,"cache_creation_input_tokens":0,"reasoning_tokens":22}}
+{"type":"tool_call","toolCallId":"call-1111-2222-3333-0","title":"run_terminal_command","kind":"execute","status":"pending","toolName":"run_terminal_command","rawInput":{"command":"echo hello-world","description":"Run echo hello-world in terminal"},"content":[],"locations":[]}
+{"type":"tool_call_update","toolCallId":"call-1111-2222-3333-0","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"Run echo hello-world in terminal"}}],"locations":[]}
+{"type":"tool_call_update","toolCallId":"call-1111-2222-3333-0","status":"completed","content":[{"type":"content","content":{"type":"text","text":"hello-world\n"}}],"rawOutput":{"type":"Bash","output_for_prompt":"exit: 0\nhello-world\n","exit_code":0,"command":"echo hello-world","truncated":false},"locations":[]}
+{"type":"thought","data":"The command printed hello-world."}
+{"type":"text","data":"The"}
+{"type":"text","data":" command"}
+{"type":"text","data":" printed"}
+{"type":"text","data":" `hello-world`."}
+{"type":"usage","messageId":"msg-2","stopReason":"end_turn","usage":{"input_tokens":6257,"output_tokens":36,"cache_read_input_tokens":10624,"cache_creation_input_tokens":0,"reasoning_tokens":22}}
+{"type":"end","stopReason":"end_turn","sessionId":"01a0b967-b2cc-7233-80c2-172626ddc572","requestId":"363904ef-845d-4a83-9fa8-f8679872986b","usage":{"input_tokens":17043,"cache_read_input_tokens":16640,"cache_creation_input_tokens":0,"output_tokens":95,"reasoning_tokens":44,"total_tokens":33778},"num_turns":2,"total_cost_usd":0.01461184}
+

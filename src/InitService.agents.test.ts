@@ -114,4 +114,20 @@ describe("Agent registry", () => {
     // No API-key scaffolding — Devin reuses its account login.
     expect(agent!.envExample).not.toContain("API_KEY=");
   });
+
+  it("listAgents includes grok", () => {
+    const agents = listAgents();
+    expect(agents.some((a) => a.name === "grok")).toBe(true);
+  });
+
+  it("getAgent returns grok entry with expected fields", () => {
+    const agent = getAgent("grok");
+    expect(agent).toBeDefined();
+    expect(agent!.name).toBe("grok");
+    expect(agent!.defaultModel).toBe("grok-4.6");
+    expect(agent!.factoryImport).toBe("grok");
+    expect(agent!.effortOption).toBe("effort");
+    expect(agent!.dockerfileTemplate).toContain("FROM");
+    expect(agent!.dockerfileTemplate).toContain("x.ai/cli/install.sh");
+  });
 });

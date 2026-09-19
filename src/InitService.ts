@@ -489,6 +489,41 @@ WORKDIR /home/agent
 ENTRYPOINT ["sleep", "infinity"]
 `;
 
+const GROK_DOCKERFILE = `FROM node:22-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \\
+  git \\
+  curl \\
+  jq \\
+  && rm -rf /var/lib/apt/lists/*
+
+{{ISSUE_TRACKER_TOOLS}}
+
+# Build-args for UID/GID alignment: sandcastle docker build-image
+# defaults these to the host user's UID/GID so image-built files
+# and bind-mounted files share an owner without runtime chown.
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+
+# Rename the base image's "node" user to "agent" and align UID/GID.
+RUN groupmod -o -g $AGENT_GID node && usermod -o -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+USER \${AGENT_UID}:\${AGENT_GID}
+
+# Install Grok CLI (installs to ~/.grok/bin)
+RUN curl -fsSL https://x.ai/cli/install.sh | bash
+
+# Add Grok to PATH
+ENV PATH="/home/agent/.grok/bin:$PATH"
+
+WORKDIR /home/agent
+
+# In worktree sandbox mode, Sandcastle bind-mounts the git worktree at \${SANDBOX_REPO_DIR}
+# and overrides the working directory to \${SANDBOX_REPO_DIR} at container start.
+# Structure your Dockerfile so that \${SANDBOX_REPO_DIR} can serve as the project root.
+ENTRYPOINT ["sleep", "infinity"]
+`;
+
 const AGENT_REGISTRY: AgentEntry[] = [
   {
     name: "claude-code",
@@ -584,6 +619,19 @@ GITHUB_TOKEN=`,
 # Run \`devin auth login\` on the host (credentials live in
 # ~/.local/share/devin/credentials.toml) — host mode reuses them directly.`,
     setupCommand: `devin -- "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+  },
+  {
+    name: "grok",
+    label: "Grok",
+    defaultModel: "grok-4.6",
+    factoryImport: "grok",
+    effortOption: "effort",
+    dockerfileTemplate: GROK_DOCKERFILE,
+    // Host mode reuses the machine's `grok login` subscription session — the
+    // .env.example block only applies to container sandboxes.
+    envExample: `# xAI API key — not needed in host mode (your \`grok login\` session is reused).
+XAI_API_KEY=`,
+    setupCommand: `grok "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
   },
 ];
 

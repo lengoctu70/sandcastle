@@ -29,6 +29,7 @@ const codexAgent = getAgent("codex")!;
 const cursorAgent = getAgent("cursor")!;
 const opencodeAgent = getAgent("opencode")!;
 const copilotAgent = getAgent("copilot")!;
+const grokAgent = getAgent("grok")!;
 
 const defaultOptions: ScaffoldOptions = {
   agent: claudeCodeAgent,
@@ -91,6 +92,12 @@ describe("InitService scaffold", () => {
     {
       agent: cursorAgent,
       expectedKey: "CURSOR_API_KEY=",
+      unexpectedKey: "ANTHROPIC_API_KEY=",
+      expectClaudeSetupTokenHint: false,
+    },
+    {
+      agent: grokAgent,
+      expectedKey: "XAI_API_KEY=",
       unexpectedKey: "ANTHROPIC_API_KEY=",
       expectClaudeSetupTokenHint: false,
     },
@@ -353,6 +360,25 @@ describe("InitService scaffold", () => {
     );
     expect(mainTs).toContain('codex("gpt-5.6-sol")');
     expect(mainTs).not.toContain("effort");
+  });
+
+  it("injects the selected effort into the generated grok() call", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, {
+      agent: grokAgent,
+      model: "grok-4.6",
+      settings: { effort: "high" },
+    });
+
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain('grok("grok-4.6", { effort: "high" })');
+    const settings = JSON.parse(
+      await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.effort).toBe("high");
   });
 
   it("injects the selected effort into the generated pi() call as thinking", async () => {
