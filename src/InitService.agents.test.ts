@@ -95,4 +95,23 @@ describe("Agent registry", () => {
     expect(agent!.dockerfileTemplate).toContain("FROM");
     expect(agent!.dockerfileTemplate).toContain("@github/copilot");
   });
+
+  it("listAgents includes devin", () => {
+    const agents = listAgents();
+    expect(agents.some((a) => a.name === "devin")).toBe(true);
+  });
+
+  it("getAgent returns devin entry with expected fields", () => {
+    const agent = getAgent("devin");
+    expect(agent).toBeDefined();
+    expect(agent!.name).toBe("devin");
+    expect(agent!.defaultModel).toBe("claude-opus-5");
+    expect(agent!.factoryImport).toBe("devin");
+    // Devin's "effort" is a catalog model_uid emitted as the variant option.
+    expect(agent!.effortOption).toBe("variant");
+    expect(agent!.dockerfileTemplate).toContain("FROM");
+    expect(agent!.dockerfileTemplate).toContain("cli.devin.ai/install.sh");
+    // No API-key scaffolding — Devin reuses its account login.
+    expect(agent!.envExample).not.toContain("API_KEY=");
+  });
 });
