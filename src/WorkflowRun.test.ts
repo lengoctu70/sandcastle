@@ -8,6 +8,8 @@ import {
   buildCompletionReport,
   buildFailureReport,
   buildImplementationPrompt,
+  buildMergeConflictRepairPrompt,
+  buildVerificationRepairPrompt,
   runVerificationCommands,
 } from "./WorkflowRun.js";
 
@@ -57,6 +59,103 @@ describe("buildImplementationPrompt", () => {
       verificationCommands: [],
     });
     expect(bare).not.toContain("## Verification");
+  });
+});
+
+describe("buildVerificationRepairPrompt", () => {
+  const failure = {
+    command: "npm test",
+    status: "failed" as const,
+    exitCode: 1,
+    durationMs: 120,
+    outputTail: "1 test failed: greeting.test.ts",
+  };
+
+  const base = {
+    issue,
+    sourceBranch: "sandcastle/issue-42",
+    targetBranch: "main",
+    verificationCommands: ["npm test", "npm run typecheck"],
+    failure,
+    attempt: 1,
+    maxAttempts: 2,
+  };
+
+  it("embeds the exact failed command, exit code, and output tail", () => {
+    const prompt = buildVerificationRepairPrompt({
+      ...base,
+      continuingSession: true,
+    });
+    expect(prompt).toContain("# Verification repair — attempt 1/2");
+    expect(prompt).toContain("`npm test`");
+    expect(prompt).toContain("npm test\n"); // the failed command, verbatim
+    expect(prompt).toContain("exited with code 1");
+    expect(prompt).toContain("1 test failed: greeting.test.ts");
+    expect(prompt).toContain("`npm run typecheck`");
+  });
+
+  it("marks a native resume as continuing the session", () => {
+    const prompt = buildVerificationRepairPrompt({
+      ...base,
+      continuingSession: true,
+    });
+    expect(prompt).toContain("Continue your current session");
+    expect(prompt).not.toContain("A previous Sandcastle run");
+  });
+
+  it("re-establishes task context for a fresh invocation", () => {
+    const prompt = buildVerificationRepairPrompt({
+      ...base,
+      continuingSession: false,
+    });
+    expect(prompt).toContain("A previous Sandcastle run implemented issue #42");
+    expect(prompt).toContain("Add a greeting command");
+    expect(prompt).toContain("The CLI should greet the user.");
+  });
+
+  it("keeps issue closure out of the agent's reach", () => {
+    const prompt = buildVerificationRepairPrompt({
+      ...base,
+      continuingSession: false,
+    });
+    expect(prompt).toContain("Do NOT run `gh issue close`");
+    expect(prompt).toContain("<promise>COMPLETE</promise>");
+  });
+});
+
+describe("buildMergeConflictRepairPrompt", () => {
+  const base = {
+    issue,
+    sourceBranch: "sandcastle/issue-42",
+    targetBranch: "main",
+    integrationBranch: "sandcastle/issue-42-integrate/20260101-000000-ab12",
+    mergeOutput: "CONFLICT (content): Merge conflict in hello.txt",
+    verificationCommands: ["npm test"],
+  };
+
+  it("describes the in-progress merge, its output, and the one-shot rules", () => {
+    const prompt = buildMergeConflictRepairPrompt({
+      ...base,
+      continuingSession: false,
+    });
+    expect(prompt).toContain("# Merge conflict repair");
+    expect(prompt).toContain("CONFLICT (content): Merge conflict in hello.txt");
+    expect(prompt).toContain("still in progress");
+    expect(prompt).toContain(
+      "`sandcastle/issue-42-integrate/20260101-000000-ab12`",
+    );
+    expect(prompt).toContain("git merge --abort");
+    expect(prompt).toContain("Do NOT run `gh issue close`");
+    expect(prompt).toContain("`npm test`");
+    expect(prompt).toContain("<promise>COMPLETE</promise>");
+  });
+
+  it("marks a native resume as continuing the session", () => {
+    const prompt = buildMergeConflictRepairPrompt({
+      ...base,
+      continuingSession: true,
+    });
+    expect(prompt).toContain("Continue your current session");
   });
 });
 
@@ -147,6 +246,44 @@ describe("buildFailureReport", () => {
     expect(report).toContain("vẫn mở");
     expect(report).toContain("sandcastle/issue-42");
     expect(report).toContain(".sandcastle/worktrees/sandcastle-issue-42");
+  });
+
+  it("surfaces the bounded-repair counters when repairs were spent", () => {
+    const report = buildFailureReport({
+      issue,
+      phase: "verification",
+      error: "Lệnh xác minh vẫn thất bại sau 2/2 lần sửa tự động",
+      verification: [],
+      verificationConfigured: true,
+      sourceBranch: "sandcastle/issue-42",
+      attempts: {
+        implementation: 1,
+        verificationRepair: 2,
+        mergeConflictRepair: 1,
+        integrationRebuild: 1,
+      },
+    });
+    expect(report).toContain("Tự động sửa đã thử");
+    expect(report).toContain("xác minh 2/2 lần");
+    expect(report).toContain("xung đột merge 1/1 lần");
+    expect(report).toContain("dựng lại tích hợp 1/1 lần");
+  });
+
+  it("omits the attempts line when no repair ran", () => {
+    const report = buildFailureReport({
+      issue,
+      phase: "implementation",
+      error: "agent exploded",
+      verification: [],
+      verificationConfigured: false,
+      attempts: {
+        implementation: 1,
+        verificationRepair: 0,
+        mergeConflictRepair: 0,
+        integrationRebuild: 0,
+      },
+    });
+    expect(report).not.toContain("Tự động sửa đã thử");
   });
 });
 
