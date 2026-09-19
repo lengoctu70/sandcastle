@@ -1,6 +1,4 @@
 import { exec, execFile } from "node:child_process";
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { promisify } from "node:util";
 import { Cause, Effect, Exit } from "effect";
 import { FileSystem } from "@effect/platform";
@@ -51,6 +49,13 @@ import {
   type ProjectSettings,
   type VerificationStatus,
 } from "./ProjectSettings.js";
+import {
+  RECOVERY_STATE_VERSION,
+  clearRecoveryState,
+  probeRecoveryArtifacts,
+  writeRecoveryState,
+  type RecoveryState,
+} from "./recovery.js";
 import { resolveCwd } from "./resolveCwd.js";
 import { assertResumeSessionExists } from "./resumePrecheck.js";
 import type { SandboxProvider } from "./SandboxProvider.js";
@@ -76,7 +81,8 @@ import * as WorktreeManager from "./WorktreeManager.js";
  * - The completion report is posted only after the target branch has moved,
  *   and the issue is closed only after the report post succeeds.
  * - Every pre-landing failure leaves the issue open, keeps the source branch
- *   and implementation worktree on disk for recovery (#18/#19 build on this),
+ *   and implementation worktree on disk for recovery (`status`/`retry`/
+ *   `discard` build on the persisted record — see `recovery.ts`),
  *   and posts a Vietnamese failure report when the issue identity is known.
  * - The active checkout is never conflicted: merging happens only inside the
  *   integration worktree, and the target branch moves via `merge --ff-only`
@@ -187,6 +193,14 @@ export interface RunIssueWorkflowOptions {
   /** Deterministic issue selection (`--issue <number>`). */
   readonly issueNumber?: number;
   /**
+   * Resume a preserved failed run (`sandcastle retry <issue>`): the issue
+   * identity, branches, and worktree come from the record — selection is
+   * never re-run — and the workflow re-enters at the recorded failure phase
+   * instead of implementing from scratch. The recorded agent session is
+   * resumed natively when the provider supports it.
+   */
+  readonly resume?: RecoveryState;
+  /**
    * Interactive issue picker — cli.ts injects a clack `select`. Returning
    * `undefined` aborts the run. When absent the run is non-interactive and
    * requires `issueNumber` once eligible issues exist.
@@ -203,6 +217,11 @@ export interface RunIssueWorkflowOptions {
   /** Per-command timeout for verification steps (default 10 minutes). */
   readonly verificationTimeoutMs?: number;
 }
+
+// Re-exported so existing `WorkflowRun.js` importers keep working — the
+// record type and its persistence helpers now live in `recovery.ts`.
+export type { RecoveryState } from "./recovery.js";
+export { recoveryStatePath } from "./recovery.js";
 
 /** A hard pre-run failure — thrown, never reported to the issue. */
 export class WorkflowRunError extends Error {
@@ -359,16 +378,33 @@ export const buildImplementationPrompt = (params: {
   readonly sourceBranch: string;
   readonly targetBranch: string;
   readonly verificationCommands: readonly string[];
+  /**
+   * Set when `sandcastle retry` continues a run that stopped during
+   * implementation: the recorded failure of the previous attempt. The
+   * preserved worktree may already hold partial work — the prompt tells the
+   * agent to continue it rather than start over.
+   */
+  readonly resumeError?: string;
 }): string => {
-  const { issue, sourceBranch, targetBranch, verificationCommands } = params;
+  const {
+    issue,
+    sourceBranch,
+    targetBranch,
+    verificationCommands,
+    resumeError,
+  } = params;
   const verificationBlock =
     verificationCommands.length > 0
       ? `\n## Verification\n\nAfter you finish, the following project commands will be run to check your work. Make sure they pass:\n\n${verificationCommands.map((c) => `- \`${c}\``).join("\n")}\n`
       : "";
+  const resumeBlock =
+    resumeError !== undefined
+      ? `\n## Previous attempt\n\nA previous Sandcastle run already started this task in this worktree and stopped with:\n\n\`\`\`\n${tail(resumeError.trim())}\n\`\`\`\n\nWhatever it produced is still here — committed or uncommitted. Continue and finish that work rather than starting over.\n`
+      : "";
   return `# Task
 
 Implement GitHub issue #${issue.number}: ${issue.title}
-
+${resumeBlock}
 ${
   issue.body.trim().length > 0
     ? `## Issue description\n\n${issue.body}\n\n`
@@ -510,7 +546,8 @@ When the merge is committed — or you are certain it cannot be resolved — out
 // Vietnamese reports (ADR 0026 — presentation boundary)
 // ---------------------------------------------------------------------------
 
-const PHASE_LABEL: Record<WorkflowRunPhase, string> = {
+/** Vietnamese label per workflow phase — reports and `sandcastle status`. */
+export const PHASE_LABEL: Record<WorkflowRunPhase, string> = {
   preflight: "kiểm tra điều kiện ban đầu",
   implementation: "chạy agent trên nhánh làm việc",
   verification: "xác minh trên nhánh làm việc",
@@ -750,68 +787,6 @@ const persistVerificationStatus = async (
 };
 
 // ---------------------------------------------------------------------------
-// Recovery state (ADR 0024 — durable record for `status`/`retry`/`discard`)
-// ---------------------------------------------------------------------------
-
-/** Durable record written on failure so later `status`/`retry` can pick up. */
-export interface RecoveryState {
-  readonly issue: GithubIssue;
-  readonly sourceBranch: string;
-  readonly targetBranch: string;
-  readonly worktreePath?: string;
-  readonly failurePhase: WorkflowRunPhase;
-  readonly error: string;
-  readonly verification: readonly VerificationCommandResult[];
-  readonly integrationVerification?: readonly VerificationCommandResult[];
-  readonly commits: readonly { readonly sha: string }[];
-  readonly sessionId?: string;
-  readonly logFilePath?: string;
-  /** Bounded-repair counters spent before this failure (#18). */
-  readonly attempts: WorkflowRunAttempts;
-  readonly failedAt: string;
-}
-
-export const recoveryStatePath = (cwd: string, issueNumber: number): string =>
-  join(cwd, ".sandcastle", "recovery", `issue-${issueNumber}.json`);
-
-const writeRecoveryState = async (
-  cwd: string,
-  state: RecoveryState,
-): Promise<void> => {
-  const dir = join(cwd, ".sandcastle", "recovery");
-  await mkdir(dir, { recursive: true });
-  await writeFile(
-    recoveryStatePath(cwd, state.issue.number),
-    JSON.stringify(state, null, 2) + "\n",
-  );
-  // Recovery state is machine-local — keep it out of git. Append to the
-  // scaffolded .sandcastle/.gitignore when present; create a minimal one when
-  // not (a fresh file only adds ignores, it cannot un-ignore anything).
-  const gitignorePath = join(cwd, ".sandcastle", ".gitignore");
-  try {
-    const content = await readFile(gitignorePath, "utf-8");
-    const lines = content.split("\n").map((l) => l.trim());
-    if (!lines.includes("recovery/")) {
-      await appendFile(
-        gitignorePath,
-        `${content.endsWith("\n") || content.length === 0 ? "" : "\n"}recovery/\n`,
-      );
-    }
-  } catch {
-    await writeFile(gitignorePath, "recovery/\n").catch(() => {});
-  }
-};
-
-const clearRecoveryState = async (
-  cwd: string,
-  issueNumber: number,
-): Promise<void> => {
-  await rm(recoveryStatePath(cwd, issueNumber), { force: true }).catch(
-    () => {},
-  );
-};
-
-// ---------------------------------------------------------------------------
 // The workflow
 // ---------------------------------------------------------------------------
 
@@ -829,6 +804,9 @@ export const runIssueWorkflow = async (
     options.verificationTimeoutMs ?? VERIFICATION_TIMEOUT_MS;
   const verificationConfigured = (): boolean =>
     settings.verificationCommands.length > 0;
+  // `sandcastle retry` hands in the durable record of a failed run — issue
+  // identity, branches, and worktree come from it and selection never runs.
+  const resume = options.resume;
 
   // ---- Preflight: settings, gh auth, label (ADR 0026 — fail before work) ---
 
@@ -841,7 +819,11 @@ export const runIssueWorkflow = async (
     );
   }
 
-  status("Đang kiểm tra GitHub CLI (gh) và label…");
+  status(
+    resume === undefined
+      ? "Đang kiểm tra GitHub CLI (gh) và label…"
+      : "Đang kiểm tra GitHub CLI (gh)…",
+  );
   const readiness = await probeGhReadiness(
     options.discoveryExec ?? nodeDiscoveryExec,
   );
@@ -855,19 +837,24 @@ export const runIssueWorkflow = async (
     );
   }
 
-  let labelExists = false;
-  try {
-    labelExists = await gh.labelExists();
-  } catch (e) {
-    throw new WorkflowRunError(
-      `Không kiểm tra được label GitHub: ${e instanceof Error ? e.message : String(e)}`,
-    );
-  }
-  if (!labelExists) {
-    throw new WorkflowRunError(
-      `Repository chưa có label "${SANDCASTLE_LABEL}". Chạy \`sandcastle init\` ` +
-        `để tạo label, hoặc tạo thủ công: gh label create ${SANDCASTLE_LABEL}.`,
-    );
+  // The label check gates *selection* — a retry never selects (the record
+  // proves the issue was chosen), so a label removed since the run must not
+  // block continuing the preserved work.
+  if (resume === undefined) {
+    let labelExists = false;
+    try {
+      labelExists = await gh.labelExists();
+    } catch (e) {
+      throw new WorkflowRunError(
+        `Không kiểm tra được label GitHub: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    if (!labelExists) {
+      throw new WorkflowRunError(
+        `Repository chưa có label "${SANDCASTLE_LABEL}". Chạy \`sandcastle init\` ` +
+          `để tạo label, hoặc tạo thủ công: gh label create ${SANDCASTLE_LABEL}.`,
+      );
+    }
   }
 
   // ---- Issue selection — immutable once chosen (ADR 0026) -------------------
@@ -887,7 +874,27 @@ export const runIssueWorkflow = async (
   };
 
   let issue: GithubIssue;
-  if (options.issueNumber !== undefined) {
+  if (resume !== undefined) {
+    // Retry: identity comes from the recovery record — the issue is re-viewed
+    // only to prove it is still open (a closed issue means the work already
+    // landed or was abandoned elsewhere, making the record stale).
+    try {
+      issue = await gh.viewIssue(resume.issue.number);
+    } catch (e) {
+      throw new WorkflowRunError(
+        `Không đọc được issue #${resume.issue.number} trên GitHub: ` +
+          `${e instanceof Error ? e.message : String(e)}. ` +
+          `Nếu issue không còn tồn tại, chạy \`sandcastle discard ${resume.issue.number}\` để xóa bản ghi phục hồi.`,
+      );
+    }
+    if (issue.state !== "OPEN") {
+      throw new WorkflowRunError(
+        `Issue #${issue.number} đã ở trạng thái "${issue.state || "unknown"}" — ` +
+          "bản ghi phục hồi cho issue này đã lỗi thời (có thể công việc đã được merge hoặc issue đã đóng). " +
+          `Kiểm tra lại trên GitHub, rồi chạy \`sandcastle discard ${issue.number}\` để xóa bản ghi và công việc được giữ lại.`,
+      );
+    }
+  } else if (options.issueNumber !== undefined) {
     try {
       issue = await gh.viewIssue(options.issueNumber);
     } catch (e) {
@@ -944,7 +951,13 @@ export const runIssueWorkflow = async (
     assertEligible(issue);
   }
 
-  status(`Đã chọn issue #${issue.number}: ${issue.title}`);
+  status(
+    resume === undefined
+      ? `Đã chọn issue #${issue.number}: ${issue.title}`
+      : `Đang tiếp tục issue #${issue.number} từ bản ghi phục hồi ` +
+          `(dừng ở bước "${PHASE_LABEL[resume.failurePhase]}"` +
+          `${resume.retryCount > 0 ? `, đã retry ${resume.retryCount} lần` : ""})…`,
+  );
 
   // ---- Resolve agent + sandbox from persisted settings ----------------------
 
@@ -954,20 +967,44 @@ export const runIssueWorkflow = async (
   // host-side session storage — needed by the resume precheck for repairs.
   const hostRepoDir = await runEffect(resolveCwd(cwd));
 
-  const targetBranch = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
-  if (targetBranch === "HEAD") {
+  // A retry lands on the branch the failed run was targeting, even when the
+  // checkout has since moved — the landing uses `update-ref` CAS then.
+  const targetBranch =
+    resume?.targetBranch ??
+    (await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd));
+  if (resume === undefined && targetBranch === "HEAD") {
     throw new WorkflowRunError(
       "Repository đang ở trạng thái detached HEAD — hãy checkout một nhánh trước khi chạy `sandcastle run`.",
     );
   }
-  const sourceBranch = `sandcastle/issue-${issue.number}`;
+  // The target base is recorded in the recovery record so `status`/`retry`
+  // can compare what the run integrated against (the landing freshness check
+  // re-reads the live tip separately).
+  const targetBaseSha = await git(
+    ["rev-parse", "-q", "--verify", `refs/heads/${targetBranch}`],
+    cwd,
+  ).catch(() => "");
+  if (targetBaseSha === "") {
+    throw new WorkflowRunError(
+      resume !== undefined
+        ? `Nhánh đích \`${targetBranch}\` trong bản ghi phục hồi không còn tồn tại — ` +
+            `bản ghi cho issue #${issue.number} đã lỗi thời. ` +
+            `Kiểm tra lại repo, rồi chạy \`sandcastle discard ${issue.number}\` để xóa bản ghi.`
+        : `Không xác định được SHA đầu nhánh \`${targetBranch}\`.`,
+    );
+  }
+  const sourceBranch =
+    resume?.sourceBranch ?? `sandcastle/issue-${issue.number}`;
 
   // ---- Failure path — one closure used by every phase after selection -------
 
   let phase: WorkflowRunPhase = "implementation";
   let wt: Worktree | undefined;
   let integrationWt: Worktree | undefined;
-  let verification: VerificationCommandResult[] = [];
+  // A retry that re-enters at integration carries the recorded source-stage
+  // verification forward so reports still show what was checked.
+  let verification: VerificationCommandResult[] =
+    resume !== undefined ? [...resume.verification] : [];
   let integrationVerification: VerificationCommandResult[] | undefined;
   let integrationBranch: string | undefined;
   let integrationPath: string | undefined;
@@ -984,9 +1021,11 @@ export const runIssueWorkflow = async (
   // Accumulated across all agent runs (implementation + repairs): each wt.run
   // returns only that invocation's commits/session.
   const allCommits: { sha: string }[] = [];
-  let lastSessionId: string | undefined;
+  // Retry seeds the recorded agent session/log so repair invocations resume
+  // the same session across process restarts when the provider supports it.
+  let lastSessionId: string | undefined = resume?.sessionId;
   let lastCompletionSignal: string | undefined;
-  let lastLogFilePath: string | undefined;
+  let lastLogFilePath: string | undefined = resume?.logFilePath;
 
   const recordAgentRun = (r: WorktreeRunResult): void => {
     // Dedupe by sha: the merge-conflict repair runs inside the integration
@@ -1152,9 +1191,11 @@ export const runIssueWorkflow = async (
       // A failure to report must not sink the cleanup path.
     }
     const state: RecoveryState = {
+      version: RECOVERY_STATE_VERSION,
       issue,
       sourceBranch,
       targetBranch,
+      targetBaseSha,
       ...(wt !== undefined ? { worktreePath: wt.worktreePath } : {}),
       failurePhase: phase,
       error: detail,
@@ -1168,6 +1209,9 @@ export const runIssueWorkflow = async (
         ? { logFilePath: lastLogFilePath }
         : {}),
       attempts,
+      // Each retry that itself fails rewrites the record with the count
+      // incremented, so `status` shows how often the task was retried.
+      retryCount: (resume?.retryCount ?? 0) + (resume !== undefined ? 1 : 0),
       failedAt: new Date().toISOString(),
     };
     await writeRecoveryState(cwd, state).catch(() => {});
@@ -1214,7 +1258,70 @@ export const runIssueWorkflow = async (
     };
   };
 
-  // ---- Implementation -------------------------------------------------------
+  // ---- Retry resume: validate the preserved artifacts, seed commits ---------
+  //
+  // A stale record never silently proceeds and is never deleted here — the
+  // diagnosis points at `sandcastle discard`, the only command that removes
+  // preserved work (and only after confirmation).
+  const preservedCommits: string[] = [];
+  let preservedWorktreeUsable = false;
+  if (resume !== undefined) {
+    const artifacts = await probeRecoveryArtifacts(cwd, resume);
+    preservedWorktreeUsable = artifacts.worktreeUsable;
+    preservedCommits.push(...artifacts.preservedCommits);
+    if (!preservedWorktreeUsable && preservedCommits.length === 0) {
+      // No committed work on the branch (never committed, reset, or already
+      // merged elsewhere) and no usable worktree — nothing to continue.
+      throw new WorkflowRunError(
+        `Bản ghi phục hồi cho issue #${issue.number} đã lỗi thời: ` +
+          (artifacts.branchExists
+            ? `nhánh \`${sourceBranch}\` không còn commit nào chưa merge ` +
+              "(có thể đã merge ở nơi khác hoặc đã bị reset)"
+            : `nhánh \`${sourceBranch}\` không còn tồn tại`) +
+          (resume.worktreePath !== undefined
+            ? `, và worktree \`${resume.worktreePath}\` đã mất`
+            : "") +
+          `. Không có công việc nào để tiếp tục — chạy \`sandcastle discard ${issue.number}\` để xóa bản ghi.`,
+      );
+    }
+    if (
+      resume.worktreePath !== undefined &&
+      !preservedWorktreeUsable &&
+      artifacts.branchExists
+    ) {
+      status(
+        `Worktree \`${resume.worktreePath}\` không còn — đang dựng lại worktree từ nhánh \`${sourceBranch}\` đã được giữ.`,
+        "warn",
+      );
+    }
+    // Drop stale worktree registrations (e.g. the preserved dir was deleted
+    // out from under git) so `createWorktree` sees the real on-disk state.
+    await git(["worktree", "prune"], cwd).catch(() => {});
+    for (const sha of preservedCommits) allCommits.push({ sha });
+  }
+
+  // A retry re-enters the workflow at the recorded failure phase instead of
+  // starting over: "implementation" only when there is no committed work to
+  // verify, "verification" to re-run the checks (with a fresh bounded repair
+  // budget), and straight into the integration loop for anything later —
+  // the recorded source-stage verification already passed by then.
+  const startPhase: WorkflowRunPhase =
+    resume === undefined ||
+    preservedCommits.length === 0 ||
+    resume.failurePhase === "implementation" ||
+    resume.failurePhase === "preflight"
+      ? "implementation"
+      : resume.failurePhase === "verification"
+        ? "verification"
+        : "integration";
+  phase = startPhase;
+
+  // ---- Worktree — create fresh on a normal run, re-attach on retry ----------
+  //
+  // `createWorktree` reuses a managed worktree already checked out on the
+  // source branch, so the preserved worktree is picked up in place; when it
+  // is gone, a new worktree is created on the preserved branch (its commits
+  // are the work).
 
   try {
     wt = await createWorktree({
@@ -1224,42 +1331,55 @@ export const runIssueWorkflow = async (
         branch: sourceBranch,
         baseBranch: targetBranch,
       },
-      copyToWorktree: ["node_modules"],
+      // A reused preserved worktree already carries its dependency copies.
+      ...(preservedWorktreeUsable ? {} : { copyToWorktree: ["node_modules"] }),
     });
   } catch (e) {
     return fail(e);
   }
 
-  status(
-    `Đang chạy agent cho issue #${issue.number} trên nhánh \`${sourceBranch}\`…`,
-  );
-  attempts.implementation = 1;
-  try {
-    const implResult = await wt.run({
-      agent,
-      sandbox,
-      prompt: buildImplementationPrompt({
-        issue,
-        sourceBranch,
-        targetBranch,
-        verificationCommands: settings.verificationCommands,
-      }),
-      name: `issue-${issue.number}`,
-      maxIterations: 1,
-      completionSignal: DEFAULT_COMPLETION_SIGNAL,
-    });
-    recordAgentRun(implResult);
-  } catch (e) {
-    return fail(e);
-  }
+  // ---- Implementation (skipped when a retry resumes past it) -----------------
 
-  if (allCommits.length === 0) {
-    return fail(
-      new Error(
-        "Agent kết thúc nhưng không tạo commit nào trên nhánh làm việc — " +
-          "không có thay đổi nào để xác minh hay merge.",
-      ),
+  if (startPhase === "implementation") {
+    status(
+      resume === undefined
+        ? `Đang chạy agent cho issue #${issue.number} trên nhánh \`${sourceBranch}\`…`
+        : `Đang tiếp tục agent cho issue #${issue.number} trên nhánh \`${sourceBranch}\` được giữ lại…`,
     );
+    attempts.implementation = 1;
+    // Resume the recorded session when possible — the agent keeps its prior
+    // reasoning. Without one, the prompt itself carries the context.
+    const resumeSession =
+      resume !== undefined ? await resumableSession() : undefined;
+    try {
+      const implResult = await wt.run({
+        agent,
+        sandbox,
+        prompt: buildImplementationPrompt({
+          issue,
+          sourceBranch,
+          targetBranch,
+          verificationCommands: settings.verificationCommands,
+          ...(resume !== undefined ? { resumeError: resume.error } : {}),
+        }),
+        name: `issue-${issue.number}`,
+        maxIterations: 1,
+        completionSignal: DEFAULT_COMPLETION_SIGNAL,
+        ...(resumeSession !== undefined ? { resumeSession } : {}),
+      });
+      recordAgentRun(implResult);
+    } catch (e) {
+      return fail(e);
+    }
+
+    if (allCommits.length === 0) {
+      return fail(
+        new Error(
+          "Agent kết thúc nhưng không tạo commit nào trên nhánh làm việc — " +
+            "không có thay đổi nào để xác minh hay merge.",
+        ),
+      );
+    }
   }
 
   // ---- Verification on the source worktree -----------------------------------
@@ -1268,62 +1388,13 @@ export const runIssueWorkflow = async (
   // the same session when the provider supports it, else a fresh invocation
   // against the preserved code with the task + failure inlined. Bounded at
   // MAX_VERIFICATION_REPAIR_ATTEMPTS; every repair re-runs ALL commands.
+  // Skipped when a retry resumes at integration — the recorded results
+  // already passed and the merged tree is re-verified anyway.
 
-  phase = "verification";
-  if (verificationConfigured()) {
-    status("Đang chạy lệnh xác minh…");
-    verification = await runVerificationCommands(
-      settings.verificationCommands,
-      wt.worktreePath,
-      verificationTimeoutMs,
-    );
-    await persistVerificationStatus(
-      cwd,
-      hasFailedVerification(verification) ? "failed" : "passed",
-    );
-
-    while (hasFailedVerification(verification)) {
-      const failed = verification.find((r) => r.status === "failed")!;
-      if (attempts.verificationRepair >= MAX_VERIFICATION_REPAIR_ATTEMPTS) {
-        return fail(
-          new Error(
-            `Lệnh xác minh vẫn thất bại sau ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS} ` +
-              `lần sửa tự động: \`${failed.command}\` (exit ${failed.exitCode ?? "?"})\n${failed.outputTail}`,
-          ),
-        );
-      }
-      attempts.verificationRepair++;
-      const resumeSession = await resumableSession();
-      status(
-        `Xác minh thất bại — agent đang sửa trong cùng worktree ` +
-          `(lần ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
-          `${resumeSession !== undefined ? ", tiếp tục phiên agent" : ", phiên mới"})…`,
-        "warn",
-      );
-      try {
-        const repair = await wt.run({
-          agent,
-          sandbox,
-          prompt: buildVerificationRepairPrompt({
-            issue,
-            sourceBranch,
-            targetBranch,
-            verificationCommands: settings.verificationCommands,
-            failure: failed,
-            attempt: attempts.verificationRepair,
-            maxAttempts: MAX_VERIFICATION_REPAIR_ATTEMPTS,
-            continuingSession: resumeSession !== undefined,
-          }),
-          name: `issue-${issue.number}`,
-          maxIterations: 1,
-          completionSignal: DEFAULT_COMPLETION_SIGNAL,
-          ...(resumeSession !== undefined ? { resumeSession } : {}),
-        });
-        recordAgentRun(repair);
-      } catch (e) {
-        return fail(e);
-      }
-      status("Đang chạy lại lệnh xác minh sau khi sửa…");
+  if (startPhase === "implementation" || startPhase === "verification") {
+    phase = "verification";
+    if (verificationConfigured()) {
+      status("Đang chạy lệnh xác minh…");
       verification = await runVerificationCommands(
         settings.verificationCommands,
         wt.worktreePath,
@@ -1333,12 +1404,65 @@ export const runIssueWorkflow = async (
         cwd,
         hasFailedVerification(verification) ? "failed" : "passed",
       );
+
+      while (hasFailedVerification(verification)) {
+        const failed = verification.find((r) => r.status === "failed")!;
+        if (attempts.verificationRepair >= MAX_VERIFICATION_REPAIR_ATTEMPTS) {
+          return fail(
+            new Error(
+              `Lệnh xác minh vẫn thất bại sau ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS} ` +
+                `lần sửa tự động: \`${failed.command}\` (exit ${failed.exitCode ?? "?"})\n${failed.outputTail}`,
+            ),
+          );
+        }
+        attempts.verificationRepair++;
+        const resumeSession = await resumableSession();
+        status(
+          `Xác minh thất bại — agent đang sửa trong cùng worktree ` +
+            `(lần ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
+            `${resumeSession !== undefined ? ", tiếp tục phiên agent" : ", phiên mới"})…`,
+          "warn",
+        );
+        try {
+          const repair = await wt.run({
+            agent,
+            sandbox,
+            prompt: buildVerificationRepairPrompt({
+              issue,
+              sourceBranch,
+              targetBranch,
+              verificationCommands: settings.verificationCommands,
+              failure: failed,
+              attempt: attempts.verificationRepair,
+              maxAttempts: MAX_VERIFICATION_REPAIR_ATTEMPTS,
+              continuingSession: resumeSession !== undefined,
+            }),
+            name: `issue-${issue.number}`,
+            maxIterations: 1,
+            completionSignal: DEFAULT_COMPLETION_SIGNAL,
+            ...(resumeSession !== undefined ? { resumeSession } : {}),
+          });
+          recordAgentRun(repair);
+        } catch (e) {
+          return fail(e);
+        }
+        status("Đang chạy lại lệnh xác minh sau khi sửa…");
+        verification = await runVerificationCommands(
+          settings.verificationCommands,
+          wt.worktreePath,
+          verificationTimeoutMs,
+        );
+        await persistVerificationStatus(
+          cwd,
+          hasFailedVerification(verification) ? "failed" : "passed",
+        );
+      }
+    } else {
+      status(
+        `Không có lệnh xác minh nào được cấu hình — bỏ qua bước xác minh (trạng thái: ${settings.verificationStatus ?? "unavailable"}).`,
+        "warn",
+      );
     }
-  } else {
-    status(
-      `Không có lệnh xác minh nào được cấu hình — bỏ qua bước xác minh (trạng thái: ${settings.verificationStatus ?? "unavailable"}).`,
-      "warn",
-    );
   }
 
   // ---- Integration in a separate worktree (ADR 0024) --------------------------

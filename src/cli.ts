@@ -1,4 +1,4 @@
-import { Command, Options } from "@effect/cli";
+import { Args, Command, Options } from "@effect/cli";
 import { FileSystem } from "@effect/platform";
 import { Effect, Option } from "effect";
 import * as clack from "@clack/prompts";
@@ -6,7 +6,7 @@ import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { styleText } from "node:util";
 
-import { Display } from "./Display.js";
+import { Display, type DisplayService } from "./Display.js";
 import { buildImage, removeImage } from "./DockerLifecycle.js";
 import {
   buildImage as podmanBuildImage,
@@ -44,7 +44,23 @@ import {
 } from "./discoveryPicker.js";
 import { probeGhReadiness, createSandcastleLabel } from "./githubSetup.js";
 import { configureCommand } from "./configure.js";
-import { runIssueWorkflow } from "./WorkflowRun.js";
+import {
+  MAX_MERGE_CONFLICT_REPAIR_ATTEMPTS,
+  MAX_TARGET_REBUILD_ATTEMPTS,
+  MAX_VERIFICATION_REPAIR_ATTEMPTS,
+  PHASE_LABEL,
+  runIssueWorkflow,
+  type RunIssueWorkflowOptions,
+} from "./WorkflowRun.js";
+import {
+  discardRecoveryWork,
+  listRecoveryStates,
+  probeRecoveryArtifacts,
+  readRecoveryState,
+  recoveryStatePath,
+  type RecoveryReadResult,
+  type RecoveryState,
+} from "./recovery.js";
 import type { GithubIssue } from "./githubIssues.js";
 import type { ModelSource, VerificationStatus } from "./ProjectSettings.js";
 import { ConfigDirError, InitError } from "./errors.js";
@@ -1192,31 +1208,43 @@ const runCommand = Command.make("run", { issue: runIssueOption }, ({ issue }) =>
     const cwd = process.cwd();
     const isInteractive = process.stdin.isTTY === true;
 
+    yield* runWorkflowAndReport(d, {
+      cwd,
+      issueNumber: issue._tag === "Some" ? issue.value : undefined,
+      // The picker seam is only wired when a TTY exists — without it the
+      // service requires --issue (or reports no eligible issues).
+      ...(isInteractive
+        ? {
+            selectIssue: async (issues: readonly GithubIssue[]) => {
+              const picked = await clack.select<number>({
+                message: "Chọn issue để Sandcastle thực hiện:",
+                options: issues.map((i) => ({
+                  value: i.number,
+                  label: `#${i.number} ${i.title}`,
+                })),
+              });
+              return clack.isCancel(picked) ? undefined : picked;
+            },
+          }
+        : {}),
+      onStatus: (message, severity) => {
+        Effect.runSync(d.status(message, severity));
+      },
+    });
+  }),
+);
+
+/**
+ * Shared bridge for `run`/`retry`: invoke the workflow and map its
+ * structured outcome onto the Display service and exit status.
+ */
+const runWorkflowAndReport = (
+  d: DisplayService,
+  options: RunIssueWorkflowOptions,
+): Effect.Effect<void, InitError> =>
+  Effect.gen(function* () {
     const result = yield* Effect.tryPromise({
-      try: () =>
-        runIssueWorkflow({
-          cwd,
-          issueNumber: issue._tag === "Some" ? issue.value : undefined,
-          // The picker seam is only wired when a TTY exists — without it the
-          // service requires --issue (or reports no eligible issues).
-          ...(isInteractive
-            ? {
-                selectIssue: async (issues: readonly GithubIssue[]) => {
-                  const picked = await clack.select<number>({
-                    message: "Chọn issue để Sandcastle thực hiện:",
-                    options: issues.map((i) => ({
-                      value: i.number,
-                      label: `#${i.number} ${i.title}`,
-                    })),
-                  });
-                  return clack.isCancel(picked) ? undefined : picked;
-                },
-              }
-            : {}),
-          onStatus: (message, severity) => {
-            Effect.runSync(d.status(message, severity));
-          },
-        }),
+      try: () => runIssueWorkflow(options),
       catch: (e) =>
         new InitError({
           message: e instanceof Error ? e.message : String(e),
@@ -1235,7 +1263,246 @@ const runCommand = Command.make("run", { issue: runIssueOption }, ({ issue }) =>
         // exits non-zero so scripts/CI observe the failed run.
         return yield* Effect.fail(new InitError({ message: result.message }));
     }
+  });
+
+// --- Recovery commands: status / retry / discard (ADR 0024) ---
+
+const issueNumberArg = Args.integer({ name: "issue-number" }).pipe(
+  Args.withDescription("GitHub issue number of the preserved failed task"),
+);
+
+const firstLineOf = (text: string): string => text.split("\n", 1)[0] ?? text;
+
+/**
+ * `sandcastle status` — list every preserved failed task with the phase it
+ * stopped in, spent repair attempts, and the live state of its branch and
+ * worktree. Corrupt records are surfaced, never hidden.
+ */
+const formatRecoveryEntry = async (
+  cwd: string,
+  entry:
+    | { readonly kind: "ok"; readonly state: RecoveryState }
+    | {
+        readonly kind: "corrupt";
+        readonly path: string;
+        readonly detail: string;
+      },
+): Promise<string> => {
+  if (entry.kind === "corrupt") {
+    return (
+      `• ${entry.path} — BẢN GHI BỊ HỎNG: ${entry.detail}. ` +
+      "Sandcastle không tự xóa bản ghi hỏng; sửa hoặc xóa tệp thủ công."
+    );
+  }
+  const s = entry.state;
+  const probe = await probeRecoveryArtifacts(cwd, s);
+  const lines = [
+    `• Issue #${s.issue.number} — ${s.issue.title}`,
+    `  Dừng ở bước "${PHASE_LABEL[s.failurePhase]}" lúc ${s.failedAt}` +
+      (s.retryCount > 0 ? ` — đã retry ${s.retryCount} lần` : ""),
+    `  Nhánh \`${s.sourceBranch}\`${probe.branchExists ? "" : " (đã mất)"}` +
+      ` · Worktree \`${s.worktreePath ?? "—"}\`` +
+      (s.worktreePath !== undefined && !probe.worktreeExists
+        ? " (đã mất)"
+        : ""),
+    `  Sửa tự động đã dùng: xác minh ${s.attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
+      ` · xung đột merge ${s.attempts.mergeConflictRepair}/${MAX_MERGE_CONFLICT_REPAIR_ATTEMPTS}` +
+      ` · dựng lại tích hợp ${s.attempts.integrationRebuild}/${MAX_TARGET_REBUILD_ATTEMPTS}`,
+    `  Lỗi: ${firstLineOf(s.error)}`,
+  ];
+  const stale: string[] = [];
+  if (!probe.branchExists) stale.push("nhánh nguồn đã mất");
+  if (probe.landedOrEmpty) {
+    stale.push(
+      "nhánh không còn commit chưa merge (có thể đã merge ở nơi khác)",
+    );
+  }
+  if (
+    s.worktreePath !== undefined &&
+    !probe.worktreeExists &&
+    probe.branchExists
+  ) {
+    stale.push("worktree đã mất — retry sẽ dựng lại từ nhánh");
+  }
+  if (stale.length > 0) lines.push(`  ⚠ Lỗi thời: ${stale.join("; ")}.`);
+  return lines.join("\n");
+};
+
+const statusCommand = Command.make("status", {}, () =>
+  Effect.gen(function* () {
+    const d = yield* Display;
+    const cwd = process.cwd();
+    const entries = yield* Effect.promise(() => listRecoveryStates(cwd));
+    if (entries.length === 0) {
+      yield* d.status("Không có tác vụ thất bại nào được giữ lại.", "info");
+      return;
+    }
+    yield* d.text(`Tác vụ thất bại được giữ lại (${entries.length}):`);
+    for (const entry of entries) {
+      yield* d.text(
+        yield* Effect.promise(() => formatRecoveryEntry(cwd, entry)),
+      );
+    }
+    yield* d.text(
+      "Dùng `sandcastle retry <số-issue>` để tiếp tục, hoặc `sandcastle discard <số-issue>` để xóa công việc được giữ lại.",
+    );
   }),
+);
+
+/**
+ * `sandcastle retry <issue>` — continue a preserved failed task. The record
+ * pins the issue/branch/worktree so the run NEVER re-selects an issue or
+ * creates a new implementation branch; it re-enters the workflow at the
+ * recorded failure phase.
+ */
+const retryCommand = Command.make(
+  "retry",
+  { issueNumber: issueNumberArg },
+  ({ issueNumber }) =>
+    Effect.gen(function* () {
+      const d = yield* Display;
+      const cwd = process.cwd();
+      const record: RecoveryReadResult = yield* Effect.promise(() =>
+        readRecoveryState(cwd, issueNumber),
+      );
+      if (record.kind === "missing") {
+        return yield* Effect.fail(
+          new InitError({
+            message:
+              `Không tìm thấy bản ghi phục hồi cho issue #${issueNumber}. ` +
+              "Chạy `sandcastle status` để xem các tác vụ thất bại được giữ lại.",
+          }),
+        );
+      }
+      if (record.kind === "corrupt") {
+        return yield* Effect.fail(
+          new InitError({
+            message:
+              `Bản ghi phục hồi cho issue #${issueNumber} bị hỏng: ${record.detail} ` +
+              `(${record.path}). Sandcastle không tự xóa — sửa hoặc xóa tệp thủ công.`,
+          }),
+        );
+      }
+      yield* runWorkflowAndReport(d, {
+        cwd,
+        resume: record.state,
+        onStatus: (message, severity) => {
+          Effect.runSync(d.status(message, severity));
+        },
+      });
+    }),
+);
+
+const discardYesOption = Options.boolean("yes").pipe(
+  Options.withAlias("y"),
+  Options.withDescription(
+    "Confirm the discard — required when stdin is not a TTY",
+  ),
+);
+
+/**
+ * `sandcastle discard <issue>` — permanently delete a preserved failed task:
+ * worktree, source branch, and recovery record. Interactive runs ask for
+ * confirmation first; non-interactive runs require `--yes`. A declined
+ * confirmation leaves EVERYTHING untouched.
+ */
+const discardCommand = Command.make(
+  "discard",
+  { issueNumber: issueNumberArg, yes: discardYesOption },
+  ({ issueNumber, yes }) =>
+    Effect.gen(function* () {
+      const d = yield* Display;
+      const cwd = process.cwd();
+      const record: RecoveryReadResult = yield* Effect.promise(() =>
+        readRecoveryState(cwd, issueNumber),
+      );
+      if (record.kind === "missing") {
+        return yield* Effect.fail(
+          new InitError({
+            message:
+              `Không tìm thấy bản ghi phục hồi cho issue #${issueNumber}. ` +
+              "Chạy `sandcastle status` để xem các tác vụ thất bại được giữ lại.",
+          }),
+        );
+      }
+      if (record.kind === "corrupt") {
+        return yield* Effect.fail(
+          new InitError({
+            message:
+              `Bản ghi phục hồi cho issue #${issueNumber} bị hỏng: ${record.detail} ` +
+              `(${record.path}). Sandcastle không tự xóa — sửa hoặc xóa tệp thủ công.`,
+          }),
+        );
+      }
+      const state = record.state;
+
+      // Show exactly what would be destroyed BEFORE asking.
+      const probe = yield* Effect.promise(() =>
+        probeRecoveryArtifacts(cwd, state),
+      );
+      yield* d.text(
+        `Sẽ xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}:`,
+      );
+      yield* d.text(
+        `  • Nhánh \`${state.sourceBranch}\`` +
+          (probe.branchExists
+            ? ` (${probe.preservedCommits.length} commit chưa merge)`
+            : " (đã mất)"),
+      );
+      if (state.worktreePath !== undefined) {
+        yield* d.text(
+          `  • Worktree \`${state.worktreePath}\`` +
+            (probe.worktreeExists ? "" : " (đã mất)"),
+        );
+      }
+      yield* d.text(`  • Bản ghi ${recoveryStatePath(cwd, issueNumber)}`);
+
+      let confirmed = yes;
+      if (!confirmed) {
+        if (process.stdin.isTTY !== true) {
+          return yield* Effect.fail(
+            new InitError({
+              message:
+                "Lệnh `discard` cần xác nhận. Chạy lại với `--yes` để xóa, " +
+                "hoặc chạy trong terminal tương tác để được hỏi xác nhận.",
+            }),
+          );
+        }
+        const answer = yield* Effect.promise(() =>
+          clack.confirm({
+            message: `Xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}?`,
+            initialValue: false,
+          }),
+        );
+        confirmed = answer === true;
+      }
+      if (!confirmed) {
+        yield* d.status(
+          "Đã hủy — worktree, nhánh và bản ghi phục hồi được giữ nguyên.",
+          "info",
+        );
+        return;
+      }
+
+      const outcome = yield* Effect.promise(() =>
+        discardRecoveryWork(cwd, state),
+      );
+      if (!outcome.ok) {
+        return yield* Effect.fail(
+          new InitError({
+            message:
+              "Không xóa được toàn bộ công việc được giữ lại — bản ghi phục hồi vẫn còn:\n" +
+              outcome.failures.map((f) => `  • ${f}`).join("\n"),
+          }),
+        );
+      }
+      yield* d.status(
+        `Đã xóa công việc được giữ lại của issue #${issueNumber}` +
+          ` (worktree: ${outcome.worktreeRemoved ? "đã xóa" : "không có"}` +
+          `, nhánh: ${outcome.branchRemoved ? "đã xóa" : "không có"}).`,
+        "success",
+      );
+    }),
 );
 
 // --- Root command ---
@@ -1253,6 +1520,9 @@ export const sandcastle = rootCommand.pipe(
     initCommand,
     configureCommand,
     runCommand,
+    statusCommand,
+    retryCommand,
+    discardCommand,
     dockerCommand,
     podmanCommand,
   ]),
