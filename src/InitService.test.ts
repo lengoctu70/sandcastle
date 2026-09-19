@@ -846,6 +846,21 @@ describe("InitService scaffold", () => {
       expect(withBeads).not.toContain(".env.example");
     });
 
+    it.each(["parallel-planner", "parallel-planner-with-review"])(
+      "host mode next steps for %s cover host dependency reuse and the plan schema",
+      (template) => {
+        const joined = hostNext(template, "main.mts");
+        // copyToWorktree is the host-mode dependency reuse mechanism — no
+        // container install hook exists to mention.
+        expect(joined).toContain('copyToWorktree: ["node_modules"]');
+        expect(joined).toContain("npm install zod");
+        expect(joined).not.toMatch(/container|onSandboxReady/i);
+        if (template === "parallel-planner-with-review") {
+          expect(joined).toContain("CODING_STANDARDS.md");
+        }
+      },
+    );
+
     it("host mode + custom tracker keeps the English custom setup steps", () => {
       const joined = getNextStepsLines(
         "blank",
@@ -2559,6 +2574,113 @@ describe("InitService scaffold", () => {
       // so they are never rewritten.
       expect(mainTs).toContain("sandbox.run(");
     });
+
+    it.each(["parallel-planner", "parallel-planner-with-review"])(
+      "selecting host generates a branch-isolated host workflow for %s",
+      async (templateName) => {
+        const dir = await makeDir();
+        await runScaffold(dir, {
+          sandboxProvider: hostProvider,
+          templateName,
+        });
+
+        const mainTs = await readFile(
+          join(dir, ".sandcastle", "main.mts"),
+          "utf-8",
+        );
+        expect(mainTs).toContain(
+          'import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox"',
+        );
+        expect(mainTs).toContain("issues.map");
+
+        // Host dependency reuse stays; the container-only `npm install`
+        // sandbox hook, its declaration, and its comments are stripped.
+        expect(mainTs).toContain('copyToWorktree = ["node_modules"]');
+        expect(mainTs).not.toContain("const hooks");
+        expect(mainTs).not.toContain("hooks,");
+        expect(mainTs).not.toContain("npm install");
+        expect(mainTs).not.toContain("onSandboxReady");
+        expect(mainTs).not.toMatch(/container/i);
+        expect(mainTs).not.toContain("sandcastle:sandbox-");
+
+        // The per-issue concurrency block binds an explicit branch from the
+        // plan — never a shared head or merge-to-head worktree.
+        const implementerBlock = mainTs.slice(
+          mainTs.indexOf("issues.map"),
+          mainTs.indexOf("settled.entries()"),
+        );
+        expect(implementerBlock).toContain("issue.branch");
+        expect(implementerBlock).not.toContain('type: "merge-to-head"');
+        expect(implementerBlock).not.toContain('type: "head"');
+
+        // Planner and merger keep their target-branch responsibilities via
+        // the injected merge-to-head — one per call, never on implementers.
+        expect(
+          mainTs.match(/branchStrategy: \{ type: "merge-to-head" \}/g),
+        ).toHaveLength(2);
+        expect(mainTs).not.toContain('type: "head"');
+
+        if (templateName === "parallel-planner") {
+          // Each concurrent implementer gets its own explicit branch (and
+          // therefore its own host worktree).
+          expect(mainTs).toContain(
+            'branchStrategy: { type: "branch", branch: issue.branch }',
+          );
+        } else {
+          // The reviewer runs inside the same createSandbox worktree, on the
+          // same explicit branch, as the implementation it evaluates.
+          const pipeline = mainTs.slice(
+            mainTs.indexOf("createSandbox({"),
+            mainTs.indexOf("sandbox.close()"),
+          );
+          expect(pipeline).toContain("branch: issue.branch");
+          expect(pipeline.match(/await sandbox\.run\(/g)).toHaveLength(2);
+        }
+        // planner + per-issue implementer/createSandbox + merger
+        expect(mainTs.match(/sandbox: noSandbox\(\)/g)).toHaveLength(3);
+      },
+    );
+
+    it.each([
+      ["docker", "parallel-planner"],
+      ["podman", "parallel-planner"],
+      ["docker", "parallel-planner-with-review"],
+      ["podman", "parallel-planner-with-review"],
+    ])(
+      "keeps the %s container workflow for %s byte-identical",
+      async (providerName, templateName) => {
+        const dir = await makeDir();
+        await runScaffold(dir, {
+          sandboxProvider: getSandboxProvider(providerName),
+          templateName,
+        });
+
+        const mainTs = await readFile(
+          join(dir, ".sandcastle", "main.mts"),
+          "utf-8",
+        );
+        // Reconstruct the expected output from the template source: marker
+        // comments are stripped back to the original text, so only the
+        // standard agent/model and provider rewrites apply — the generated
+        // file must not otherwise change.
+        const templateSource = await readFile(
+          join(import.meta.dirname, "templates", templateName, "main.mts"),
+          "utf-8",
+        );
+        const expected = templateSource
+          .replace("// sandcastle:sandbox-setup:start\n", "")
+          .replace("\n// sandcastle:sandbox-setup:end", "")
+          .replace(/\/\* sandcastle:sandbox-hooks \*\/ hooks,/g, "hooks,")
+          .replace(/claudeCode\("[^"]+"\)/g, 'claudeCode("claude-opus-4-8")')
+          .replace(/sandboxes\/docker\b/g, `sandboxes/${providerName}`)
+          .replace(/\bdocker\b/g, providerName);
+        expect(mainTs).toBe(expected);
+        // The container setup survives intact — install hook and all.
+        expect(mainTs).toContain("const hooks");
+        expect(mainTs).toContain("npm install");
+        expect(mainTs).not.toContain("sandcastle:sandbox-");
+      },
+    );
 
     it("selecting host omits agent API-key env entries but keeps tracker env", async () => {
       const dir = await makeDir();
