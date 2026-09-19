@@ -39,6 +39,17 @@ const isTransientExecError = (err: ExecError | GitSetupTimeoutError): boolean =>
   err.exitCode !== undefined &&
   TRANSIENT_EXEC_EXIT_CODES.has(err.exitCode);
 
+/**
+ * Parallel queue runs (#20) in host mode run these git-setup commands on the
+ * same machine, so concurrent `git config --global` writes collide on
+ * `~/.gitconfig.lock` — the loser exits 255 with "could not lock config
+ * file". That's a transient collision between siblings, not a real setup
+ * failure: retry it like the exec races above.
+ */
+const isGitConfigLockRace = (err: ExecError | GitSetupTimeoutError): boolean =>
+  err._tag === "ExecError" &&
+  err.message.includes("could not lock config file");
+
 const execOk = (
   sandbox: SandboxService,
   command: string,
@@ -73,9 +84,10 @@ const execOkWithGitTimeout = (
         }),
     ),
     // Each attempt is bounded by its own timeout (above); retry only transient
-    // exec races, so a genuine git error or a hung exec still fails fast.
+    // exec races and ~/.gitconfig lock collisions between parallel host-mode
+    // runs, so a genuine git error or a hung exec still fails fast.
     Effect.retry({
-      while: isTransientExecError,
+      while: (err) => isTransientExecError(err) || isGitConfigLockRace(err),
       times: GIT_SETUP_MAX_RETRIES,
       schedule: Schedule.spaced(Duration.millis(GIT_SETUP_RETRY_DELAY_MS)),
     }),

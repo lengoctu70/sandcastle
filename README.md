@@ -837,9 +837,11 @@ Fails with a clear error when `settings.json` is missing or malformed — run `s
 
 ### `sandcastle run`
 
-Runs the full issue workflow for one GitHub Issue — the normal entry point after `init` (usually via `npm run sandcastle`). It requires the `github-issues` issue tracker, an installed and authenticated `gh` CLI, and the `Sandcastle` label on the repository — all checked up front, before any agent work.
+Runs the full issue workflow for one or all eligible GitHub Issues — the normal entry point after `init` (usually via `npm run sandcastle`). It requires the `github-issues` issue tracker, an installed and authenticated `gh` CLI, and the `Sandcastle` label on the repository — all checked up front, before any agent work.
 
-Interactively, `run` lists open issues labeled `Sandcastle` and lets you pick exactly one. Non-interactively (CI, scripts), `--issue <number>` selects the issue deterministically; without a TTY and without the flag it fails fast.
+Interactively, `run` first asks for the scope: **one issue** (you then pick from the open `Sandcastle`-labeled issues), **all eligible issues sequentially**, or **all eligible issues in parallel** bounded by the configured `parallelism`. Non-interactively (CI, scripts), `--issue <number>` selects one issue deterministically and `--all` queues every open `Sandcastle`-labeled issue; without a TTY and without either flag it fails fast. `--all` and `--issue` are mutually exclusive.
+
+For `--all`, issues run in ascending issue-number order and each gets the identical single-issue pipeline below — its own `sandcastle/issue-<number>` branch, worktree, integration worktree, verification, landing, report, and (on failure) recovery record. Sequential is the default (`parallelism` 1); parallel mode caps how many issues are in flight at once — the bound comes from `--parallelism` when given, otherwise the `parallelism` in `settings.json` (integer 1–4, set it with `sandcastle configure --parallelism`). There is no unbounded option. A failing issue never aborts the others: in-flight issues finish, the queue continues, and the run ends with a Vietnamese summary listing which issues landed and which failed (failed issues stay open with their recovery state). Integration and landing are serialized across concurrent issues, so parallel runs can never race the target branch.
 
 For the selected issue, Sandcastle then owns the whole sequence (ADR 0023/0024): the configured agent implements it on a dedicated `sandcastle/issue-<number>` branch in its own worktree — the agent never sees issue-closing instructions — the configured verification commands run in that worktree, the result is merged in a separate integration worktree based on the target branch's current tip, verification runs again on the integrated tree, and the target branch is updated only after integrated verification passes and a freshness check confirms the target hasn't moved (fast-forward when it's your current checkout, atomic compare-and-swap otherwise — never a force-update).
 
@@ -849,9 +851,11 @@ When a repair budget is exhausted (or the failure isn't repairable), the run sto
 
 Only after landing does Sandcastle post a Vietnamese completion report (outcome, landed commits and change summary, executed verification, cautions — including how many repairs were needed) and then close the issue. On any pre-landing failure it posts a Vietnamese failure report instead, keeps the issue open, preserves the source branch and worktree under `.sandcastle/` for recovery, and never leaves your active checkout conflicted.
 
-| Option    | Required | Default                  | Description                                               |
-| --------- | -------- | ------------------------ | --------------------------------------------------------- |
-| `--issue` | No       | Interactive issue picker | GitHub issue number to implement — skips the issue picker |
+| Option          | Required | Default                        | Description                                                                      |
+| --------------- | -------- | ------------------------------ | -------------------------------------------------------------------------------- |
+| `--issue`       | No       | Interactive run-scope picker   | GitHub issue number to implement — mutually exclusive with `--all`               |
+| `--all`         | No       | `false`                        | Run every open `Sandcastle`-labeled issue (ascending issue-number order)         |
+| `--parallelism` | No       | Configured `parallelism` (1–4) | Cap on how many `--all` issues run at once — `1` is sequential; requires `--all` |
 
 ### `sandcastle docker build-image`
 

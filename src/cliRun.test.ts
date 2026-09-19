@@ -146,6 +146,17 @@ process.exit(1);
  *   post-repair state check.
  * - A `# Verification repair` prompt additionally creates `verify-ok.flag`,
  *   which a verification command can assert on to gate repair success.
+ *
+ * Queue support (#20):
+ * - `AGENT_BEGIN <issue>` / `AGENT_END <issue>` markers are appended to the
+ *   shared call log so tests can compute max in-flight agent concurrency.
+ * - `FAKE_AGENT_DELAY_MS` sleeps inside the run so overlapping parallel
+ *   issues are actually observed in flight.
+ * - `FAKE_AGENT_FAIL_ISSUE=<n>` exits 1 (without committing) when the
+ *   implementation prompt targets issue #<n> — repair prompts are unaffected,
+ *   so the issue fails at the implementation phase and stays open.
+ * - `FAKE_AGENT_PER_ISSUE_FILE=1` names the created file
+ *   `agent-work-<issue>.txt` instead of `agent-work.txt`.
  */
 const writeFakeClaude = async (dir: string) => {
   const shim = join(dir, "claude");
@@ -160,13 +171,22 @@ process.stdin.on("data", (d) => (buf += d));
 process.stdin.on("end", () => {
   const log = process.env.FAKE_GH_LOG;
   const prior = log && fs.existsSync(log)
-    ? fs.readFileSync(log, "utf-8").split("\\n").filter((l) => l.startsWith("AGENT")).length
+    ? fs.readFileSync(log, "utf-8").split("\\n").filter((l) => l === "AGENT" || l.startsWith("AGENT_RESUME")).length
     : 0;
   const n = prior + 1;
   const sessionId = "fake-session-" + n;
+  const issueMatch = buf.match(/issue #(\\d+)/);
+  const issueNo = issueMatch ? issueMatch[1] : "?";
   const resumeIdx = process.argv.indexOf("--resume");
   const resumed = resumeIdx >= 0 ? process.argv[resumeIdx + 1] : null;
   if (log) fs.appendFileSync(log, resumed ? "AGENT_RESUME " + resumed + "\\n" : "AGENT\\n");
+  if (log) fs.appendFileSync(log, "AGENT_BEGIN " + issueNo + "\\n");
+  const endRun = (code) => {
+    if (log) fs.appendFileSync(log, "AGENT_END " + issueNo + "\\n");
+    process.exit(code);
+  };
+  const delayMs = parseInt(process.env.FAKE_AGENT_DELAY_MS || "0", 10);
+  if (delayMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, delayMs);
   const promptOut = process.env.FAKE_AGENT_PROMPT;
   if (promptOut) fs.appendFileSync(promptOut, "\\n===PROMPT " + n + "===\\n" + buf);
   const home = process.env.HOME;
@@ -178,7 +198,12 @@ process.stdin.on("end", () => {
   }
   if (process.env.FAKE_CLAUDE_FAIL === "1") {
     console.log(JSON.stringify({ type: "result", result: "agent exploded" }));
-    process.exit(1);
+    endRun(1);
+  }
+  const failIssue = process.env.FAKE_AGENT_FAIL_ISSUE;
+  if (failIssue && buf.includes("Implement GitHub issue #" + failIssue + ":")) {
+    console.log(JSON.stringify({ type: "result", result: "agent exploded" }));
+    endRun(1);
   }
   const cwd = process.cwd();
   if (buf.includes("# Merge conflict repair")) {
@@ -194,13 +219,17 @@ process.stdin.on("end", () => {
     if (buf.includes("# Verification repair")) {
       fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
     }
-    const name = process.env.FAKE_AGENT_FILE || "agent-work.txt";
+    const name = process.env.FAKE_AGENT_FILE
+      || (process.env.FAKE_AGENT_PER_ISSUE_FILE === "1" && issueNo !== "?"
+        ? "agent-work-" + issueNo + ".txt"
+        : "agent-work.txt");
     fs.writeFileSync(path.join(cwd, name), "implemented " + n + "\\n");
     cp.execSync("git add -A && git commit -m \\"agent work " + n + "\\"", { cwd, stdio: "ignore" });
   }
   console.log(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }));
   console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "worked" }] } }));
   console.log(JSON.stringify({ type: "result", result: "done <promise>COMPLETE</promise>", session_id: sessionId }));
+  endRun(0);
 });
 `,
   );
@@ -307,6 +336,43 @@ const ISSUE_5 = {
   state: "OPEN",
   labels: [{ name: "Sandcastle" }],
   url: "https://example.test/issues/5",
+};
+
+const ISSUE_7 = {
+  number: 7,
+  title: "Add a farewell file",
+  body: "Please add a farewell.",
+  state: "OPEN",
+  labels: [{ name: "Sandcastle" }],
+  url: "https://example.test/issues/7",
+};
+
+const ISSUE_9 = {
+  number: 9,
+  title: "Add a readme note",
+  body: "Please add a note.",
+  state: "OPEN",
+  labels: [{ name: "Sandcastle" }],
+  url: "https://example.test/issues/9",
+};
+
+/**
+ * Max simultaneously in-flight fake-agent runs, computed from the
+ * `AGENT_BEGIN <issue>`/`AGENT_END <issue>` markers the fake claude appends to
+ * the shared call log (#20 concurrency-bound assertions).
+ */
+const maxAgentConcurrency = (log: readonly string[]): number => {
+  let inFlight = 0;
+  let max = 0;
+  for (const l of log) {
+    if (l.startsWith("AGENT_BEGIN")) {
+      inFlight += 1;
+      if (inFlight > max) max = inFlight;
+    } else if (l.startsWith("AGENT_END")) {
+      inFlight -= 1;
+    }
+  }
+  return max;
 };
 
 // ---------------------------------------------------------------------------
@@ -464,7 +530,9 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     expect(log.filter((l) => l === "AGENT").length).toBe(1);
     expect(log).toContain("AGENT_RESUME fake-session-1");
     expect(log).toContain("AGENT_RESUME fake-session-2");
-    expect(log.filter((l) => l.startsWith("AGENT")).length).toBe(3);
+    expect(
+      log.filter((l) => l === "AGENT" || l.startsWith("AGENT_RESUME")).length,
+    ).toBe(3);
     // Initial verify + one re-run per repair = 3 invocations.
     expect(log.filter((l) => l === "VERIFY").length).toBe(3);
     expect(log.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
@@ -567,7 +635,9 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     // The one allowed repair ran (session resumed) and left the merge
     // conflicted — no second repair, no landing, no close.
     expect(log).toContain("AGENT_RESUME fake-session-1");
-    expect(log.filter((l) => l.startsWith("AGENT")).length).toBe(2);
+    expect(
+      log.filter((l) => l === "AGENT" || l.startsWith("AGENT_RESUME")).length,
+    ).toBe(2);
     expect(log.some((l) => l.startsWith("gh issue comment 7"))).toBe(true);
     expect(log.some((l) => l.startsWith("gh issue close"))).toBe(false);
 
@@ -741,8 +811,188 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     }
   });
 
-  it("run --help exposes --issue", async () => {
+  it("run --help exposes --issue, --all, and --parallelism", async () => {
     const { stdout } = await runCli("run --help", process.cwd(), process.env);
     expect(stdout).toContain("--issue");
+    expect(stdout).toContain("--all");
+    expect(stdout).toContain("--parallelism");
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("sandcastle run --all (queued issues, #20)", () => {
+  it("runs every eligible issue sequentially in issue-number order", async () => {
+    const { repoDir, logFile, env } = await makeFixture(
+      [ISSUE_9, ISSUE_5, ISSUE_7],
+      { FAKE_AGENT_PER_ISSUE_FILE: "1" },
+    );
+    // parallelism 1 in the fixture settings = sequential mode.
+    await writeSettings(repoDir);
+
+    const { stdout } = await runCli("run --all", repoDir, env);
+
+    const log = await readLog(logFile);
+    // Queue preflight runs once (one --version/auth/label probe), then each
+    // issue's own `issue view` — in ascending number order even though the
+    // tracker returned them shuffled.
+    expect(log.filter((l) => l === "gh --version").length).toBe(1);
+    const views = log
+      .filter((l) => l.startsWith("gh issue view"))
+      .map((l) => l.split(" ")[3]);
+    expect(views).toEqual(["5", "7", "9"]);
+
+    // Sequential: at most one agent in flight, started in issue order.
+    expect(maxAgentConcurrency(log)).toBe(1);
+    const begins = log
+      .filter((l) => l.startsWith("AGENT_BEGIN"))
+      .map((l) => l.split(" ").pop());
+    expect(begins).toEqual(["5", "7", "9"]);
+
+    // Every issue landed on main and was closed.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work-5.txt");
+    expect(files).toContain("agent-work-7.txt");
+    expect(files).toContain("agent-work-9.txt");
+    const closes = log
+      .filter((l) => l.startsWith("gh issue close"))
+      .map((l) => l.split(" ")[3]);
+    expect(closes).toEqual(["5", "7", "9"]);
+
+    // Vietnamese end-of-run summary lists all landed issues.
+    expect(stdout).toContain("Hoàn thành tất cả 3 issue");
+    expect(stdout).toContain("#5");
+    expect(stdout).toContain("#7");
+    expect(stdout).toContain("#9");
+  });
+
+  it("caps in-flight issues at --parallelism and still lands them all", async () => {
+    const { repoDir, logFile, env } = await makeFixture(
+      [ISSUE_9, ISSUE_5, ISSUE_7],
+      { FAKE_AGENT_PER_ISSUE_FILE: "1", FAKE_AGENT_DELAY_MS: "600" },
+    );
+    await writeSettings(repoDir);
+
+    const { stdout } = await runCli("run --all --parallelism 2", repoDir, env);
+
+    const log = await readLog(logFile);
+    // Bounded: exactly two agents overlapped — the flag overrode the
+    // configured parallelism 1, and the delay made the overlap observable.
+    expect(maxAgentConcurrency(log)).toBe(2);
+
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work-5.txt");
+    expect(files).toContain("agent-work-7.txt");
+    expect(files).toContain("agent-work-9.txt");
+    expect(log.filter((l) => l.startsWith("gh issue close")).length).toBe(3);
+    expect(stdout).toContain("Hoàn thành tất cả 3 issue");
+  });
+
+  it("honors the configured parallelism setting for --all", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5, ISSUE_7], {
+      FAKE_AGENT_PER_ISSUE_FILE: "1",
+      FAKE_AGENT_DELAY_MS: "600",
+    });
+    await writeSettings(repoDir, { parallelism: 2 });
+
+    const { stdout } = await runCli("run --all", repoDir, env);
+
+    const log = await readLog(logFile);
+    // No flag — the configured bound (2) applied and both issues overlapped.
+    expect(maxAgentConcurrency(log)).toBe(2);
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work-5.txt");
+    expect(files).toContain("agent-work-7.txt");
+    expect(stdout).toContain("Hoàn thành tất cả 2 issue");
+  });
+
+  it("keeps going after a failed issue and reports landed vs failed", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5, ISSUE_7], {
+      FAKE_AGENT_PER_ISSUE_FILE: "1",
+      FAKE_AGENT_DELAY_MS: "400",
+      FAKE_AGENT_FAIL_ISSUE: "5",
+    });
+    await writeSettings(repoDir, { parallelism: 2 });
+
+    try {
+      await runCli("run --all", repoDir, env);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      // The summary names the landed issue, the failed one, and marks the run
+      // failed — #5's failure did not stop #7 from landing.
+      expect(stdout + stderr).toContain("#5");
+      expect(stdout + stderr).toContain("#7");
+      expect(stdout + stderr).toContain("thất bại");
+    }
+
+    const log = await readLog(logFile);
+    // #7 landed and closed; #5 got a failure comment but was never closed.
+    expect(log.some((l) => l.startsWith("gh issue close 7"))).toBe(true);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(false);
+    expect(log.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work-7.txt");
+    expect(files).not.toContain("agent-work-5.txt");
+
+    // The failed issue's recovery state and source branch/worktree survive.
+    const recovery = await readFile(
+      join(repoDir, ".sandcastle", "recovery", "issue-5.json"),
+      "utf-8",
+    );
+    expect(recovery).toContain('"issue"');
+    const branches = await git(repoDir, "branch --list");
+    expect(branches).toContain("sandcastle/issue-5");
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees).toContain("sandcastle-issue-5");
+  });
+
+  it("rejects --all combined with --issue", async () => {
+    const { repoDir, env } = await makeFixture([ISSUE_5, ISSUE_7]);
+    await writeSettings(repoDir);
+
+    try {
+      await runCli("run --all --issue 5", repoDir, env);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("--all");
+      expect(stdout + stderr).toContain("--issue");
+    }
+  });
+
+  it("rejects a --parallelism bound outside 1-4", async () => {
+    const { repoDir, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+
+    try {
+      await runCli("run --all --parallelism 5", repoDir, env);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("--parallelism");
+    }
+  });
+
+  it("rejects --parallelism without --all in non-interactive mode", async () => {
+    const { repoDir, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+
+    try {
+      await runCli("run --issue 5 --parallelism 2", repoDir, env);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("--parallelism");
+      expect(stdout + stderr).toContain("--all");
+    }
+  });
+
+  it("reports no eligible issues and exits 0 for --all when none are labeled", async () => {
+    const { repoDir, env } = await makeFixture([]);
+    await writeSettings(repoDir);
+
+    const { stdout } = await runCli("run --all", repoDir, env);
+    expect(stdout).toContain("Không có issue nào đang mở");
   });
 });
