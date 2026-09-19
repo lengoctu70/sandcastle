@@ -845,13 +845,31 @@ For the selected issue, Sandcastle then owns the whole sequence (ADR 0023/0024):
 
 Deterministic failures get bounded automatic repair instead of an immediate stop (ADR 0024): a failed source-stage verification sends the exact failed command and its output back to the agent in the same worktree — resuming the same agent session when the provider supports native resume (Claude Code, Codex, Pi, Grok), otherwise a fresh invocation against the preserved worktree with the task and failure inlined — for at most two repairs, each re-running all verification commands. A merge conflict triggers at most one repair inside the integration worktree itself (the agent resolves the conflicted files and commits the merge there), after which all verification commands re-run on the integrated tree before landing. If the target branch moved while integrating, Sandcastle discards the integration state and rebuilds it on the new tip at most once — it never force-updates a moved branch.
 
-When a repair budget is exhausted (or the failure isn't repairable), the run stops safely: it posts a Vietnamese failure report naming the phase and the attempts spent, keeps the issue open, preserves the source branch and worktree, and writes a machine-local recovery record to `.sandcastle/recovery/issue-<number>.json` (ignored by git) carrying the failure phase, attempt counters, verification results, and agent session id.
+When a repair budget is exhausted (or the failure isn't repairable), the run stops safely: it posts a Vietnamese failure report naming the phase and the attempts spent, keeps the issue open, preserves the source branch and worktree, and writes a machine-local recovery record to `.sandcastle/recovery/issue-<number>.json` (ignored by git) carrying the issue identity, branches, target base SHA, failure phase, attempt counters, verification results, and agent session id. The record survives process exit — `sandcastle status` lists it, `sandcastle retry <issue-number>` continues the preserved work, and `sandcastle discard <issue-number>` removes it after confirmation.
 
 Only after landing does Sandcastle post a Vietnamese completion report (outcome, landed commits and change summary, executed verification, cautions — including how many repairs were needed) and then close the issue. On any pre-landing failure it posts a Vietnamese failure report instead, keeps the issue open, preserves the source branch and worktree under `.sandcastle/` for recovery, and never leaves your active checkout conflicted.
 
 | Option    | Required | Default                  | Description                                               |
 | --------- | -------- | ------------------------ | --------------------------------------------------------- |
 | `--issue` | No       | Interactive issue picker | GitHub issue number to implement — skips the issue picker |
+
+### `sandcastle status`
+
+Lists every preserved failed task — one entry per recovery record under `.sandcastle/recovery/`. Each entry shows the issue, the phase it stopped in, when it failed, how often it was retried, the preserved source branch and worktree (including whether they still exist), the bounded-repair attempts already spent, and the first line of the recorded error. Stale signals are marked explicitly — a missing source branch, a branch with no unmerged commits (possibly landed elsewhere), or a worktree that is gone (a `retry` rebuilds it from the branch). A record Sandcastle cannot parse is reported as corrupt — it is never silently dropped. With nothing preserved, `status` reports there are no failed tasks.
+
+### `sandcastle retry <issue-number>`
+
+Continues one preserved failed task. The recovery record pins the task: `retry` never re-selects an issue, never creates a new implementation branch, and never starts the work over. It re-enters the workflow at the recorded failure phase — re-running verification (with a fresh bounded repair budget), or going straight to the integration/landing sequence when the failure happened there — inside the preserved worktree and on the preserved source branch. When the record carries an agent session id and the provider supports session storage, the next agent invocation resumes that session across the process restart; otherwise a fresh invocation against the preserved code carries the issue identity and failure context.
+
+A successful `retry` runs the normal safe path: verification, integration, freshness-checked landing, the Vietnamese completion report, issue closure, and cleanup of the recovery record, worktree, and branch. A `retry` that fails again rewrites the record with the new failure phase and an incremented retry count. Stale records are diagnosed in Vietnamese instead of being silently used — the issue now closed (work may have landed elsewhere), the target branch gone, or no committed work left to continue — and point at `sandcastle discard` for cleanup.
+
+### `sandcastle discard <issue-number>`
+
+Permanently deletes one preserved failed task: the preserved worktree, the source branch, and the recovery record. It first lists exactly what will be removed. Interactive runs ask for confirmation first; a declined confirmation leaves everything untouched. Non-interactive runs (no TTY) require `--yes`, so scripts can never delete preserved work accidentally. The record is deleted last — if removing a worktree or branch fails, the record survives so the task stays visible in `status`. Missing or corrupt records produce a Vietnamese diagnosis and nothing is removed.
+
+| Option  | Required | Default             | Description                                            |
+| ------- | -------- | ------------------- | ------------------------------------------------------ |
+| `--yes` | No       | Interactive confirm | Confirm the discard — required when stdin is not a TTY |
 
 ### `sandcastle docker build-image`
 

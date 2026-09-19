@@ -1,5 +1,12 @@
 import { exec } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -744,5 +751,334 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
   it("run --help exposes --issue", async () => {
     const { stdout } = await runCli("run --help", process.cwd(), process.env);
     expect(stdout).toContain("--issue");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Recovery commands — `status` / `retry` / `discard` run as SEPARATE CLI
+// processes against the durable `.sandcastle/recovery/` records a failed
+// `run` leaves behind (#19).
+// ---------------------------------------------------------------------------
+
+const exists = async (path: string): Promise<boolean> =>
+  access(path).then(
+    () => true,
+    () => false,
+  );
+
+const recoveryPath = (repoDir: string, issue: number) =>
+  join(repoDir, ".sandcastle", "recovery", `issue-${issue}.json`);
+
+const sourceWorktreePath = (repoDir: string, issue: number) =>
+  join(repoDir, ".sandcastle", "worktrees", `sandcastle-issue-${issue}`);
+
+describe("sandcastle status / retry / discard (CLI seam)", () => {
+  it("run fails → status lists it → retry resumes at the failed phase, resumes the session, lands → status clean", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    // Verification fails while the counter file holds >0 — four failures:
+    // three inside the first run (initial + two bounded repairs), then one
+    // more inside the retry so its repair pass is exercised too.
+    const vfails = join(repoDir, ".vfails");
+    await writeFile(vfails, "4");
+    const verifyCmd =
+      `c=$(cat "${vfails}" 2>/dev/null || echo 0); echo VERIFY >> "${logFile}"; ` +
+      `if [ "$c" -gt 0 ]; then echo $((c-1)) > "${vfails}"; echo "gated failure $c" >&2; exit 1; fi`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    // 1) The run fails at verification after spending both repair attempts.
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    const recovery = JSON.parse(
+      await readFile(recoveryPath(repoDir, 5), "utf-8"),
+    );
+    expect(recovery).toMatchObject({
+      failurePhase: "verification",
+      sourceBranch: "sandcastle/issue-5",
+      targetBranch: "main",
+      issue: { number: 5 },
+      sessionId: "fake-session-3",
+      retryCount: 0,
+      attempts: { implementation: 1, verificationRepair: 2 },
+    });
+    expect(typeof recovery.targetBaseSha).toBe("string");
+    expect(recovery.targetBaseSha.length).toBeGreaterThan(0);
+
+    // 2) `status` in a separate process lists the preserved task.
+    const status1 = await runCli("status", repoDir, env);
+    expect(status1.stdout).toContain("Issue #5");
+    expect(status1.stdout).toContain("xác minh trên nhánh làm việc");
+    expect(status1.stdout).toContain("xác minh 2/2");
+    expect(status1.stdout).toContain("sandcastle/issue-5");
+    expect(status1.stdout).toContain("sandcastle-issue-5");
+
+    // 3) `retry` continues the preserved work: no new issue selection, no
+    //    new implementation run — it re-enters at verification, hits the one
+    //    remaining gate, and the repair RESUMES the recorded agent session.
+    const before = await readLog(logFile);
+    const { stdout } = await runCli("retry 5", repoDir, env);
+
+    const after = await readLog(logFile);
+    const delta = after.slice(before.length);
+    // No re-selection: issue list/label probing never ran on retry.
+    expect(delta.some((l) => l.startsWith("gh issue list"))).toBe(false);
+    expect(delta.some((l) => l.startsWith("gh label list"))).toBe(false);
+    // It re-viewed only the recorded issue.
+    expect(delta.some((l) => l.startsWith("gh issue view 5"))).toBe(true);
+    // No fresh implementation invocation — the retry resumed at
+    // verification; its single repair resumed the recorded session.
+    expect(delta.filter((l) => l === "AGENT").length).toBe(0);
+    expect(delta).toContain("AGENT_RESUME fake-session-3");
+    // verify (fail) → repair → verify (pass) → integrated verify (pass).
+    expect(delta.filter((l) => l === "VERIFY").length).toBe(3);
+    expect(delta.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+
+    // The repair prompt carried the failed command + output context.
+    const prompts = await readFile(promptFile, "utf-8");
+    const repairPrompt = prompts.split("===PROMPT 4===")[1] ?? "";
+    expect(repairPrompt).toContain("# Verification repair");
+    expect(repairPrompt).toContain("gated failure");
+
+    // Landed: agent's work is on main, source worktree/branch cleaned up,
+    // the recovery record removed.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    const branches = await git(repoDir, "branch --list");
+    expect(branches).not.toContain("sandcastle/issue-5");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+    expect(stdout).toContain("Hoàn thành issue #5");
+
+    // 4) `status` is clean again.
+    const status2 = await runCli("status", repoDir, env);
+    expect(status2.stdout).toContain("Không có tác vụ thất bại");
+  });
+
+  it("retry after an implementation-phase failure reuses the preserved worktree and lands", async () => {
+    // FAKE_CLAUDE_FAIL makes the agent exit non-zero with no commits.
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5], {
+      FAKE_CLAUDE_FAIL: "1",
+    });
+    await writeSettings(repoDir);
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    const recovery = JSON.parse(
+      await readFile(recoveryPath(repoDir, 5), "utf-8"),
+    );
+    expect(recovery.failurePhase).toBe("implementation");
+    expect(recovery.worktreePath).toContain("sandcastle-issue-5");
+
+    // Retry with the agent healthy — the preserved worktree is reused and a
+    // fresh implementation invocation carries the previous failure context
+    // (no session id was captured from the crashed run).
+    const env2 = { ...env, FAKE_CLAUDE_FAIL: "0" };
+    const before = await readLog(logFile);
+    const { stdout } = await runCli("retry 5", repoDir, env2);
+
+    const delta = (await readLog(logFile)).slice(before.length);
+    expect(delta.filter((l) => l === "AGENT").length).toBe(1);
+    expect(delta.some((l) => l.startsWith("AGENT_RESUME"))).toBe(false);
+    const prompts = await readFile(promptFile, "utf-8");
+    const retryPrompt = prompts.split("===PROMPT 2===")[1] ?? "";
+    expect(retryPrompt).toContain("# Task");
+    expect(retryPrompt).toContain("issue #5");
+    expect(retryPrompt).toContain("Previous attempt");
+
+    expect(stdout).toContain("Hoàn thành issue #5");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
+
+  it("retry rebuilds the preserved worktree when only the branch survived", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    // Simulate the worktree being deleted out from under git — the branch
+    // and its commits remain.
+    await execAsync(
+      `git worktree remove --force "${sourceWorktreePath(repoDir, 5)}"`,
+      { cwd: repoDir },
+    );
+    expect(await exists(sourceWorktreePath(repoDir, 5))).toBe(false);
+
+    // Status marks it recoverable — worktree gone but the branch holds work.
+    const statusOut = await runCli("status", repoDir, env);
+    expect(statusOut.stdout).toContain("worktree đã mất");
+
+    // Make verification pass now, then retry — the worktree is rebuilt from
+    // the preserved branch and the run lands without any new agent call.
+    await writeSettings(repoDir, {
+      verificationCommands: [`echo VERIFY >> "${logFile}"`],
+    });
+    const before = await readLog(logFile);
+    const { stdout } = await runCli("retry 5", repoDir, env);
+
+    const delta = (await readLog(logFile)).slice(before.length);
+    expect(delta.filter((l) => l === "AGENT").length).toBe(0);
+    expect(delta.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    expect(stdout).toContain("dựng lại worktree");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
+
+  it("discard without --yes refuses non-interactively and keeps everything; --yes removes record, worktree, and branch", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+    expect(await exists(sourceWorktreePath(repoDir, 5))).toBe(true);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toContain(
+      "sandcastle/issue-5",
+    );
+
+    // Declined/required confirmation: stdin is not a TTY here, so the command
+    // must refuse without --yes and touch nothing.
+    try {
+      await runCli("discard 5", repoDir, env);
+      expect.fail("Expected discard without --yes to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("--yes");
+    }
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+    expect(await exists(sourceWorktreePath(repoDir, 5))).toBe(true);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toContain(
+      "sandcastle/issue-5",
+    );
+
+    // Confirmed: everything preserved is removed.
+    const { stdout } = await runCli("discard 5 --yes", repoDir, env);
+    expect(stdout).toContain("Đã xóa");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+    expect(await exists(sourceWorktreePath(repoDir, 5))).toBe(false);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toBe("");
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+
+    const statusOut = await runCli("status", repoDir, env);
+    expect(statusOut.stdout).toContain("Không có tác vụ thất bại");
+  });
+
+  it("unknown issue number: retry and discard explain there is no record", async () => {
+    const { repoDir, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+
+    try {
+      await runCli("retry 99", repoDir, env);
+      expect.fail("Expected retry to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("issue #99");
+      expect(stdout + stderr).toContain("status");
+    }
+    try {
+      await runCli("discard 99 --yes", repoDir, env);
+      expect.fail("Expected discard to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("issue #99");
+    }
+  });
+
+  it("corrupt record: status surfaces it, retry/discard refuse without deleting it", async () => {
+    const { repoDir, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+    await mkdir(join(repoDir, ".sandcastle", "recovery"), { recursive: true });
+    const corruptPath = recoveryPath(repoDir, 9);
+    await writeFile(corruptPath, "{ not valid json !!!");
+
+    const statusOut = await runCli("status", repoDir, env);
+    expect(statusOut.stdout).toContain("BỊ HỎNG");
+    expect(statusOut.stdout).toContain("issue-9.json");
+
+    try {
+      await runCli("retry 9", repoDir, env);
+      expect.fail("Expected retry to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("bị hỏng");
+    }
+    try {
+      await runCli("discard 9 --yes", repoDir, env);
+      expect.fail("Expected discard to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("bị hỏng");
+    }
+    // The corrupt record is never silently deleted.
+    expect(await exists(corruptPath)).toBe(true);
+  });
+
+  it("stale record (worktree and branch gone): status marks it, retry diagnoses and preserves the record", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    await execAsync(
+      `git worktree remove --force "${sourceWorktreePath(repoDir, 5)}"`,
+      { cwd: repoDir },
+    );
+    await execAsync("git branch -D sandcastle/issue-5", { cwd: repoDir });
+
+    const statusOut = await runCli("status", repoDir, env);
+    expect(statusOut.stdout).toContain("Issue #5");
+    expect(statusOut.stdout).toContain("Lỗi thời");
+
+    try {
+      await runCli("retry 5", repoDir, env);
+      expect.fail("Expected retry to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("lỗi thời");
+      expect(stdout + stderr).toContain("discard");
+    }
+    // The stale record is preserved, not silently deleted.
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+
+    // Discard still cleans up the record itself.
+    await runCli("discard 5 --yes", repoDir, env);
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
+
+  it("stale record (issue now closed): retry refuses with a discard hint", async () => {
+    const { repoDir, logFile, issuesFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    // The issue was closed while the record persisted — the preserved work
+    // may already have landed elsewhere, so continuing is unsafe.
+    await writeFile(
+      issuesFile,
+      JSON.stringify([{ ...ISSUE_5, state: "CLOSED" }]),
+    );
+
+    try {
+      await runCli("retry 5", repoDir, env);
+      expect.fail("Expected retry to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("CLOSED");
+      expect(stdout + stderr).toContain("discard");
+    }
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
   });
 });
