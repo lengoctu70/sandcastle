@@ -6,6 +6,105 @@
   </picture>
 </div>
 
+## Bắt đầu nhanh
+
+> Hướng dẫn ngắn nhất để cài đặt và chạy Sandcastle — dùng lại tài khoản subscription của agent CLI bạn đã đăng nhập trên máy. Tài liệu tham khảo chi tiết phía dưới (API, sandbox providers, prompts, templates, CLI options) vẫn bằng tiếng Anh.
+
+### Bạn cần có
+
+- [Node.js](https://nodejs.org/) và [Git](https://git-scm.com/).
+- [GitHub CLI (`gh`)](https://cli.github.com/) đã đăng nhập (`gh auth login`) — Sandcastle dùng `gh` để đọc issue, đăng báo cáo và đóng issue.
+- Một agent CLI đã cài và đăng nhập sẵn trên máy — ví dụ Claude Code, Codex, Pi, OpenCode, Devin, Cursor, Copilot, Grok hoặc Antigravity. **Không cần API key**: chế độ host tái sử dụng phiên đăng nhập subscription hiện có của agent.
+- (Không bắt buộc) [Docker](https://www.docker.com/) hoặc [Podman](https://podman.io/) nếu bạn muốn agent chạy trong container thay vì trên host.
+
+### 1. Cài đặt
+
+```bash
+npm i -D @lengoctu70/sandcastle
+```
+
+(Không cần cài cũng được — `npx @lengoctu70/sandcastle init` chạy thẳng từ npm.)
+
+### 2. Khởi tạo trong repo của bạn
+
+```bash
+npx sandcastle init
+```
+
+Init hỏi bạn bằng tiếng Việt (mọi bước đều có flag tương đương cho chế độ non-interactive — xem [`sandcastle init`](#sandcastle-init)):
+
+- **Nơi chạy agent**: `host`, `docker` hoặc `podman`.
+- **Agent + model + effort**: trong chế độ host, init tự khám phá các agent CLI đã cài, kiểm tra đăng nhập, và liệt kê model/effort thật từ chính CLI đó.
+- **Workflow**: chọn theo kết quả bạn muốn — một issue có review (khuyến nghị), nhanh tuần tự, song song, hoặc workflow tùy chỉnh.
+- **Issue tracker**: chọn `github-issues` để Sandcastle làm việc với GitHub Issue.
+- **Lệnh xác minh**: init phát hiện sẵn các lệnh như `npm run typecheck`, `npm test`… để bạn xác nhận hoặc chỉnh sửa.
+
+Khi chọn `github-issues`, init kiểm tra `gh` đã cài và đăng nhập trước khi scaffold, và chỉ tạo label `Sandcastle` trên repo sau khi bạn xác nhận. Init cũng tự thêm script này vào `package.json`:
+
+```json
+"scripts": {
+  "sandcastle": "sandcastle run"
+}
+```
+
+### 3. Chạy
+
+Gắn label `Sandcastle` cho các issue bạn muốn giao cho Sandcastle, rồi:
+
+```bash
+npm run sandcastle
+```
+
+Bạn sẽ được hỏi chọn **một issue** đang mở, chạy **tất cả tuần tự**, hoặc **tất cả song song** (giới hạn `parallelism` 1–4). Trong CI/script không tương tác, dùng `sandcastle run --issue <N>` hoặc `sandcastle run --all`.
+
+### Chế độ host — hiểu rõ trước khi chọn
+
+Chế độ host là đường đi khuyến nghị cho subscription: agent chạy trực tiếp trên máy của bạn trong một **git worktree riêng** (không đụng vào checkout đang mở), tái sử dụng phiên đăng nhập CLI hiện có — không cần cài lại agent hay copy API key vào container.
+
+**Worktree KHÔNG phải cách ly hệ điều hành.** Agent vẫn giữ toàn bộ quyền truy cập tệp và tiến trình của tài khoản bạn. Nếu cần ranh giới bảo mật thực sự, chọn `docker` hoặc `podman` trong init — agent chạy trong container riêng với image do Sandcastle build (`sandcastle docker build-image` / `sandcastle podman build-image`).
+
+Sandcastle cũng **xác minh danh tính** của executable trước khi tin đó là agent bạn chọn: một lệnh trùng tên (ví dụ `agent` trỏ tới sản phẩm khác) bị báo `wrong-product` thay vì bị gọi nhầm.
+
+### Model và effort: khám phá trực tiếp, không đoán
+
+Init đọc catalog model/effort **trực tiếp từ CLI của agent** — không hard-code "model mới nhất". Khi agent có nhiều model provider (Pi, OpenCode, Devin), model được nhóm theo provider; model và effort được khuyến nghị đánh dấu `(khuyến nghị)`.
+
+Nếu discovery thất bại, bạn có 3 lựa chọn an toàn: **thử lại**, **nhập model thủ công** — lựa chọn được lưu là `modelSource: "manual-unverified"` và UI không bao giờ trình bày nó là đã xác minh — hoặc **dừng lại** trước khi scaffold. Đổi sau bằng [`sandcastle configure`](#sandcastle-configure).
+
+### Mỗi lần chạy diễn ra thế nào
+
+Với mỗi issue được chọn, Sandcastle tự làm trọn chuỗi:
+
+1. **Implement** — agent làm việc trên nhánh `sandcastle/issue-<N>` trong worktree riêng; agent **không** nhận được quyền đóng issue.
+2. **Xác minh** — các lệnh xác minh bạn đã xác nhận chạy trong worktree.
+3. **Merge tích hợp** — kết quả merge trong một worktree tích hợp riêng, rồi xác minh lại lần nữa trên cây đã merge.
+4. **Landing** — nhánh đích chỉ được cập nhật sau khi xác minh pass và tip nhánh không bị động.
+5. **Báo cáo + đóng** — Sandcastle đăng báo cáo hoàn thành tiếng Việt lên issue rồi mới `gh issue close`.
+
+### Sửa tự động có giới hạn
+
+- Xác minh thất bại → agent sửa trong cùng worktree, **tối đa 2 lần** (tiếp tục đúng agent session khi agent hỗ trợ resume).
+- Xung đột merge → **tối đa 1 lần** sửa trong worktree tích hợp.
+- Nhánh đích bị động trong lúc merge → dựng lại tích hợp **tối đa 1 lần**; Sandcastle không bao giờ force-update.
+
+### Khi một tác vụ thất bại
+
+Issue vẫn **mở** kèm báo cáo thất bại tiếng Việt; nhánh + worktree + chi tiết lỗi được giữ trong `.sandcastle/recovery/`:
+
+```bash
+sandcastle status      # liệt kê các tác vụ thất bại được giữ lại
+sandcastle retry <N>   # tiếp tục từ đúng bước đã dừng — không chọn lại issue, không implement lại
+sandcastle discard <N> # xóa worktree + nhánh + bản ghi (hỏi xác nhận, hoặc --yes)
+```
+
+### Issue chỉ đóng sau khi code đã nằm trên nhánh đích
+
+`gh issue close` chỉ chạy **sau khi** code của issue đã pass xác minh và được merge — "closed" nghĩa là hoàn thành thật trong repo, không phải "agent nói xong".
+
+---
+
+_Tài liệu tham khảo đầy đủ bên dưới — API, sandbox providers, prompts, templates, CLI options — vẫn bằng tiếng Anh._
+
 ## What Is Sandcastle?
 
 A TypeScript library for orchestrating AI coding agents in isolated sandboxes:
@@ -79,6 +178,7 @@ Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbo
 Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept the same providers as their top-level counterparts. `wt.interactive()` defaults to `noSandbox()` when no sandbox is specified.
 
 ```typescript
+import { run, interactive, claudeCode } from "@lengoctu70/sandcastle";
 import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 import { podman } from "@lengoctu70/sandcastle/sandboxes/podman";
 import { vercel } from "@lengoctu70/sandcastle/sandboxes/vercel";
@@ -128,6 +228,9 @@ console.log(result.branch); // target branch name
 ```typescript
 import { run, claudeCode } from "@lengoctu70/sandcastle";
 import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
+
+// Stand-in for your observability client used by onAgentStreamEvent below.
+const myLogger = console;
 
 const result = await run({
   // Agent provider — required. Pass a model string to claudeCode().
@@ -427,7 +530,7 @@ Only `branch` and `merge-to-head` strategies are accepted; `head` is a compile-t
 Pass `cwd` to target a repo other than `process.cwd()`. Relative paths resolve against `process.cwd()`; absolute paths pass through. A `CwdError` is thrown if the path does not exist or is not a directory.
 
 ```typescript
-import { createWorktree } from "@lengoctu70/sandcastle";
+import { createWorktree, claudeCode } from "@lengoctu70/sandcastle";
 
 await using wt = await createWorktree({
   branchStrategy: { type: "branch", branch: "agent/fix-42" },
@@ -601,9 +704,12 @@ If any command exits with a non-zero code, the run fails immediately with an err
 Use `{{KEY}}` placeholders in your prompt to inject values from the `promptArgs` option. This is useful for reusing the same prompt file across multiple runs with different parameters.
 
 ```typescript
-import { run } from "@lengoctu70/sandcastle";
+import { run, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 await run({
+  agent: claudeCode("claude-opus-4-8"),
+  sandbox: docker(),
   promptFile: "./my-prompt.md",
   promptArgs: { ISSUE_NUMBER: 42, PRIORITY: "high" },
 });
@@ -1292,7 +1398,7 @@ import {
   type ExecResult,
 } from "@lengoctu70/sandcastle";
 import { execFile, spawn } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
