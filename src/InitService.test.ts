@@ -9,9 +9,13 @@ import {
   getNextStepsLines,
   getAgent,
   listTemplates,
+  listWorkflowOptions,
   listIssueTrackers,
   getIssueTracker,
   getSandboxProvider,
+  detectVerificationCandidates,
+  ensureSandcastleScript,
+  SANDCASTLE_SCRIPT_COMMAND,
 } from "./InitService.js";
 import type {
   AgentEntry,
@@ -766,21 +770,22 @@ describe("InitService scaffold", () => {
       const lines = next("simple-loop", "main.mts");
       const joined = lines.join("\n");
       expect(joined).toContain("prompt");
-      expect(joined).toMatch(/customiz|review|read/i);
+      // Steps are Vietnamese per ADR 0026.
+      expect(joined).toMatch(/customiz|review|read|chỉnh sửa|đọc/i);
     });
 
     it("sequential-reviewer template includes a step mentioning prompt files", () => {
       const lines = next("sequential-reviewer", "main.mts");
       const joined = lines.join("\n");
       expect(joined).toContain("prompt");
-      expect(joined).toMatch(/customiz|review|read/i);
+      expect(joined).toMatch(/customiz|review|read|chỉnh sửa|đọc/i);
     });
 
     it("parallel-planner template includes a step mentioning prompt files", () => {
       const lines = next("parallel-planner", "main.mts");
       const joined = lines.join("\n");
       expect(joined).toContain("prompt");
-      expect(joined).toMatch(/customiz|review|read/i);
+      expect(joined).toMatch(/customiz|review|read|chỉnh sửa|đọc/i);
     });
 
     it("returns at least 2 numbered steps for blank template", () => {
@@ -999,6 +1004,321 @@ describe("InitService scaffold", () => {
       expect(joined).not.toContain("image isn't built yet");
       expect(joined).not.toContain("build the image");
     });
+  });
+
+  // ---------------------------------------------------------------------
+  // Workflow options (ADR 0025/0026): the interactive picker presents
+  // Vietnamese outcome labels bound to stable internal template ids.
+  // ---------------------------------------------------------------------
+
+  describe("listWorkflowOptions", () => {
+    it("presents Vietnamese outcome labels bound to stable template ids", () => {
+      const options = listWorkflowOptions();
+      // Order is the pick order: reviewed sequential first (recommended),
+      // fast sequential, the two parallel workflows, then custom/blank.
+      expect(options.map((o) => o.template)).toEqual([
+        "sequential-reviewer",
+        "simple-loop",
+        "parallel-planner",
+        "parallel-planner-with-review",
+        "blank",
+      ]);
+      expect(options[0]).toMatchObject({
+        template: "sequential-reviewer",
+        recommended: true,
+      });
+      // Exactly one recommended choice.
+      expect(options.filter((o) => o.recommended)).toHaveLength(1);
+
+      const templateNames = listTemplates().map((t) => t.name);
+      for (const option of options) {
+        // Every outcome maps to a real, stable template id — never renamed.
+        expect(templateNames).toContain(option.template);
+        // The label is an outcome, not the codename; the id stays visible
+        // in the hint for traceability.
+        expect(option.label).not.toBe(option.template);
+        expect(option.label.length).toBeGreaterThan(0);
+        expect(option.hint).toContain(option.template);
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Verification-command detection (ADR 0024)
+  // ---------------------------------------------------------------------
+
+  describe("detectVerificationCandidates", () => {
+    const runDetect = (dir: string, packageManager: PackageManager = "npm") =>
+      Effect.runPromise(
+        detectVerificationCandidates(dir, packageManager).pipe(
+          Effect.provide(NodeFileSystem.layer),
+        ),
+      );
+
+    it("detects npm scripts in canonical run order (typecheck, lint, test, build)", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({
+          name: "fixture",
+          scripts: {
+            dev: "vite",
+            build: "tsup",
+            test: "vitest run",
+            lint: "eslint .",
+            typecheck: "tsgo --noEmit",
+          },
+        }),
+      );
+      expect(await runDetect(dir)).toEqual([
+        "npm run typecheck",
+        "npm run lint",
+        "npm test",
+        "npm run build",
+      ]);
+    });
+
+    it("renders scripts with the detected package manager", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({
+          scripts: { typecheck: "tsc --noEmit", test: "vitest" },
+        }),
+      );
+      expect(await runDetect(dir, "pnpm")).toEqual([
+        "pnpm run typecheck",
+        "pnpm run test",
+      ]);
+    });
+
+    it("skips the npm-init placeholder test script — it always fails", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({
+          scripts: {
+            test: 'echo "Error: no test specified" && exit 1',
+            typecheck: "tsc --noEmit",
+          },
+        }),
+      );
+      expect(await runDetect(dir)).toEqual(["npm run typecheck"]);
+    });
+
+    it("detects non-npm candidates from config markers", async () => {
+      const dir = await makeDir();
+      await writeFile(join(dir, "go.mod"), "module example.com/x\n");
+      await writeFile(join(dir, "pyproject.toml"), "[project]\n");
+      expect(await runDetect(dir)).toEqual(["go test ./...", "pytest"]);
+    });
+
+    it("detects a Makefile only when it declares a test: target", async () => {
+      const withTarget = await makeDir();
+      await writeFile(
+        join(withTarget, "Makefile"),
+        "build:\n\techo build\n\ntest:\n\techo test\n",
+      );
+      expect(await runDetect(withTarget)).toEqual(["make test"]);
+
+      const without = await makeDir();
+      await writeFile(join(without, "Makefile"), "build:\n\techo build\n");
+      expect(await runDetect(without)).toEqual([]);
+    });
+
+    it("combines npm scripts and non-npm markers, npm first", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({ scripts: { test: "vitest" } }),
+      );
+      await writeFile(join(dir, "Cargo.toml"), "[package]\n");
+      expect(await runDetect(dir)).toEqual(["npm test", "cargo test"]);
+    });
+
+    it("returns an empty list when nothing is detected", async () => {
+      const dir = await makeDir();
+      expect(await runDetect(dir)).toEqual([]);
+    });
+
+    it("ignores a malformed package.json and still detects non-npm markers", async () => {
+      const dir = await makeDir();
+      await writeFile(join(dir, "package.json"), "not valid json{{{");
+      await writeFile(join(dir, "go.mod"), "module example.com/x\n");
+      expect(await runDetect(dir)).toEqual(["go test ./..."]);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // package.json `sandcastle` script (ADR 0026)
+  // ---------------------------------------------------------------------
+
+  describe("ensureSandcastleScript", () => {
+    const runEnsure = (
+      dir: string,
+      options?: Parameters<typeof ensureSandcastleScript>[1],
+    ) =>
+      Effect.runPromise(
+        ensureSandcastleScript(dir, options).pipe(
+          Effect.provide(NodeFileSystem.layer),
+        ),
+      );
+
+    const readPkg = async (dir: string) =>
+      JSON.parse(await readFile(join(dir, "package.json"), "utf-8")) as {
+        scripts?: Record<string, string>;
+      };
+
+    it("adds the script to an existing package.json, preserving unrelated content", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify(
+          {
+            name: "my-project",
+            version: "1.2.3",
+            scripts: { test: "vitest", dev: "vite" },
+            dependencies: { zod: "^4.0.0" },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "added" });
+      const pkg = await readPkg(dir);
+      expect(pkg.scripts).toEqual({
+        test: "vitest",
+        dev: "vite",
+        sandcastle: SANDCASTLE_SCRIPT_COMMAND,
+      });
+      expect(SANDCASTLE_SCRIPT_COMMAND).toBe("sandcastle run");
+      expect((pkg as { name?: string }).name).toBe("my-project");
+    });
+
+    it("creates a minimal package.json when none exists", async () => {
+      const dir = await makeDir();
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "created-package-json" });
+      const pkg = await readPkg(dir);
+      expect(pkg.scripts?.["sandcastle"]).toBe("sandcastle run");
+    });
+
+    it("reports already-correct when the script is already right", async () => {
+      const dir = await makeDir();
+      const original = JSON.stringify(
+        { scripts: { sandcastle: "sandcastle run" } },
+        null,
+        2,
+      );
+      await writeFile(join(dir, "package.json"), original);
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "already-correct" });
+      // Untouched — byte-identical.
+      expect(await readFile(join(dir, "package.json"), "utf-8")).toBe(original);
+    });
+
+    it("reports a conflict without writing when resolution is ask", async () => {
+      const dir = await makeDir();
+      const original = JSON.stringify(
+        {
+          scripts: {
+            sandcastle: "npx tsx .sandcastle/main.mts",
+            test: "vitest",
+          },
+        },
+        null,
+        2,
+      );
+      await writeFile(join(dir, "package.json"), original);
+      const outcome = await runEnsure(dir, { resolution: "ask" });
+      expect(outcome).toEqual({
+        kind: "conflict",
+        existing: "npx tsx .sandcastle/main.mts",
+      });
+      // Never silently overwritten — the file is byte-identical.
+      expect(await readFile(join(dir, "package.json"), "utf-8")).toBe(original);
+    });
+
+    it("keeps an existing script when resolution is keep", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({ scripts: { sandcastle: "echo mine" } }),
+      );
+      const outcome = await runEnsure(dir, { resolution: "keep" });
+      expect(outcome).toEqual({ kind: "kept-existing" });
+      const pkg = await readPkg(dir);
+      expect(pkg.scripts?.["sandcastle"]).toBe("echo mine");
+    });
+
+    it("overwrites an existing script when resolution is overwrite", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({
+          scripts: { sandcastle: "echo mine", test: "vitest" },
+        }),
+      );
+      const outcome = await runEnsure(dir, { resolution: "overwrite" });
+      expect(outcome).toEqual({ kind: "overwritten" });
+      const pkg = await readPkg(dir);
+      expect(pkg.scripts).toEqual({
+        sandcastle: "sandcastle run",
+        test: "vitest",
+      });
+    });
+
+    it("skips a malformed package.json rather than rewriting it", async () => {
+      const dir = await makeDir();
+      await writeFile(join(dir, "package.json"), "not valid json{{{");
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "skipped-malformed" });
+      expect(await readFile(join(dir, "package.json"), "utf-8")).toBe(
+        "not valid json{{{",
+      );
+    });
+  });
+
+  it("persists verificationCommands and verificationStatus into settings.json", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, {
+      settings: {
+        verificationCommands: ["npm run typecheck", "npm test"],
+      },
+    });
+    let settings = JSON.parse(
+      await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.verificationCommands).toEqual([
+      "npm run typecheck",
+      "npm test",
+    ]);
+    // Configured-but-not-yet-run: no status key — never reported passed.
+    expect("verificationStatus" in settings).toBe(false);
+
+    const skippedDir = await makeDir();
+    await runScaffold(skippedDir, {
+      settings: { verificationStatus: "skipped" },
+    });
+    settings = JSON.parse(
+      await readFile(join(skippedDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.verificationCommands).toEqual([]);
+    expect(settings.verificationStatus).toBe("skipped");
+
+    const unavailableDir = await makeDir();
+    await runScaffold(unavailableDir, {
+      settings: { verificationStatus: "unavailable" },
+    });
+    settings = JSON.parse(
+      await readFile(
+        join(unavailableDir, ".sandcastle", "settings.json"),
+        "utf-8",
+      ),
+    );
+    expect(settings.verificationStatus).toBe("unavailable");
   });
 
   it("scaffolds pi agent with pi Dockerfile", async () => {

@@ -57,6 +57,20 @@ export interface RoleOverride {
 export type RoleOverrides = Partial<Record<WorkflowRole, RoleOverride>>;
 
 /**
+ * Verification outcome states (ADR 0024). `"passed"`/`"failed"` are written
+ * by the run command after it executes `verificationCommands`; init only ever
+ * writes `"skipped"` (the user explicitly declined verification) or
+ * `"unavailable"` (no candidate commands could be detected). An absent field
+ * means commands are configured but have not run yet — so a skipped or
+ * missing setup can never be misread as passed.
+ */
+export type VerificationStatus =
+  | "passed"
+  | "failed"
+  | "skipped"
+  | "unavailable";
+
+/**
  * The `.sandcastle/settings.json` document (version 1).
  *
  * Optional keys (`effort`, `roleOverrides`) are omitted from the file entirely
@@ -76,6 +90,12 @@ export interface ProjectSettings {
   readonly sandbox: SandboxProviderChoice;
   /** Ordered verification commands run after implementation (may be empty). */
   readonly verificationCommands: readonly string[];
+  /**
+   * Latest verification state (additive, version 1). Omitted when commands
+   * are configured but have not run — `"passed"` is only ever written after a
+   * command actually exited 0.
+   */
+  readonly verificationStatus?: VerificationStatus;
   /** Bounded parallelism for parallel workflows; an integer from 1 to 4. */
   readonly parallelism: number;
   readonly roleOverrides?: RoleOverrides;
@@ -101,6 +121,12 @@ const WORKFLOW_ROLES: readonly WorkflowRole[] = [
   "implementer",
   "reviewer",
   "merger",
+];
+const VERIFICATION_STATUSES: readonly VerificationStatus[] = [
+  "passed",
+  "failed",
+  "skipped",
+  "unavailable",
 ];
 
 /** Absolute path to a repo's `.sandcastle/settings.json`. */
@@ -224,6 +250,11 @@ export interface InitialProjectSettings {
   readonly modelSource?: ModelSource;
   /** Defaults to `[]`. */
   readonly verificationCommands?: readonly string[];
+  /**
+   * Defaults to omitted (configured, not yet run). Init writes `"skipped"` or
+   * `"unavailable"` when no usable command list was produced.
+   */
+  readonly verificationStatus?: VerificationStatus;
   /** Defaults to `1` (sequential). Must stay within {@link MIN_PARALLELISM}–{@link MAX_PARALLELISM}. */
   readonly parallelism?: number;
   readonly roleOverrides?: RoleOverrides;
@@ -239,6 +270,7 @@ export interface ProjectSettingsInitOverrides {
   readonly modelSource?: ModelSource;
   readonly sandbox?: SandboxProviderChoice;
   readonly verificationCommands?: readonly string[];
+  readonly verificationStatus?: VerificationStatus;
   readonly parallelism?: number;
   readonly roleOverrides?: RoleOverrides;
 }
@@ -258,6 +290,9 @@ export const makeProjectSettings = (
   workflow: init.workflow,
   sandbox: init.sandbox,
   verificationCommands: init.verificationCommands ?? [],
+  ...(init.verificationStatus !== undefined
+    ? { verificationStatus: init.verificationStatus }
+    : {}),
   parallelism: init.parallelism ?? MIN_PARALLELISM,
   ...(init.roleOverrides !== undefined
     ? { roleOverrides: init.roleOverrides }
@@ -297,6 +332,8 @@ export interface ProjectSettingsUpdate {
   readonly workflow?: string;
   readonly sandbox?: SandboxProviderChoice;
   readonly verificationCommands?: readonly string[];
+  /** `null` clears the stored status back to "configured, not yet run". */
+  readonly verificationStatus?: VerificationStatus | null;
   readonly parallelism?: number;
   readonly roleOverrides?: Partial<
     Record<WorkflowRole, RoleOverrideUpdate | null>
@@ -377,6 +414,7 @@ const SETTINGS_FIELDS = [
   "workflow",
   "sandbox",
   "verificationCommands",
+  "verificationStatus",
   "parallelism",
   "roleOverrides",
   "issueTracker",
@@ -440,6 +478,20 @@ const validateSettings = (
     commands.push(command);
   }
 
+  let verificationStatus: VerificationStatus | undefined;
+  const rawStatus = raw["verificationStatus"];
+  if (rawStatus !== undefined) {
+    if (
+      typeof rawStatus !== "string" ||
+      !VERIFICATION_STATUSES.includes(rawStatus as VerificationStatus)
+    ) {
+      fail(
+        `trường "verificationStatus" phải là một trong: ${VERIFICATION_STATUSES.join(", ")}`,
+      );
+    }
+    verificationStatus = rawStatus as VerificationStatus;
+  }
+
   const parallelism = raw["parallelism"];
   if (
     typeof parallelism !== "number" ||
@@ -481,6 +533,7 @@ const validateSettings = (
     workflow,
     sandbox: sandbox as SandboxProviderChoice,
     verificationCommands: commands,
+    ...(verificationStatus !== undefined ? { verificationStatus } : {}),
     parallelism,
     ...(roleOverrides !== undefined ? { roleOverrides } : {}),
     issueTracker,
@@ -663,6 +716,11 @@ const applyUpdate = (
   if (update.parallelism !== undefined) next.parallelism = update.parallelism;
   if (update.verificationCommands !== undefined) {
     next.verificationCommands = [...update.verificationCommands];
+  }
+  if (update.verificationStatus === null) {
+    delete next.verificationStatus;
+  } else if (update.verificationStatus !== undefined) {
+    next.verificationStatus = update.verificationStatus;
   }
 
   if (update.effort === null) {

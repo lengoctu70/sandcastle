@@ -2,8 +2,8 @@ import { run, claudeCode } from "@lengoctu70/sandcastle";
 import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox";
 
 // Simple loop: an agent that picks open issues one by one and closes them.
-// Run this with: npx tsx .sandcastle/main.mts
-// Or add to package.json scripts: "sandcastle": "npx tsx .sandcastle/main.mts"
+// Run this file directly with: npx tsx .sandcastle/main.mts
+// Init added the package.json script "sandcastle": "sandcastle run" — npm run sandcastle
 
 await run({
   // A name for this run, shown as a prefix in log output.

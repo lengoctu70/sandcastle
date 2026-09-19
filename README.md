@@ -45,11 +45,13 @@ npx @lengoctu70/sandcastle init
 cp .sandcastle/.env.example .sandcastle/.env
 ```
 
-4. Run the `.sandcastle/main.ts` (or `main.mts`) file with `npx tsx`
+4. Launch the workflow. Init adds a `"sandcastle": "sandcastle run"` script to your `package.json`, so the normal command is:
 
 ```bash
-npx tsx .sandcastle/main.ts
+npm run sandcastle
 ```
+
+(Advanced: you can also execute the scaffolded file directly with `npx tsx .sandcastle/main.ts` — or `main.mts`.)
 
 ```typescript
 // 3. Run the agent via the JS API
@@ -771,6 +773,12 @@ In host mode, init also _discovers_ agents that support it (Codex, Pi, OpenCode,
 
 Init detects your host package manager (npm, pnpm, yarn, or bun) from a `packageManager` field or lockfile, defaulting to npm. Templates whose `main` file imports a host dependency — the planner templates import [Zod](https://zod.dev) for their `<plan>` output schema — prompt you to install it with that package manager when it isn't already in your `package.json`, so the first `npx tsx .sandcastle/main.ts` doesn't fail with `ERR_MODULE_NOT_FOUND`.
 
+Init also detects candidate verification commands — `package.json` scripts (`typecheck`, `lint`, `test`, `build`, in run order via the detected package manager) plus non-npm markers such as `Cargo.toml`, `go.mod`, Python test configs, and a `Makefile` `test:` target — and lets you confirm, edit, or explicitly skip them. The result is persisted to `settings.json` as `verificationCommands` with an honest `verificationStatus` (`skipped` when declined, `unavailable` when nothing could be detected — a skipped setup is never reported as passed). In non-interactive runs, pass `--verification-commands` with a comma-separated list or `--skip-verification`; without a flag, headless init adopts whatever was detected.
+
+For the GitHub Issues tracker, init verifies the `gh` CLI is installed and authenticated (`gh auth status`) before anything is scaffolded — interactive runs offer a recheck after `gh auth login`, headless runs fail with guidance. Creating the `Sandcastle` label on the repository only happens after explicit confirmation (`--create-label true`), and permission failures are reported with gh's own error line.
+
+Finally, init inserts `"sandcastle": "sandcastle run"` into your `package.json` scripts (creating a minimal `package.json` when none exists) so the normal launch is `npm run sandcastle`. Unrelated scripts are preserved, and an existing `sandcastle` script with different content is never silently overwritten — interactive init asks first, while non-interactive init fails unless `--overwrite-script true|false` decides.
+
 Every interactive prompt has a paired `--flag` so the entire init can run non-interactively (e.g. in CI or a scripted setup). When stdin is not a TTY and a required flag is missing, init fails fast with a clear error rather than wedging on a prompt.
 
 | Option                    | Required | Default                      | Description                                                                                                                                                                              |
@@ -783,9 +791,12 @@ Every interactive prompt has a paired `--flag` so the entire init can run non-in
 | `--sandbox`               | No       | Interactive prompt           | Sandbox provider to use (`host`, `docker`, `podman`)                                                                                                                                     |
 | `--template`              | No       | Interactive prompt           | Template to scaffold (e.g. `blank`, `simple-loop`)                                                                                                                                       |
 | `--issue-tracker`         | No       | Interactive prompt           | Issue tracker to use (`github-issues`, `beads`, `custom`)                                                                                                                                |
-| `--create-label`          | No       | Interactive prompt           | `true` / `false` — whether to create the `Sandcastle` GitHub label (only with `--issue-tracker github-issues`)                                                                           |
+| `--create-label`          | No       | Interactive prompt           | `true` / `false` — whether to create the `Sandcastle` GitHub label (only with `--issue-tracker github-issues`; requires an installed, authenticated `gh`)                                |
 | `--build-image`           | No       | Interactive prompt           | `true` / `false` — whether to build the sandbox image now (silently ignored with `--issue-tracker custom`)                                                                               |
 | `--install-template-deps` | No       | Interactive prompt           | `true` / `false` — whether to install template host deps (e.g. `zod` for the planner templates)                                                                                          |
+| `--verification-commands` | No       | Detected candidates          | Comma-separated verification commands to persist (e.g. `"npm run typecheck,npm test"`); overrides detection. Cannot be combined with `--skip-verification`                               |
+| `--skip-verification`     | No       | `false`                      | Skip verification-command setup — `settings.json` records `verificationStatus: "skipped"`                                                                                                |
+| `--overwrite-script`      | No       | Interactive prompt           | `true` / `false` — resolve a conflicting existing `"sandcastle"` package script: overwrite with `"sandcastle run"` or keep it. Required when a conflict is hit non-interactively         |
 
 Creates the following files:
 
