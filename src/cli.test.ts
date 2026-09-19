@@ -1,5 +1,12 @@
 import { exec } from "node:child_process";
-import { chmod, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  readdir,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -664,6 +671,182 @@ if (key === "--version") {
       const output = stdout + stderr;
       expect(output).toContain("Chưa tìm thấy Codex CLI");
       expect(output).toContain("npm install -g @openai/codex");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // Host-mode Pi discovery (ADR 0021): `init --agent pi --sandbox host`
+  // probes the `pi` executable — bare `--version`, the `--help` product
+  // fingerprint, `pi --list-models` for auth + catalog, and read-only
+  // `pi auth check` evidence — then persists the selection. These tests use
+  // a fake `pi` executable in a temp shim dir prepended to PATH; no real CLI
+  // or provider account is ever touched.
+  // ---------------------------------------------------------------------
+
+  /**
+   * Write a fake `pi` executable (a node script) into `dir`. `auth` toggles
+   * `pi --list-models` between a provider-grouped table and the real
+   * "No models available" message. Every invocation emits the `[paseo-team]`
+   * extension line on stderr, like the observed install.
+   */
+  const writeFakePi = async (dir: string, auth: boolean) => {
+    const shim = join(dir, "pi");
+    const modelsBlock = auth
+      ? `console.log(\`provider   model                 context  max-out  thinking  images
+anthropic  claude-opus-4-1       200K     32K      yes       yes
+anthropic  claude-sonnet-4-5     200K     64K      yes       yes
+google     gemini-3-pro-preview  1M       64K      yes       yes
+openai     gpt-5.2               400K     128K     yes       yes\`);`
+      : `console.log("No models available. Use /login to log into a provider via OAuth or API key.");`;
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const key = args.join(" ");
+console.error("[paseo-team] PASEO_PI_ROLE unset — extension passive");
+if (key === "--version") {
+  console.log("0.84.4");
+  process.exit(0);
+}
+if (key === "--help") {
+  console.log("pi - AI coding assistant with read, bash, edit, write tools\\n\\nUsage:\\n  pi [options]");
+  process.exit(0);
+}
+if (key === "--list-models") {
+  ${modelsBlock}
+  process.exit(0);
+}
+if (key.startsWith("auth check")) {
+  const p = args[args.indexOf("--provider") + 1];
+  console.log(JSON.stringify({ status: "ready", provider: p, authType: "api_key" }));
+  process.exit(0);
+}
+process.exit(1);
+`,
+    );
+    await chmod(shim, 0o755);
+    return shim;
+  };
+
+  it("init --sandbox host --agent pi discovers and persists the recommended model and thinking level", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-pi-"));
+    await writeFakePi(shimDir, true);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent pi --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Cảnh báo chế độ host");
+    expect(stdout).toContain("Khởi tạo xong");
+
+    // Discovered defaults: pi's default-provider model + its default
+    // thinking level, marked discovered.
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "pi",
+      model: "google/gemini-3-pro-preview",
+      effort: "medium",
+      modelSource: "discovered",
+      sandbox: "host",
+    });
+
+    // The generated main passes both to the pi() factory — `thinking` is
+    // pi's name for the effort option.
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain(
+      'pi("google/gemini-3-pro-preview", { thinking: "medium" })',
+    );
+    expect(main).toContain("noSandbox()");
+  });
+
+  it("init --sandbox host --agent pi honors --model/--effort validated against the live catalog", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-pi-"));
+    await writeFakePi(shimDir, true);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent pi --model anthropic/claude-sonnet-4-5 --effort xhigh --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      model: "anthropic/claude-sonnet-4-5",
+      effort: "xhigh",
+      modelSource: "discovered",
+    });
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain(
+      'pi("anthropic/claude-sonnet-4-5", { thinking: "xhigh" })',
+    );
+  });
+
+  it("init --sandbox host --agent pi fails with login guidance when no provider is configured", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-pi-"));
+    await writeFakePi(shimDir, false);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent pi --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("/login");
+      // Nothing was scaffolded — the stop happens before any writes.
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  it("init --sandbox host --agent pi fails with install guidance when pi is not on PATH", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const bareShimDir = await mkdtemp(join(tmpdir(), "empty-path-"));
+    // Unlike the codex case, a real `pi` can live in node's own bin dir
+    // (global npm install) — so PATH gets only a scratch dir with a `node`
+    // symlink and nothing else.
+    await symlink(process.execPath, join(bareShimDir, "node"));
+    const barePath = bareShimDir;
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent pi --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: barePath } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("Chưa tìm thấy Pi");
+      expect(output).toContain(
+        "npm install -g @earendil-works/pi-coding-agent",
+      );
       expect(await readdir(hostDir)).not.toContain(".sandcastle");
     }
   });

@@ -90,9 +90,9 @@ describe("discovery registry", () => {
 
   it("returns undefined for agents without an adapter", async () => {
     expect(getDiscoveryAdapter("claude-code")).toBeUndefined();
-    // Pi, OpenCode, Claude & friends are later tickets — they resolve to
+    // OpenCode, Claude & friends are later tickets — they resolve to
     // `undefined` so init keeps them on the static path for now.
-    expect(await discoverAgent("pi", READY_EXEC)).toBeUndefined();
+    expect(await discoverAgent("claude-code", READY_EXEC)).toBeUndefined();
   });
 
   it("discovers a ready codex through the injected boundary", async () => {

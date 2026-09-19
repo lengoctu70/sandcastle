@@ -614,7 +614,14 @@ const parsePiStreamLine = (line: string): ParsedStreamEvent[] => {
 /** Options for the pi agent provider. */
 export interface PiOptions {
   /** Reasoning effort level. Maps to the CLI's --thinking flag. */
-  readonly thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  readonly thinking?:
+    | "off"
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max";
   /** Environment variables injected by this agent provider. */
   readonly env?: Record<string, string>;
   /** When false, session capture is disabled. Default: true. */
