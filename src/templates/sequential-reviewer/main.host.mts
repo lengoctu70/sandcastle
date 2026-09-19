@@ -18,8 +18,7 @@
 //
 // Usage:
 //   npx tsx .sandcastle/main.mts
-// Or add to package.json:
-//   "scripts": { "sandcastle": "npx tsx .sandcastle/main.mts" }
+// Init added the package.json script "sandcastle": "sandcastle run" — npm run sandcastle
 
 import * as sandcastle from "@lengoctu70/sandcastle";
 import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox";

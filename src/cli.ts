@@ -15,6 +15,7 @@ import {
 import {
   scaffold,
   listTemplates,
+  listWorkflowOptions,
   listAgents,
   getAgent,
   listIssueTrackers,
@@ -23,6 +24,8 @@ import {
   getSandboxProvider,
   getNextStepsLines,
   detectPackageManager,
+  detectVerificationCandidates,
+  ensureSandcastleScript,
   addDependencyCommand,
   hostHasDependency,
   getTemplateDependencies,
@@ -39,7 +42,8 @@ import {
   resolveDiscoveredSelection,
   INIT_STOPPED_MESSAGE,
 } from "./discoveryPicker.js";
-import type { ModelSource } from "./ProjectSettings.js";
+import { probeGhReadiness, createSandcastleLabel } from "./githubSetup.js";
+import type { ModelSource, VerificationStatus } from "./ProjectSettings.js";
 import { ConfigDirError, InitError } from "./errors.js";
 import { VERSION } from "./version.js";
 
@@ -182,6 +186,36 @@ const installTemplateDepsOption = Options.choice("install-template-deps", [
   Options.optional,
 );
 
+// Verification setup (ADR 0024): an explicit comma-separated list, or an
+// explicit skip. Without either, interactive init asks to
+// confirm/edit/skip the detected candidates and non-interactive init adopts
+// whatever was detected (empty detection records status "unavailable").
+const verificationCommandsOption = Options.text("verification-commands").pipe(
+  Options.withDescription(
+    'Comma-separated verification commands to persist (e.g. "npm run typecheck,npm test"). Overrides detection',
+  ),
+  Options.optional,
+);
+
+const skipVerificationOption = Options.boolean("skip-verification").pipe(
+  Options.withDescription(
+    'Skip verification-command setup — settings record verificationStatus "skipped"',
+  ),
+);
+
+// package.json script conflict resolution (ADR 0026): an existing
+// "sandcastle" script with different content is never silently overwritten.
+// Interactive init asks; non-interactive init fails unless this flag decides.
+const overwriteScriptOption = Options.choice("overwrite-script", [
+  "true",
+  "false",
+]).pipe(
+  Options.withDescription(
+    'Resolve a conflicting existing "sandcastle" package script: true overwrites it with "sandcastle run", false keeps it',
+  ),
+  Options.optional,
+);
+
 /**
  * Translate an `Options.choice("flag", ["true", "false"]).optional` value into
  * a tri-state boolean. None when the flag was absent; otherwise the parsed bool.
@@ -205,6 +239,9 @@ const initCommand = Command.make(
     createLabel: createLabelOption,
     buildImage: buildImageOption,
     installTemplateDeps: installTemplateDepsOption,
+    verificationCommands: verificationCommandsOption,
+    skipVerification: skipVerificationOption,
+    overwriteScript: overwriteScriptOption,
   },
   ({
     imageName: imageNameFlag,
@@ -218,6 +255,9 @@ const initCommand = Command.make(
     createLabel: createLabelFlag,
     buildImage: buildImageFlag,
     installTemplateDeps: installTemplateDepsFlag,
+    verificationCommands: verificationCommandsFlag,
+    skipVerification,
+    overwriteScript: overwriteScriptFlag,
   }) =>
     Effect.gen(function* () {
       const d = yield* Display;
@@ -287,6 +327,18 @@ const initCommand = Command.make(
       const installTemplateDepsChoice = choiceToTriBool(
         installTemplateDepsFlag,
       );
+      const overwriteScriptChoice = choiceToTriBool(overwriteScriptFlag);
+
+      // The two verification flags answer the same question — combining them
+      // is a caller error, not a precedence rule.
+      if (verificationCommandsFlag._tag === "Some" && skipVerification) {
+        yield* Effect.fail(
+          new InitError({
+            message:
+              "--verification-commands and --skip-verification cannot be combined.",
+          }),
+        );
+      }
 
       const isInteractive = process.stdin.isTTY === true;
       const failIfNonInteractive = (flag: string) =>
@@ -487,7 +539,10 @@ const initCommand = Command.make(
         selectedIssueTracker = getIssueTracker(selected as string)!;
       }
 
-      // Resolve template: CLI flag > interactive select (already validated above)
+      // Resolve workflow: --template (stable internal id) > interactive
+      // outcome picker. The picker presents Vietnamese outcome labels bound
+      // to unchanged template ids (ADR 0026) — the reviewed sequential
+      // workflow is the recommended preselection (ADR 0025).
       let selectedTemplate: string;
       if (template._tag === "Some") {
         selectedTemplate = template.value;
@@ -495,14 +550,17 @@ const initCommand = Command.make(
         if (!isInteractive) {
           yield* failIfNonInteractive("--template");
         }
+        const workflowOptions = listWorkflowOptions();
+        const recommended =
+          workflowOptions.find((o) => o.recommended) ?? workflowOptions[0]!;
         const selected = yield* Effect.promise(() =>
           clack.select({
-            message: "Chọn template:",
-            initialValue: "blank",
-            options: templates.map((tmpl) => ({
-              value: tmpl.name,
-              label: tmpl.name,
-              hint: tmpl.description,
+            message: "Chọn workflow theo kết quả bạn muốn:",
+            initialValue: recommended.template,
+            options: workflowOptions.map((o) => ({
+              value: o.template,
+              label: o.label,
+              hint: o.hint,
             })),
           }),
         );
@@ -512,10 +570,198 @@ const initCommand = Command.make(
         selectedTemplate = selected as string;
       }
 
+      // Detect the host package manager — verification candidates are built
+      // with it below, and the zod offer / next steps reuse it.
+      const packageManager = yield* detectPackageManager(cwd);
+
+      // Verification commands (ADR 0024): detect project candidates, then
+      // confirm/edit/skip. Flags win (--verification-commands an explicit
+      // list, --skip-verification an explicit decline); non-interactive runs
+      // without a flag adopt the detected list. The saved
+      // verificationStatus distinguishes skipped/unavailable from a
+      // configured-but-not-yet-run list so nothing is ever reported passed
+      // that did not run.
+      let verificationCommands: readonly string[] = [];
+      let verificationStatus: VerificationStatus | undefined;
+      const parseCommandList = (raw: string): string[] =>
+        raw
+          .split(",")
+          .map((c) => c.trim())
+          .filter((c) => c.length > 0);
+
+      if (verificationCommandsFlag._tag === "Some") {
+        verificationCommands = parseCommandList(verificationCommandsFlag.value);
+        if (verificationCommands.length === 0) {
+          yield* Effect.fail(
+            new InitError({
+              message:
+                "--verification-commands must list at least one command (or pass --skip-verification).",
+            }),
+          );
+        }
+      } else if (skipVerification) {
+        verificationStatus = "skipped";
+      } else {
+        const candidates = yield* detectVerificationCandidates(
+          cwd,
+          packageManager,
+        );
+        if (!isInteractive) {
+          // Deterministic headless behavior: adopt detection as-is. An
+          // explicit flag is the only way to override or decline it.
+          verificationCommands = candidates;
+          if (candidates.length === 0) {
+            verificationStatus = "unavailable";
+          } else {
+            yield* d.status(
+              `Dùng các lệnh xác minh phát hiện được: ${candidates.join(", ")}`,
+              "info",
+            );
+          }
+        } else if (candidates.length > 0) {
+          yield* d.text(
+            "Phát hiện các lệnh xác minh trong dự án:\n" +
+              candidates.map((c) => `  • ${c}`).join("\n"),
+          );
+          const action = yield* Effect.promise(() =>
+            clack.select({
+              message: "Bạn muốn thiết lập lệnh xác minh thế nào?",
+              options: [
+                {
+                  value: "confirm" as const,
+                  label: `Dùng ${candidates.length} lệnh trên`,
+                },
+                { value: "edit" as const, label: "Chỉnh sửa danh sách" },
+                {
+                  value: "skip" as const,
+                  label: "Bỏ qua — không dùng lệnh xác minh",
+                },
+              ],
+            }),
+          );
+          if (clack.isCancel(action)) {
+            yield* Effect.fail(
+              new InitError({ message: INIT_STOPPED_MESSAGE }),
+            );
+          }
+          if (action === "confirm") {
+            verificationCommands = candidates;
+          } else if (action === "edit") {
+            const entered = yield* Effect.promise(() =>
+              clack.text({
+                message:
+                  "Nhập các lệnh xác minh, cách nhau bởi dấu phẩy (để trống = bỏ qua):",
+                initialValue: candidates.join(", "),
+              }),
+            );
+            if (clack.isCancel(entered)) {
+              return yield* Effect.fail(
+                new InitError({ message: INIT_STOPPED_MESSAGE }),
+              );
+            }
+            verificationCommands = parseCommandList(entered);
+            if (verificationCommands.length === 0) {
+              verificationStatus = "skipped";
+            }
+          } else {
+            verificationStatus = "skipped";
+          }
+        } else {
+          yield* d.status(
+            "Không phát hiện lệnh xác minh nào trong dự án (xem package.json scripts, Cargo.toml, go.mod, Makefile…).",
+            "info",
+          );
+          const action = yield* Effect.promise(() =>
+            clack.select({
+              message: "Bạn có muốn nhập lệnh xác minh thủ công không?",
+              options: [
+                { value: "manual" as const, label: "Nhập lệnh thủ công" },
+                {
+                  value: "none" as const,
+                  label: "Tiếp tục không có lệnh xác minh",
+                },
+              ],
+            }),
+          );
+          if (clack.isCancel(action)) {
+            yield* Effect.fail(
+              new InitError({ message: INIT_STOPPED_MESSAGE }),
+            );
+          }
+          if (action === "manual") {
+            const entered = yield* Effect.promise(() =>
+              clack.text({
+                message:
+                  "Nhập các lệnh xác minh, cách nhau bởi dấu phẩy (để trống = bỏ qua):",
+              }),
+            );
+            if (clack.isCancel(entered)) {
+              return yield* Effect.fail(
+                new InitError({ message: INIT_STOPPED_MESSAGE }),
+              );
+            }
+            verificationCommands = parseCommandList(entered);
+          }
+          verificationStatus =
+            verificationCommands.length > 0 ? undefined : "unavailable";
+        }
+      }
+      if (verificationStatus === "skipped") {
+        yield* d.status(
+          'Đã bỏ qua lệnh xác minh — settings ghi nhận trạng thái "skipped", không bao giờ báo cáo là đã pass.',
+          "warn",
+        );
+      }
+
       // Offer to create the "Sandcastle" label on the repo (skip for non-GitHub issue trackers).
       // CLI flag > interactive confirm. The flag is only meaningful for the github-issues tracker.
       let shouldCreateLabel = false;
       if (selectedIssueTracker.name === "github-issues") {
+        // Verify gh is installed AND authenticated before any label work or
+        // scaffolding (ADR 0026) — GitHub failures must surface during setup,
+        // not after agent work. Interactive runs may recheck after the user
+        // installs/logs in; non-interactive runs fail with the guidance.
+        for (;;) {
+          const readiness = yield* d.spinner(
+            "Đang kiểm tra GitHub CLI (gh)…",
+            Effect.promise(() => probeGhReadiness()),
+          );
+          if (readiness.kind === "ready") {
+            yield* d.status(
+              `gh ${readiness.version ?? ""} — đã đăng nhập${
+                readiness.authDetail ? ` (${readiness.authDetail})` : ""
+              }`,
+              "success",
+            );
+            break;
+          }
+          const reason =
+            readiness.kind === "not-installed"
+              ? "Chưa tìm thấy GitHub CLI (`gh`). Cài đặt từ https://cli.github.com/ (ví dụ `brew install gh`), sau đó chạy `gh auth login`."
+              : readiness.kind === "unauthenticated"
+                ? "`gh` đã được cài đặt nhưng chưa đăng nhập GitHub. Chạy `gh auth login` để đăng nhập."
+                : `Không kiểm tra được gh: ${readiness.detail ?? "lỗi không xác định"}.`;
+          if (!isInteractive) {
+            yield* Effect.fail(new InitError({ message: reason }));
+          }
+          yield* d.status(reason, "warn");
+          const action = yield* Effect.promise(() =>
+            clack.select({
+              message: "GitHub CLI chưa sẵn sàng — bạn muốn tiếp tục thế nào?",
+              options: [
+                { value: "retry", label: "Kiểm tra lại" },
+                { value: "stop", label: "Dừng lại" },
+              ],
+            }),
+          );
+          if (clack.isCancel(action) || action === "stop") {
+            yield* Effect.fail(
+              new InitError({ message: INIT_STOPPED_MESSAGE }),
+            );
+          }
+          // "retry" — loop back and probe again.
+        }
+
         shouldCreateLabel = yield* resolveConfirmFlag({
           choice: createLabelChoice,
           flag: "--create-label",
@@ -525,14 +771,124 @@ const initCommand = Command.make(
         });
 
         if (shouldCreateLabel) {
-          yield* Effect.try({
-            try: () =>
-              execSync(
-                'gh label create "Sandcastle" --description "Issues for Sandcastle to work on" --color "F9A825" 2>/dev/null',
-                { cwd, stdio: "ignore" },
-              ),
-            catch: () => undefined,
-          }).pipe(Effect.ignore);
+          const labelResult = yield* Effect.promise(() =>
+            createSandcastleLabel(),
+          );
+          if (labelResult.kind === "created") {
+            yield* d.status(
+              'Đã tạo label "Sandcastle" trên GitHub.',
+              "success",
+            );
+          } else if (labelResult.kind === "already-exists") {
+            yield* d.status(
+              'Label "Sandcastle" đã tồn tại trên repository.',
+              "info",
+            );
+          } else {
+            yield* Effect.fail(
+              new InitError({
+                message:
+                  `Không tạo được label "Sandcastle": ${labelResult.detail}. ` +
+                  "Kiểm tra quyền ghi của tài khoản `gh` trên repository này " +
+                  "(label cần quyền Issues: write), hoặc chạy lại init với --create-label false.",
+              }),
+            );
+          }
+        }
+      }
+
+      // Add the "sandcastle": "sandcastle run" package script (ADR 0026) so
+      // the normal launch is `npm run sandcastle`. This runs *before*
+      // scaffolding: a conflicting existing script is never silently
+      // overwritten — --overwrite-script decides non-interactively;
+      // interactive init asks, defaulting to keep — so a refused conflict
+      // fails without leaving a partial .sandcastle/ behind.
+      let packageScriptReady = true;
+      {
+        let outcome = yield* ensureSandcastleScript(cwd, {
+          resolution:
+            overwriteScriptChoice._tag === "Some"
+              ? overwriteScriptChoice.value
+                ? "overwrite"
+                : "keep"
+              : "ask",
+        }).pipe(
+          Effect.mapError(
+            (e) =>
+              new InitError({
+                message: `${e instanceof Error ? e.message : e}`,
+              }),
+          ),
+        );
+        if (outcome.kind === "conflict") {
+          const existing = outcome.existing;
+          if (!isInteractive) {
+            yield* Effect.fail(
+              new InitError({
+                message:
+                  `package.json already has a "sandcastle" script ("${existing}") that differs from "sandcastle run". ` +
+                  "--overwrite-script is required in non-interactive mode (no TTY detected): " +
+                  "true to replace it, false to keep it.",
+              }),
+            );
+          }
+          const overwrite = yield* Effect.promise(() =>
+            clack.confirm({
+              message: `Script "sandcastle" trong package.json đang là "${existing}". Ghi đè thành "sandcastle run"?`,
+              initialValue: false,
+            }),
+          );
+          if (clack.isCancel(overwrite)) {
+            yield* Effect.fail(
+              new InitError({ message: INIT_STOPPED_MESSAGE }),
+            );
+          }
+          outcome = yield* ensureSandcastleScript(cwd, {
+            resolution: overwrite ? "overwrite" : "keep",
+          }).pipe(
+            Effect.mapError(
+              (e) =>
+                new InitError({
+                  message: `${e instanceof Error ? e.message : e}`,
+                }),
+            ),
+          );
+        }
+        switch (outcome.kind) {
+          case "added":
+            yield* d.status(
+              'Đã thêm script "sandcastle": "sandcastle run" vào package.json.',
+              "success",
+            );
+            break;
+          case "created-package-json":
+            yield* d.status(
+              'Đã tạo package.json với script "sandcastle": "sandcastle run".',
+              "success",
+            );
+            break;
+          case "overwritten":
+            yield* d.status(
+              'Đã ghi đè script "sandcastle" trong package.json thành "sandcastle run".',
+              "success",
+            );
+            break;
+          case "kept-existing":
+            packageScriptReady = false;
+            yield* d.status(
+              'Giữ nguyên script "sandcastle" hiện có — `npm run sandcastle` sẽ không khởi động Sandcastle.',
+              "warn",
+            );
+            break;
+          case "skipped-malformed":
+            packageScriptReady = false;
+            yield* d.status(
+              `package.json không phải là JSON hợp lệ — bỏ qua bước thêm script "sandcastle". Tự thêm "sandcastle": "sandcastle run" vào scripts để dùng \`npm run sandcastle\`.`,
+              "warn",
+            );
+            break;
+          case "already-correct":
+            break;
         }
       }
 
@@ -548,6 +904,8 @@ const initCommand = Command.make(
           settings: {
             modelSource,
             ...(selectedEffort !== undefined ? { effort: selectedEffort } : {}),
+            verificationCommands,
+            ...(verificationStatus !== undefined ? { verificationStatus } : {}),
           },
         }).pipe(
           Effect.mapError(
@@ -558,10 +916,6 @@ const initCommand = Command.make(
           ),
         ),
       );
-
-      // Detect the host package manager so the zod offer below and the next
-      // steps below both use the right install command.
-      const packageManager = yield* detectPackageManager(cwd);
 
       // If the chosen template imports zod on the host (the planner templates
       // build their <plan> output schema with it) and the host doesn't already
@@ -657,6 +1011,7 @@ const initCommand = Command.make(
         selectedAgent,
         packageManager,
         selectedSandboxProvider,
+        { packageScriptReady },
       );
       for (const [i, line] of nextSteps.entries()) {
         yield* d.text(i === 0 ? line : styleText("dim", line));

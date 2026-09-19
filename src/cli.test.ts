@@ -297,13 +297,18 @@ describe("sandcastle CLI", () => {
   });
 
   it("init --issue-tracker github-issues without --create-label fails fast in non-interactive mode", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    // gh readiness is probed before the label question — provide an
+    // authenticated fake gh so the missing-flag failure is what surfaces.
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, { authenticated: true });
 
     try {
-      await runCli(
-        "init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues",
-        hostDir,
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
       );
       expect.fail("Expected command to fail");
     } catch (err: unknown) {
@@ -610,6 +615,45 @@ if (key === "--version") {
 } else {
   process.exit(1);
 }
+`,
+    );
+    await chmod(shim, 0o755);
+    return shim;
+  };
+
+  /**
+   * Write a fake `gh` executable into `dir` answering the exact subcommands
+   * init probes: `--version` (install check), `auth status` (login check),
+   * and `label create` (label setup). Never reaches the real GitHub CLI or
+   * real credentials.
+   */
+  const writeFakeGh = async (
+    dir: string,
+    options: {
+      authenticated?: boolean;
+      labelCreate?: "ok" | "exists" | "denied";
+    } = {},
+  ) => {
+    const shim = join(dir, "gh");
+    const authenticated = options.authenticated !== false;
+    const labelCreate = options.labelCreate ?? "ok";
+    const authBlock = authenticated
+      ? `console.log("github.com"); process.exit(0);`
+      : `console.error("You are not logged into any GitHub hosts. Run gh auth login to authenticate."); process.exit(1);`;
+    const labelBlock =
+      labelCreate === "ok"
+        ? `console.log("✓ Label created"); process.exit(0);`
+        : labelCreate === "exists"
+          ? `console.error("the label 'Sandcastle' already exists"); process.exit(1);`
+          : `console.error("gh: Resource not accessible by integration (HTTP 403)"); process.exit(1);`;
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const key = process.argv.slice(2).join(" ");
+if (key === "--version") { console.log("gh version 2.90.0 (2026-04-16)"); process.exit(0); }
+if (key === "auth status") { ${authBlock} }
+if (key.startsWith("label create")) { ${labelBlock} }
+process.exit(1);
 `,
     );
     await chmod(shim, 0o755);
@@ -1562,5 +1606,447 @@ if (key === "--version") {
       expect(output).toContain("antigravity.google/cli/install.sh");
       expect(await readdir(hostDir)).not.toContain(".sandcastle");
     }
+  });
+
+  // ---------------------------------------------------------------------
+  // Ticket #15 — GitHub readiness, verification detection, package script
+  // ---------------------------------------------------------------------
+
+  const readSettings = async (dir: string) =>
+    JSON.parse(
+      await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+    ) as Record<string, unknown>;
+
+  it("init --issue-tracker github-issues fails with install guidance when gh is missing", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    // PATH with only node — no gh anywhere.
+    const bareShimDir = await mkdtemp(join(tmpdir(), "empty-path-"));
+    await symlink(process.execPath, join(bareShimDir, "node"));
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label false --build-image false`,
+        { cwd: hostDir, env: { ...process.env, PATH: bareShimDir } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("GitHub CLI");
+      expect(output).toContain("cli.github.com");
+      // The gh gate runs before any writes — nothing was left behind.
+      const entries = await readdir(hostDir);
+      expect(entries).not.toContain(".sandcastle");
+      expect(entries).not.toContain("package.json");
+    }
+  });
+
+  it("init --issue-tracker github-issues fails with login guidance when gh is unauthenticated", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, { authenticated: false });
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label false --build-image false`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("gh auth login");
+      const entries = await readdir(hostDir);
+      expect(entries).not.toContain(".sandcastle");
+      expect(entries).not.toContain("package.json");
+    }
+  });
+
+  it("init --issue-tracker github-issues --create-label false completes with an authenticated gh and no label", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, { authenticated: true });
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label false --build-image false`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = await readSettings(hostDir);
+    expect(settings["issueTracker"]).toBe("github-issues");
+    // --create-label false → the scaffolded prompt does not filter by label.
+    const prompt = await readFile(
+      join(hostDir, ".sandcastle", "prompt.md"),
+      "utf-8",
+    );
+    expect(prompt).not.toContain("--label");
+  });
+
+  it("init --issue-tracker github-issues --create-label true creates the Sandcastle label", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, { authenticated: true, labelCreate: "ok" });
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label true --build-image false`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain('Đã tạo label "Sandcastle"');
+    expect(stdout).toContain("Khởi tạo xong");
+    // Confirmed label → the scaffolded prompt filters issues by it.
+    const prompt = await readFile(
+      join(hostDir, ".sandcastle", "prompt.md"),
+      "utf-8",
+    );
+    expect(prompt).toContain("--label");
+  });
+
+  it("init --issue-tracker github-issues --create-label true treats an existing label as fine", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, {
+      authenticated: true,
+      labelCreate: "exists",
+    });
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label true --build-image false`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("đã tồn tại");
+    expect(stdout).toContain("Khởi tạo xong");
+  });
+
+  it("init --issue-tracker github-issues --create-label true fails clearly when label creation is denied", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, {
+      authenticated: true,
+      labelCreate: "denied",
+    });
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label true --build-image false`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      // Vietnamese failure report carrying gh's own error line.
+      expect(output).toContain('Không tạo được label "Sandcastle"');
+      expect(output).toContain("403");
+      expect(output).toContain("--create-label false");
+      // Label failure happens before any writes.
+      const entries = await readdir(hostDir);
+      expect(entries).not.toContain(".sandcastle");
+      expect(entries).not.toContain("package.json");
+    }
+  });
+
+  it("init detects package.json scripts as verification commands in canonical order", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(
+      join(hostDir, "package.json"),
+      JSON.stringify({
+        name: "fixture",
+        scripts: {
+          dev: "vite",
+          build: "tsup",
+          test: "vitest run",
+          lint: "eslint .",
+          typecheck: "tsgo --noEmit",
+        },
+      }),
+    );
+
+    await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+      hostDir,
+    );
+
+    const settings = await readSettings(hostDir);
+    // Run order: cheap checks first, tests, then the full build.
+    expect(settings["verificationCommands"]).toEqual([
+      "npm run typecheck",
+      "npm run lint",
+      "npm test",
+      "npm run build",
+    ]);
+    // Configured but not yet run — no status key (never reported passed).
+    expect("verificationStatus" in settings).toBe(false);
+  });
+
+  it("init detects non-npm verification candidates", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(join(hostDir, "go.mod"), "module example.com/x\n");
+
+    await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+      hostDir,
+    );
+
+    const settings = await readSettings(hostDir);
+    expect(settings["verificationCommands"]).toEqual(["go test ./..."]);
+  });
+
+  it("init records verificationStatus unavailable when nothing is detected", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+      hostDir,
+    );
+
+    const settings = await readSettings(hostDir);
+    expect(settings["verificationCommands"]).toEqual([]);
+    expect(settings["verificationStatus"]).toBe("unavailable");
+  });
+
+  it("init --skip-verification persists status skipped, ignoring detected candidates", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(
+      join(hostDir, "package.json"),
+      JSON.stringify({ scripts: { test: "vitest" } }),
+    );
+
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false --skip-verification",
+      hostDir,
+    );
+
+    const settings = await readSettings(hostDir);
+    expect(settings["verificationCommands"]).toEqual([]);
+    expect(settings["verificationStatus"]).toBe("skipped");
+    expect(stdout).toContain("Đã bỏ qua lệnh xác minh");
+  });
+
+  it("init --verification-commands persists the explicit list instead of detection", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(
+      join(hostDir, "package.json"),
+      JSON.stringify({ scripts: { test: "vitest" } }),
+    );
+
+    await runCli(
+      `init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false --verification-commands "make test, ./check.sh"`,
+      hostDir,
+    );
+
+    const settings = await readSettings(hostDir);
+    expect(settings["verificationCommands"]).toEqual([
+      "make test",
+      "./check.sh",
+    ]);
+  });
+
+  it("init --verification-commands combined with --skip-verification fails", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    try {
+      await runCli(
+        `init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false --verification-commands "npm test" --skip-verification`,
+        hostDir,
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("cannot be combined");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  it("init adds the sandcastle script to package.json, preserving unrelated scripts", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(
+      join(hostDir, "package.json"),
+      JSON.stringify(
+        {
+          name: "my-project",
+          scripts: { test: "vitest", dev: "vite" },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+      hostDir,
+    );
+
+    expect(stdout).toContain('Đã thêm script "sandcastle"');
+    const pkg = JSON.parse(
+      await readFile(join(hostDir, "package.json"), "utf-8"),
+    ) as { name: string; scripts: Record<string, string> };
+    expect(pkg.name).toBe("my-project");
+    expect(pkg.scripts).toEqual({
+      test: "vitest",
+      dev: "vite",
+      sandcastle: "sandcastle run",
+    });
+  });
+
+  it("init creates a minimal package.json with the sandcastle script when none exists", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+      hostDir,
+    );
+
+    expect(stdout).toContain("Đã tạo package.json");
+    const pkg = JSON.parse(
+      await readFile(join(hostDir, "package.json"), "utf-8"),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts["sandcastle"]).toBe("sandcastle run");
+  });
+
+  it("init fails clearly on a conflicting sandcastle script in non-interactive mode — nothing is written", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const original = JSON.stringify({
+      name: "conflict-fixture",
+      scripts: { sandcastle: "echo mine", test: "vitest" },
+    });
+    await writeFile(join(hostDir, "package.json"), original);
+
+    try {
+      await runCli(
+        "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+        hostDir,
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain('"sandcastle" script');
+      expect(output).toContain("--overwrite-script");
+      // Never silently overwritten — and the failure happens before
+      // scaffolding, so no partial .sandcastle/ is left behind.
+      expect(await readFile(join(hostDir, "package.json"), "utf-8")).toBe(
+        original,
+      );
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  it("init --overwrite-script true replaces a conflicting sandcastle script", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(
+      join(hostDir, "package.json"),
+      JSON.stringify({
+        scripts: { sandcastle: "echo mine", test: "vitest" },
+      }),
+    );
+
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false --overwrite-script true",
+      hostDir,
+    );
+
+    expect(stdout).toContain("Đã ghi đè");
+    const pkg = JSON.parse(
+      await readFile(join(hostDir, "package.json"), "utf-8"),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts).toEqual({
+      sandcastle: "sandcastle run",
+      test: "vitest",
+    });
+  });
+
+  it("init --overwrite-script false keeps the existing script and warns", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(
+      join(hostDir, "package.json"),
+      JSON.stringify({
+        scripts: { sandcastle: "echo mine", test: "vitest" },
+      }),
+    );
+
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false --overwrite-script false",
+      hostDir,
+    );
+
+    expect(stdout).toContain("Giữ nguyên");
+    const pkg = JSON.parse(
+      await readFile(join(hostDir, "package.json"), "utf-8"),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts["sandcastle"]).toBe("echo mine");
+    // Next steps don't claim `npm run sandcastle` works — they warn that the
+    // kept script prevents it.
+    expect(stdout).toContain("KHÔNG khởi động");
+    expect(stdout).not.toContain("init đã thêm script");
+  });
+
+  it("init github-issues end-to-end: gh ready, label created, detection and script insertion", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await writeFile(
+      join(hostDir, "package.json"),
+      JSON.stringify({
+        name: "e2e-fixture",
+        scripts: { test: "vitest", typecheck: "tsc --noEmit" },
+      }),
+    );
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, { authenticated: true, labelCreate: "ok" });
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent claude-code --template sequential-reviewer --sandbox docker --issue-tracker github-issues --create-label true --build-image false`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain('Đã tạo label "Sandcastle"');
+    expect(stdout).toContain('Đã thêm script "sandcastle"');
+    expect(stdout).toContain("Khởi tạo xong");
+
+    const settings = await readSettings(hostDir);
+    expect(settings).toMatchObject({
+      agent: "claude-code",
+      workflow: "sequential-reviewer",
+      sandbox: "docker",
+      issueTracker: "github-issues",
+      verificationCommands: ["npm run typecheck", "npm test"],
+    });
+
+    const pkg = JSON.parse(
+      await readFile(join(hostDir, "package.json"), "utf-8"),
+    ) as { scripts: Record<string, string> };
+    expect(pkg.scripts["sandcastle"]).toBe("sandcastle run");
+    expect(pkg.scripts["test"]).toBe("vitest");
+
+    // The scaffolded workflow files exist.
+    const sandcastleFiles = await readdir(join(hostDir, ".sandcastle"));
+    expect(sandcastleFiles).toContain("settings.json");
+    expect(sandcastleFiles).toContain("main.mts");
   });
 });

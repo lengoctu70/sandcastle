@@ -96,6 +96,66 @@ const TEMPLATES: TemplateMetadata[] = [
 
 export const listTemplates = (): TemplateMetadata[] => TEMPLATES;
 
+// ---------------------------------------------------------------------------
+// Workflow picker presentation (ADR 0025/0026)
+// ---------------------------------------------------------------------------
+
+/**
+ * One row in the interactive workflow picker: a Vietnamese, outcome-oriented
+ * label bound to a stable internal template id (ADR 0026). The ids are what
+ * `--template`, `settings.json#workflow`, and the scaffold directories use —
+ * they are never renamed. `recommended` marks the reviewed sequential
+ * workflow (quality-first default per ADR 0025's quality/speed trade-off).
+ */
+export interface WorkflowOption {
+  /** Stable internal template identifier, e.g. `"sequential-reviewer"`. */
+  readonly template: string;
+  /** Vietnamese outcome label shown in the picker. */
+  readonly label: string;
+  /** Vietnamese hint describing the trade-off, including the template id. */
+  readonly hint: string;
+  /** The picker's preselected, recommended choice. */
+  readonly recommended?: boolean;
+}
+
+/**
+ * Outcome-ordered workflow choices. Presentation order is deliberate: the
+ * reviewed sequential workflow first (recommended), then the fast sequential
+ * trade-off, then the two parallel workflows, then custom/blank for advanced
+ * users who want the programmable API.
+ */
+const WORKFLOW_OPTIONS: readonly WorkflowOption[] = [
+  {
+    template: "sequential-reviewer",
+    recommended: true,
+    label: "Làm từng issue một, có bước review code (khuyến nghị)",
+    hint: "sequential-reviewer — một issue tại một thời điểm, chất lượng được kiểm tra sau mỗi issue",
+  },
+  {
+    template: "simple-loop",
+    label: "Làm từng issue một, không có bước review riêng",
+    hint: "simple-loop — nhanh hơn, đánh đổi không có review tự động",
+  },
+  {
+    template: "parallel-planner",
+    label: "Nhiều issue cùng lúc, do planner chia việc",
+    hint: "parallel-planner — tối đa 2 issue song song (cấu hình 1–4 trong configure)",
+  },
+  {
+    template: "parallel-planner-with-review",
+    label: "Nhiều issue cùng lúc, có review cho từng nhánh",
+    hint: "parallel-planner-with-review — song song và vẫn review mỗi implementation",
+  },
+  {
+    template: "blank",
+    label: "Tùy chỉnh — tự viết workflow bằng JS API",
+    hint: "blank — scaffold trống cho người dùng nâng cao",
+  },
+];
+
+export const listWorkflowOptions = (): readonly WorkflowOption[] =>
+  WORKFLOW_OPTIONS;
+
 /**
  * Host-side npm packages the given template imports directly. Empty when the
  * template name is unknown or the template declares no extra dependencies.
@@ -218,6 +278,243 @@ export const hostHasDependency = (
     } catch {
       return false;
     }
+  });
+
+// ---------------------------------------------------------------------------
+// Verification-command detection (ADR 0024)
+// ---------------------------------------------------------------------------
+
+/**
+ * package.json scripts probed as verification candidates, in the order they
+ * should run: cheap static checks first, then tests, then the full build.
+ */
+const NPM_VERIFICATION_SCRIPTS = [
+  "typecheck",
+  "lint",
+  "test",
+  "build",
+] as const;
+
+/**
+ * The script body `npm init` scaffolds for `test` — a placeholder that always
+ * fails. It is never a real verification command, so detection skips it.
+ */
+const NPM_TEST_PLACEHOLDER = /no test specified/i;
+
+/** Render a detected package script as a runnable verification command. */
+const scriptCommand = (
+  packageManager: PackageManager,
+  script: string,
+): string =>
+  // `npm test` is the idiomatic form for npm's special test alias; every other
+  // manager/script pair goes through the uniform `run` subcommand.
+  packageManager === "npm" && script === "test"
+    ? "npm test"
+    : `${packageManager} run ${script}`;
+
+/**
+ * Non-npm verification candidates keyed on a config file's presence. These
+ * run only when their marker exists, so a Node project never sees `cargo
+ * test` suggested. `Makefile` is handled separately — a bare `make test` is
+ * only a candidate when the makefile actually declares a `test:` target.
+ */
+const NON_NPM_VERIFICATION_MARKERS: ReadonlyArray<{
+  readonly file: string;
+  readonly command: string;
+}> = [
+  { file: "Cargo.toml", command: "cargo test" },
+  { file: "go.mod", command: "go test ./..." },
+  { file: "pytest.ini", command: "pytest" },
+  { file: "tox.ini", command: "pytest" },
+  { file: "pyproject.toml", command: "pytest" },
+];
+
+/**
+ * Detect candidate verification commands for the project (ADR 0024).
+ *
+ * Reads `package.json` scripts (`typecheck`, `lint`, `test`, `build` — in
+ * that run order) through the detected package manager, then appends
+ * non-npm candidates whose config markers exist (`cargo test` for
+ * `Cargo.toml`, `pytest` for pytest/tox/pyproject configs, `make test` for a
+ * Makefile that declares a `test:` target, …). Returns the ordered,
+ * de-duplicated list — confirmation, editing, and skipping all happen in the
+ * CLI, which persists the result to `settings.json`.
+ */
+export const detectVerificationCandidates = (
+  repoDir: string,
+  packageManager: PackageManager,
+): Effect.Effect<readonly string[], never, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const commands: string[] = [];
+
+    const pkgPath = join(repoDir, "package.json");
+    const pkgExists = yield* fs
+      .exists(pkgPath)
+      .pipe(Effect.orElseSucceed(() => false));
+    if (pkgExists) {
+      const content = yield* fs
+        .readFileString(pkgPath)
+        .pipe(Effect.orElseSucceed(() => ""));
+      try {
+        const pkg = JSON.parse(content) as Record<string, unknown>;
+        const scripts = pkg["scripts"];
+        if (typeof scripts === "object" && scripts !== null) {
+          for (const name of NPM_VERIFICATION_SCRIPTS) {
+            const body = (scripts as Record<string, unknown>)[name];
+            if (typeof body !== "string" || body.trim().length === 0) continue;
+            // Skip the failing `npm init` test placeholder — suggesting it
+            // would configure verification that can never pass.
+            if (name === "test" && NPM_TEST_PLACEHOLDER.test(body)) continue;
+            commands.push(scriptCommand(packageManager, name));
+          }
+        }
+      } catch {
+        // Malformed package.json — no npm-derived candidates.
+      }
+    }
+
+    for (const marker of NON_NPM_VERIFICATION_MARKERS) {
+      const exists = yield* fs
+        .exists(join(repoDir, marker.file))
+        .pipe(Effect.orElseSucceed(() => false));
+      if (exists) commands.push(marker.command);
+    }
+
+    const makefilePath = join(repoDir, "Makefile");
+    const makefileExists = yield* fs
+      .exists(makefilePath)
+      .pipe(Effect.orElseSucceed(() => false));
+    if (makefileExists) {
+      const content = yield* fs
+        .readFileString(makefilePath)
+        .pipe(Effect.orElseSucceed(() => ""));
+      if (/^test\s*:/m.test(content)) commands.push("make test");
+    }
+
+    return [...new Set(commands)];
+  });
+
+// ---------------------------------------------------------------------------
+// package.json `sandcastle` script (ADR 0026)
+// ---------------------------------------------------------------------------
+
+/** The package.json script key init manages. */
+export const SANDCASTLE_SCRIPT_NAME = "sandcastle";
+
+/**
+ * The fixed script target — `sandcastle run` is the CLI-owned workflow
+ * command (ADR 0026), so the normal launch is `npm run sandcastle`.
+ */
+export const SANDCASTLE_SCRIPT_COMMAND = "sandcastle run";
+
+/**
+ * How a conflicting existing `sandcastle` script is resolved. `"ask"` leaves
+ * the file untouched and reports the conflict so the caller can prompt;
+ * `"overwrite"`/`"keep"` resolve it without asking.
+ */
+export type ScriptConflictResolution = "ask" | "overwrite" | "keep";
+
+export type PackageScriptOutcome =
+  | { readonly kind: "added" }
+  | { readonly kind: "already-correct" }
+  | { readonly kind: "overwritten" }
+  | { readonly kind: "kept-existing" }
+  /** package.json exists but is not parseable — nothing was written. */
+  | { readonly kind: "skipped-malformed" }
+  /** No package.json at all — a minimal one was created for the script. */
+  | { readonly kind: "created-package-json" }
+  /**
+   * An existing `sandcastle` script differs and resolution was `"ask"`.
+   * `existing` is the current script body, for the caller's prompt/error.
+   */
+  | { readonly kind: "conflict"; readonly existing: string };
+
+/** Indentation used when creating a new package.json or scripts block. */
+const detectJsonIndent = (content: string): string => {
+  const match = content.match(/\n([ \t]+)"/);
+  return match?.[1] ?? "  ";
+};
+
+/**
+ * Ensure the project has a `"sandcastle": "sandcastle run"` package script
+ * (ADR 0026). Unrelated scripts and all other package.json keys are preserved
+ * (parsed and re-serialized with the file's detected indentation). A
+ * conflicting existing script is never silently overwritten — `resolution`
+ * decides, and `"ask"` reports the conflict to the caller instead.
+ *
+ * When no package.json exists, a minimal `{ "private": true, "scripts": … }`
+ * is created so `npm run sandcastle` still works. A malformed package.json
+ * yields `skipped-malformed` rather than a destructive rewrite.
+ */
+export const ensureSandcastleScript = (
+  repoDir: string,
+  options?: { readonly resolution?: ScriptConflictResolution },
+): Effect.Effect<PackageScriptOutcome, Error, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const resolution = options?.resolution ?? "ask";
+    const pkgPath = join(repoDir, "package.json");
+
+    const exists = yield* fs
+      .exists(pkgPath)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+    if (!exists) {
+      const content =
+        JSON.stringify(
+          {
+            private: true,
+            scripts: { [SANDCASTLE_SCRIPT_NAME]: SANDCASTLE_SCRIPT_COMMAND },
+          },
+          null,
+          2,
+        ) + "\n";
+      yield* fs
+        .writeFileString(pkgPath, content)
+        .pipe(Effect.mapError((e) => new Error(e.message)));
+      return { kind: "created-package-json" };
+    }
+
+    const content = yield* fs
+      .readFileString(pkgPath)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+    let pkg: Record<string, unknown>;
+    try {
+      pkg = JSON.parse(content) as Record<string, unknown>;
+    } catch {
+      return { kind: "skipped-malformed" };
+    }
+    if (typeof pkg !== "object" || pkg === null || Array.isArray(pkg)) {
+      return { kind: "skipped-malformed" };
+    }
+
+    const scripts =
+      typeof pkg["scripts"] === "object" && pkg["scripts"] !== null
+        ? (pkg["scripts"] as Record<string, unknown>)
+        : undefined;
+    const existing = scripts?.[SANDCASTLE_SCRIPT_NAME];
+    if (typeof existing === "string" && existing.trim().length > 0) {
+      if (existing === SANDCASTLE_SCRIPT_COMMAND) {
+        return { kind: "already-correct" };
+      }
+      if (resolution === "ask") {
+        return { kind: "conflict", existing };
+      }
+      if (resolution === "keep") {
+        return { kind: "kept-existing" };
+      }
+    }
+
+    const nextScripts: Record<string, unknown> = { ...(scripts ?? {}) };
+    nextScripts[SANDCASTLE_SCRIPT_NAME] = SANDCASTLE_SCRIPT_COMMAND;
+    pkg["scripts"] = nextScripts;
+
+    const serialized =
+      JSON.stringify(pkg, null, detectJsonIndent(content)) + "\n";
+    yield* fs
+      .writeFileString(pkgPath, serialized)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+    return existing !== undefined ? { kind: "overwritten" } : { kind: "added" };
   });
 
 // ---------------------------------------------------------------------------
@@ -903,6 +1200,15 @@ export function getNextStepsLines(
   agent: AgentEntry,
   packageManager: PackageManager,
   sandboxProvider: SandboxProviderEntry,
+  options?: {
+    /**
+     * `false` when an existing `sandcastle` package script was kept after a
+     * conflict — the launch step then warns that `npm run sandcastle` does
+     * not start Sandcastle until the script is fixed. Defaults to `true`
+     * (init added the script, or it already pointed at `sandcastle run`).
+     */
+    readonly packageScriptReady?: boolean;
+  },
 ): string[] {
   // The custom issue tracker scaffolds a broken-until-configured project, so
   // its next steps are about running the setup prompt — not the template's
@@ -920,6 +1226,15 @@ export function getNextStepsLines(
       `3. Follow .sandcastle/${SETUP_ISSUE_TRACKER_DOC} to edit the scaffolded files in place${hasImage ? ", build the image," : ""} and verify.`,
     ];
   }
+
+  // The launch step names the auto-added package script (ADR 0026). When a
+  // conflicting pre-existing script was kept, say so honestly instead of
+  // telling the user `npm run sandcastle` will work.
+  const packageScriptReady = options?.packageScriptReady !== false;
+  const runStep = packageScriptReady
+    ? `Chạy \`npm run sandcastle\` để khởi động — init đã thêm script "sandcastle": "sandcastle run" vào package.json`
+    : `Script "sandcastle" trong package.json đã tồn tại với nội dung khác nên được giữ nguyên — \`npm run sandcastle\` sẽ KHÔNG khởi động Sandcastle cho đến khi bạn chỉnh script đó thành "sandcastle run"`;
+
   // Host mode (ADR 0021): the agent runs on this machine with its existing
   // CLI login — no image to build, no API key to set. Vietnamese per ADR 0026;
   // commands, filenames, and identifiers stay English.
@@ -930,23 +1245,23 @@ export function getNextStepsLines(
       issueTracker,
       agent,
       packageManager,
+      runStep,
     );
   }
   if (template === "blank") {
     const lines = [
-      "Next steps:",
-      `1. Set the required env vars in .sandcastle/.env (see .sandcastle/.env.example)`,
+      "Các bước tiếp theo:",
+      `1. Đặt các biến môi trường cần thiết trong .sandcastle/.env (xem .sandcastle/.env.example)`,
     ];
     if (agent.name === "claude-code") {
       lines.push(
-        "   To use your Claude subscription instead of an API key, run `claude setup-token` on your host and paste the result into CLAUDE_CODE_OAUTH_TOKEN.",
+        "   Để dùng Claude subscription thay cho API key, chạy `claude setup-token` trên máy host rồi dán kết quả vào CLAUDE_CODE_OAUTH_TOKEN.",
       );
     }
     lines.push(
-      "2. Read and customize .sandcastle/prompt.md to describe what you want the agent to do",
-      `3. Customize .sandcastle/${mainFilename} — it uses the JS API (\`run()\`) to control how the agent runs`,
-      `4. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
-      "5. Run `npm run sandcastle` to start the agent",
+      "2. Đọc và chỉnh sửa .sandcastle/prompt.md để mô tả việc bạn muốn agent làm",
+      `3. Tùy chỉnh .sandcastle/${mainFilename} — file này dùng JS API (\`run()\`) để điều khiển cách agent chạy`,
+      `4. ${runStep}`,
     );
     return lines;
   } else {
@@ -954,32 +1269,31 @@ export function getNextStepsLines(
     const usesPlanSchema = getTemplateDependencies(template).includes("zod");
     let step = 1;
     const lines: string[] = [
-      "Next steps:",
-      `${step++}. Set the required env vars in .sandcastle/.env (see .sandcastle/.env.example)`,
+      "Các bước tiếp theo:",
+      `${step++}. Đặt các biến môi trường cần thiết trong .sandcastle/.env (xem .sandcastle/.env.example)`,
     ];
     if (agent.name === "claude-code") {
       lines.push(
-        "   To use your Claude subscription instead of an API key, run `claude setup-token` on your host and paste the result into CLAUDE_CODE_OAUTH_TOKEN.",
+        "   Để dùng Claude subscription thay cho API key, chạy `claude setup-token` trên máy host rồi dán kết quả vào CLAUDE_CODE_OAUTH_TOKEN.",
       );
     }
     lines.push(
-      `${step++}. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
-      `${step++}. Templates use \`copyToWorktree: ["node_modules"]\` to copy your host node_modules into the sandbox for fast startup — the \`npm install\` in the onSandboxReady hook is a safety net for platform-specific binaries. Adjust both if you use a different package manager`,
+      `${step++}. Template dùng \`copyToWorktree: ["node_modules"]\` để sao chép node_modules của host vào sandbox cho khởi động nhanh — \`npm install\` trong hook onSandboxReady là phần dự phòng cho binary theo nền tảng. Điều chỉnh cả hai nếu bạn dùng package manager khác`,
     );
     if (usesPlanSchema) {
       lines.push(
-        `${step++}. Install a schema validator for the planner's \`<plan>\` output — the template uses Zod (\`${addDependencyCommand(packageManager, "zod")}\`), but Valibot, ArkType, or any Standard Schema library works (https://standardschema.dev)`,
+        `${step++}. Cài đặt schema validator cho output \`<plan>\` của planner — template dùng Zod (\`${addDependencyCommand(packageManager, "zod")}\`), nhưng Valibot, ArkType, hoặc một thư viện Standard Schema bất kỳ đều được (https://standardschema.dev)`,
       );
     }
     lines.push(
-      `${step++}. Read and customize the prompt files in .sandcastle/ — they shape what the agent does`,
+      `${step++}. Đọc và chỉnh sửa các tệp prompt trong .sandcastle/ — chúng quyết định việc agent làm`,
     );
     if (hasReviewer) {
       lines.push(
-        `${step++}. Customize .sandcastle/CODING_STANDARDS.md with your project's standards — the reviewer agent loads it during review`,
+        `${step++}. Tùy chỉnh .sandcastle/CODING_STANDARDS.md theo chuẩn của dự án — reviewer agent đọc tệp này khi review`,
       );
     }
-    lines.push(`${step++}. Run \`npm run sandcastle\` to start the agent`);
+    lines.push(`${step++}. ${runStep}`);
     return lines;
   }
 }
@@ -988,7 +1302,7 @@ export function getNextStepsLines(
  * Next steps for host mode (ADR 0021) — Vietnamese per ADR 0026. There is no
  * image to build and no agent API key to set; the agent reuses its existing
  * host CLI login. Only env the project itself needs (e.g. the issue
- * tracker's) is mentioned.
+ * tracker's) is mentioned. `runStep` carries the shared launch/conflict line.
  */
 const hostNextStepsLines = (
   template: string,
@@ -996,6 +1310,7 @@ const hostNextStepsLines = (
   issueTracker: IssueTrackerEntry,
   agent: AgentEntry,
   packageManager: PackageManager,
+  runStep: string,
 ): string[] => {
   const hasReviewer = template.includes("review");
   const usesPlanSchema = getTemplateDependencies(template).includes("zod");
@@ -1043,10 +1358,7 @@ const hostNextStepsLines = (
       `${step++}. Host mode chạy agent trong một git worktree riêng và tái sử dụng dependencies của host qua \`copyToWorktree\` (ví dụ node_modules) — không cần bước cài đặt nào trong worktree`,
     );
   }
-  lines.push(
-    `${step++}. Thêm "sandcastle": "npx tsx .sandcastle/${mainFilename}" vào package.json scripts`,
-    `${step++}. Chạy \`npm run sandcastle\` để khởi động agent`,
-  );
+  lines.push(`${step++}. ${runStep}`);
   return lines;
 };
 
@@ -1656,6 +1968,7 @@ export const scaffold = (
           settingsOverrides?.sandbox ??
           (sandboxProvider.name as SandboxProviderChoice),
         verificationCommands: settingsOverrides?.verificationCommands,
+        verificationStatus: settingsOverrides?.verificationStatus,
         parallelism:
           settingsOverrides?.parallelism ??
           (templateName.startsWith("parallel-") ? 2 : 1),
