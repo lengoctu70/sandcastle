@@ -524,6 +524,44 @@ WORKDIR /home/agent
 ENTRYPOINT ["sleep", "infinity"]
 `;
 
+const ANTIGRAVITY_DOCKERFILE = `FROM node:22-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \\
+  git \\
+  curl \\
+  jq \\
+  && rm -rf /var/lib/apt/lists/*
+
+{{ISSUE_TRACKER_TOOLS}}
+
+# Build-args for UID/GID alignment: sandcastle docker build-image
+# defaults these to the host user's UID/GID so image-built files
+# and bind-mounted files share an owner without runtime chown.
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+
+# Rename the base image's "node" user to "agent" and align UID/GID.
+RUN groupmod -o -g $AGENT_GID node && usermod -o -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+USER \${AGENT_UID}:\${AGENT_GID}
+
+# Install Antigravity CLI via the official install script (runs as agent →
+# ~/.local/bin). In the container, authenticate with GEMINI_API_KEY plus
+# modelProvider "gemini" in ~/.gemini/antigravity-cli/settings.json — the
+# browser OAuth flow is host-mode territory.
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+
+# Add agy to PATH
+ENV PATH="/home/agent/.local/bin:$PATH"
+
+WORKDIR /home/agent
+
+# In worktree sandbox mode, Sandcastle bind-mounts the git worktree at \${SANDBOX_REPO_DIR}
+# and overrides the working directory to \${SANDBOX_REPO_DIR} at container start.
+# Structure your Dockerfile so that \${SANDBOX_REPO_DIR} can serve as the project root.
+ENTRYPOINT ["sleep", "infinity"]
+`;
+
 const AGENT_REGISTRY: AgentEntry[] = [
   {
     name: "claude-code",
@@ -632,6 +670,21 @@ GITHUB_TOKEN=`,
     envExample: `# xAI API key — not needed in host mode (your \`grok login\` session is reused).
 XAI_API_KEY=`,
     setupCommand: `grok "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+  },
+  {
+    name: "antigravity",
+    label: "Google Antigravity",
+    defaultModel: "gemini-3.8-flash-high",
+    factoryImport: "antigravity",
+    effortOption: "effort",
+    dockerfileTemplate: ANTIGRAVITY_DOCKERFILE,
+    envExample: `# Gemini API key — optional alternative to Antigravity's Google sign-in.
+# Set "modelProvider": "gemini" in ~/.gemini/antigravity-cli/settings.json and
+# export this key to run without the browser OAuth flow (useful in containers).
+GEMINI_API_KEY=`,
+    // -i runs the setup prompt then keeps an interactive session open — the
+    // agy equivalent of Copilot's `-i` seed (not `-p`, which is print-and-exit).
+    setupCommand: `agy -i "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
   },
 ];
 

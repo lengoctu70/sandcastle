@@ -79,6 +79,8 @@ export type {
   PiOptions,
 } from "./AgentProvider.js";
 export type { GrokOptions } from "./agents/grok.js";
+export { antigravity } from "./agents/antigravity.js";
+export type { AntigravityOptions } from "./agents/antigravity.js";
 export {
   createBindMountSandboxProvider,
   createIsolatedSandboxProvider,
@@ -150,6 +152,7 @@ export { devinDiscoveryAdapter } from "./discovery/devin.js";
 export { cursorDiscoveryAdapter } from "./discovery/cursor.js";
 export { copilotDiscoveryAdapter } from "./discovery/copilot.js";
 export { grokDiscoveryAdapter } from "./discovery/grok.js";
+export { antigravityDiscoveryAdapter } from "./discovery/antigravity.js";
 export {
   listDiscoveryAdapters,
   getDiscoveryAdapter,

@@ -11,6 +11,7 @@ import { devinDiscoveryAdapter } from "./devin.js";
 import { cursorDiscoveryAdapter } from "./cursor.js";
 import { copilotDiscoveryAdapter } from "./copilot.js";
 import { grokDiscoveryAdapter } from "./grok.js";
+import { antigravityDiscoveryAdapter } from "./antigravity.js";
 import { nodeDiscoveryExec } from "./nodeExec.js";
 
 /**
@@ -31,6 +32,7 @@ const DISCOVERY_ADAPTERS: readonly AgentDiscoveryAdapter[] = [
   cursorDiscoveryAdapter,
   copilotDiscoveryAdapter,
   grokDiscoveryAdapter,
+  antigravityDiscoveryAdapter,
 ];
 
 /** All registered discovery adapters, in display order. */
