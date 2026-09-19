@@ -38,10 +38,11 @@ export type ParsedStreamEvent =
   | { type: "session_id"; sessionId: string }
   | { type: "usage"; usage: IterationUsage };
 
-const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
+export const shellEscape = (s: string): string =>
+  "'" + s.replace(/'/g, "'\\''") + "'";
 
 /** Maps allowlisted tool names to the input field containing the display arg */
-const TOOL_ARG_FIELDS: Record<string, string> = {
+export const TOOL_ARG_FIELDS: Record<string, string> = {
   Bash: "command",
   WebSearch: "query",
   WebFetch: "url",
@@ -53,7 +54,7 @@ const TOOL_ARG_FIELDS: Record<string, string> = {
  * Handles { error: "string" }, { error: { message: "string" } },
  * { error: { data: { message: "string" } } }, and { message: "string" }.
  */
-const extractErrorMessage = (obj: any): string | undefined => {
+export const extractErrorMessage = (obj: any): string | undefined => {
   const err = obj.error;
   if (typeof err === "string") return err;
   if (typeof err === "object" && err !== null) {
@@ -285,7 +286,7 @@ export const DEFAULT_MODEL = "claude-opus-4-8";
 // pure string functions.
 // ---------------------------------------------------------------------------
 
-const readSandboxFile = async (
+export const readSandboxFile = async (
   handle: Pick<BindMountSandboxHandle, "copyFileOut">,
   sandboxPath: string,
   tag: string,
@@ -302,7 +303,7 @@ const readSandboxFile = async (
   }
 };
 
-const writeSandboxFile = async (
+export const writeSandboxFile = async (
   handle: Pick<BindMountSandboxHandle, "copyFileIn" | "exec">,
   sandboxPath: string,
   content: string,
