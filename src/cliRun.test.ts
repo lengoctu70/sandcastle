@@ -130,9 +130,22 @@ process.exit(1);
  * current branch inside the worktree), then emits stream-json lines the
  * provider parses (init session_id, assistant text, result carrying the
  * completion signal). `FAKE_CLAUDE_FAIL=1` exits non-zero without committing.
- * Also appends `AGENT` to $FAKE_GH_LOG so the shared log orders
- * implement→verify→merge→report→close, and dumps the received prompt to
- * $FAKE_AGENT_PROMPT so tests can assert the immutable issue data arrived.
+ *
+ * Bounded-repair support (#18):
+ * - Each invocation is numbered; the shared call log gets `AGENT` for a fresh
+ *   run or `AGENT_RESUME <id>` when Sandcastle passed `--resume <id>`, so
+ *   tests can assert native session resume vs. fresh repair invocations.
+ * - A session JSONL is written to `$HOME/.claude/projects/<enc-cwd>/<id>.jsonl`
+ *   before exiting — mirroring real Claude Code, which persists the session
+ *   on disk as it runs — so the resume precheck finds it on the next repair.
+ * - Every received prompt is appended to $FAKE_AGENT_PROMPT under a
+ *   `===PROMPT N===` marker so tests can inspect each invocation's context.
+ * - A `# Merge conflict repair` prompt resolves the in-progress merge in the
+ *   integration worktree (writes resolved content, `git add`, `git commit`);
+ *   `FAKE_AGENT_NO_RESOLVE=1` leaves the merge conflicted to exercise the
+ *   post-repair state check.
+ * - A `# Verification repair` prompt additionally creates `verify-ok.flag`,
+ *   which a verification command can assert on to gate repair success.
  */
 const writeFakeClaude = async (dir: string) => {
   const shim = join(dir, "claude");
@@ -141,27 +154,90 @@ const writeFakeClaude = async (dir: string) => {
     `#!/usr/bin/env node
 const fs = require("fs");
 const cp = require("child_process");
+const path = require("path");
 let buf = "";
 process.stdin.on("data", (d) => (buf += d));
 process.stdin.on("end", () => {
   const log = process.env.FAKE_GH_LOG;
-  if (log) fs.appendFileSync(log, "AGENT\\n");
+  const prior = log && fs.existsSync(log)
+    ? fs.readFileSync(log, "utf-8").split("\\n").filter((l) => l.startsWith("AGENT")).length
+    : 0;
+  const n = prior + 1;
+  const sessionId = "fake-session-" + n;
+  const resumeIdx = process.argv.indexOf("--resume");
+  const resumed = resumeIdx >= 0 ? process.argv[resumeIdx + 1] : null;
+  if (log) fs.appendFileSync(log, resumed ? "AGENT_RESUME " + resumed + "\\n" : "AGENT\\n");
   const promptOut = process.env.FAKE_AGENT_PROMPT;
-  if (promptOut) fs.writeFileSync(promptOut, buf);
+  if (promptOut) fs.appendFileSync(promptOut, "\\n===PROMPT " + n + "===\\n" + buf);
+  const home = process.env.HOME;
+  if (home) {
+    const enc = process.cwd().replace(/^([A-Za-z]):/, "$1").replace(/[\\\\/]/g, "-");
+    const dir = path.join(home, ".claude", "projects", enc);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, sessionId + ".jsonl"), JSON.stringify({ cwd: process.cwd() }) + "\\n");
+  }
   if (process.env.FAKE_CLAUDE_FAIL === "1") {
     console.log(JSON.stringify({ type: "result", result: "agent exploded" }));
     process.exit(1);
   }
-  const name = process.env.FAKE_AGENT_FILE || "agent-work.txt";
-  fs.writeFileSync(name, "implemented\\n");
-  cp.execSync("git add -A && git commit -m \\"implement the issue\\"", {
-    cwd: process.cwd(),
-    stdio: "ignore",
-  });
-  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "fake-session-1" }));
-  console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "implemented the issue" }] } }));
-  console.log(JSON.stringify({ type: "result", result: "done <promise>COMPLETE</promise>", session_id: "fake-session-1" }));
+  const cwd = process.cwd();
+  if (buf.includes("# Merge conflict repair")) {
+    if (process.env.FAKE_AGENT_NO_RESOLVE !== "1") {
+      const unmerged = cp.execSync("git diff --name-only --diff-filter=U", { cwd })
+        .toString().split("\\n").filter(Boolean);
+      for (const f of unmerged) fs.writeFileSync(path.join(cwd, f), "resolved by agent\\n");
+      cp.execSync("git add -A && git commit -m \\"resolve merge conflict\\"", { cwd, stdio: "ignore" });
+    }
+    // With FAKE_AGENT_NO_RESOLVE=1 the merge stays conflicted — Sandcastle's
+    // post-repair state check must reject it.
+  } else {
+    if (buf.includes("# Verification repair")) {
+      fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
+    }
+    const name = process.env.FAKE_AGENT_FILE || "agent-work.txt";
+    fs.writeFileSync(path.join(cwd, name), "implemented " + n + "\\n");
+    cp.execSync("git add -A && git commit -m \\"agent work " + n + "\\"", { cwd, stdio: "ignore" });
+  }
+  console.log(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }));
+  console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "worked" }] } }));
+  console.log(JSON.stringify({ type: "result", result: "done <promise>COMPLETE</promise>", session_id: sessionId }));
 });
+`,
+  );
+  await chmod(shim, 0o755);
+};
+
+/**
+ * Fake `opencode` — a non-resumable provider (`captureSessions: false`, no
+ * sessionStorage), so repair runs must be fresh invocations carrying the full
+ * task + failure context. `opencode run` receives the prompt as the last argv
+ * element and emits {type:"step_start"|"text"} JSON lines.
+ */
+const writeFakeOpencode = async (dir: string) => {
+  const shim = join(dir, "opencode");
+  await writeFile(
+    shim,
+    `#!/usr/bin/env node
+const fs = require("fs");
+const cp = require("child_process");
+const path = require("path");
+const prompt = process.argv[process.argv.length - 1] || "";
+const log = process.env.FAKE_GH_LOG;
+const prior = log && fs.existsSync(log)
+  ? fs.readFileSync(log, "utf-8").split("\\n").filter((l) => l.startsWith("OPENCODE")).length
+  : 0;
+const n = prior + 1;
+if (log) fs.appendFileSync(log, "OPENCODE\\n");
+const promptOut = process.env.FAKE_AGENT_PROMPT;
+if (promptOut) fs.appendFileSync(promptOut, "\\n===PROMPT " + n + "===\\n" + prompt);
+const cwd = process.cwd();
+if (prompt.includes("# Verification repair")) {
+  fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
+}
+fs.writeFileSync(path.join(cwd, process.env.FAKE_AGENT_FILE || "agent-work.txt"), "implemented " + n + "\\n");
+cp.execSync("git add -A && git commit -m \\"opencode work " + n + "\\"", { cwd, stdio: "ignore" });
+console.log(JSON.stringify({ type: "step_start", sessionID: "oc-" + n }));
+console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <promise>COMPLETE</promise>" } }));
 `,
   );
   await chmod(shim, 0o755);
@@ -170,13 +246,15 @@ process.stdin.on("end", () => {
 interface FixtureEnv {
   readonly repoDir: string;
   readonly shimDir: string;
+  /** Fake $HOME — the fake agent writes resumable session files under it. */
+  readonly fakeHome: string;
   readonly logFile: string;
   readonly issuesFile: string;
   readonly promptFile: string;
   readonly env: NodeJS.ProcessEnv;
 }
 
-/** Temp repo + fake gh/claude + a shared call log. `issues` may be empty. */
+/** Temp repo + fake gh/claude/opencode + a shared call log. `issues` may be empty. */
 const makeFixture = async (
   issues: readonly Record<string, unknown>[],
   envOverrides: Record<string, string> = {},
@@ -188,6 +266,11 @@ const makeFixture = async (
   const shimDir = await mkdtemp(join(tmpdir(), "run-shims-"));
   await writeFakeGh(shimDir);
   await writeFakeClaude(shimDir);
+  await writeFakeOpencode(shimDir);
+
+  // A private HOME so the fake agent's session files — and the resume
+  // precheck's `~/.claude/projects/*/id.jsonl` scan — stay inside the fixture.
+  const fakeHome = await mkdtemp(join(tmpdir(), "run-home-"));
 
   const logFile = join(repoDir, "calls.log");
   const issuesFile = join(repoDir, "issues.json");
@@ -197,6 +280,7 @@ const makeFixture = async (
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     PATH: shimmedPath(shimDir),
+    HOME: fakeHome,
     FAKE_GH_LOG: logFile,
     FAKE_GH_ISSUES: issuesFile,
     FAKE_AGENT_PROMPT: promptFile,
@@ -204,7 +288,7 @@ const makeFixture = async (
     FAKE_GH_LABEL: "1",
     ...envOverrides,
   };
-  return { repoDir, shimDir, logFile, issuesFile, promptFile, env };
+  return { repoDir, shimDir, fakeHome, logFile, issuesFile, promptFile, env };
 };
 
 const runCli = (args: string, cwd: string, env: NodeJS.ProcessEnv) =>
@@ -301,7 +385,71 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     expect(stdout).toContain("đã được đóng");
   });
 
-  it("verification failure: posts a Vietnamese failure report, keeps the issue open, merges nothing", async () => {
+  it("verification repair: feeds the failed command + output back and lands on retry", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    // Fails until the agent's repair run creates verify-ok.flag — the fake
+    // claude does that only for "# Verification repair" prompts.
+    const verifyCmd =
+      `echo VERIFY >> "${logFile}"; ` +
+      `if [ ! -f verify-ok.flag ]; then echo "verify-ok.flag MISSING" >&2; exit 1; fi`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    // One implementation run, then ONE repair — a native session resume, since
+    // claude is a resumable provider and the session file exists.
+    expect(log.filter((l) => l === "AGENT").length).toBe(1);
+    expect(log).toContain("AGENT_RESUME fake-session-1");
+    // Verification ran on source (fail), source again (pass), and integrated.
+    const verifyCount = log.filter((l) => l === "VERIFY").length;
+    expect(verifyCount).toBe(3);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+
+    // The repair prompt carried the exact failed command and its output.
+    const prompts = await readFile(promptFile, "utf-8");
+    const repairPrompt = prompts.split("===PROMPT 2===")[1] ?? "";
+    expect(repairPrompt).toContain("# Verification repair");
+    expect(repairPrompt).toContain("verify-ok.flag");
+    expect(repairPrompt).toContain("verify-ok.flag MISSING");
+
+    // The fix landed on main.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(files).toContain("verify-ok.flag");
+    expect(stdout).toContain("Hoàn thành issue #5");
+  });
+
+  it("verification repair with a non-resumable provider: fresh invocation with full context", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd =
+      `echo VERIFY >> "${logFile}"; ` +
+      `if [ ! -f verify-ok.flag ]; then echo "verify-ok.flag MISSING" >&2; exit 1; fi`;
+    // opencode has no session storage — repair must be a fresh invocation.
+    await writeSettings(repoDir, {
+      agent: "opencode",
+      verificationCommands: [verifyCmd],
+    });
+
+    await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    expect(log.filter((l) => l === "OPENCODE").length).toBe(2);
+    expect(log.some((l) => l.startsWith("AGENT_RESUME"))).toBe(false);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+
+    // The fresh repair invocation re-established the task + failure context.
+    const prompts = await readFile(promptFile, "utf-8");
+    const repairPrompt = prompts.split("===PROMPT 2===")[1] ?? "";
+    expect(repairPrompt).toContain("# Verification repair");
+    expect(repairPrompt).toContain(
+      "A previous Sandcastle run implemented issue #5",
+    );
+    expect(repairPrompt).toContain("Add a greeting file");
+    expect(repairPrompt).toContain("verify-ok.flag MISSING");
+  });
+
+  it("verification failure: after 2 bounded repairs posts a Vietnamese failure report, keeps the issue open, merges nothing", async () => {
     const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
     const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
     await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
@@ -311,13 +459,20 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     });
 
     const log = await readLog(logFile);
-    // Implement ran, verify failed, a comment was posted, close never ran.
-    expect(log).toContain("AGENT");
-    expect(log).toContain("VERIFY");
+    // Implementation + exactly two bounded repair attempts (both native
+    // resumes), then the run stops — no third try.
+    expect(log.filter((l) => l === "AGENT").length).toBe(1);
+    expect(log).toContain("AGENT_RESUME fake-session-1");
+    expect(log).toContain("AGENT_RESUME fake-session-2");
+    expect(log.filter((l) => l.startsWith("AGENT")).length).toBe(3);
+    // Initial verify + one re-run per repair = 3 invocations.
+    expect(log.filter((l) => l === "VERIFY").length).toBe(3);
     expect(log.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
     expect(log.some((l) => l.startsWith("gh issue close"))).toBe(false);
-    const commentLine = log.find((l) => l.startsWith("gh issue comment"))!;
-    expect(commentLine).toContain("không hoàn thành");
+    const raw = await readFile(logFile, "utf-8");
+    expect(raw).toContain("không hoàn thành");
+    // The attempt budget is visible in the report.
+    expect(raw).toContain("xác minh 2/2");
 
     // Nothing landed on main; the failure state is preserved for recovery.
     const files = await git(repoDir, "ls-tree --name-only main");
@@ -332,6 +487,12 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
       failurePhase: "verification",
       sourceBranch: "sandcastle/issue-5",
       issue: { number: 5 },
+      attempts: {
+        implementation: 1,
+        verificationRepair: 2,
+        mergeConflictRepair: 0,
+        integrationRebuild: 0,
+      },
     });
     // The preserved source worktree stays on disk with the branch.
     const worktrees = await git(repoDir, "worktree list --porcelain");
@@ -342,10 +503,53 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     expect(settings.verificationStatus).toBe("failed");
   });
 
-  it("merge conflict: stops safely, never leaves the active checkout conflicted, issue stays open", async () => {
+  it("merge conflict: agent repairs the conflict in the integration worktree, then verify + land", async () => {
     const { repoDir, logFile, env } = await makeFixture([
       { ...ISSUE_5, number: 7 },
     ]);
+    const verifyCmd = `echo VERIFY >> "${logFile}"`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    // Pre-seed the deterministic source branch with a commit that conflicts
+    // with a newer commit on main — the integration merge must collide.
+    await execAsync("git checkout -b sandcastle/issue-7", { cwd: repoDir });
+    await commitFile(repoDir, "hello.txt", "branch version\n", "branch change");
+    await execAsync("git checkout main", { cwd: repoDir });
+    await commitFile(repoDir, "hello.txt", "main version\n", "main change");
+
+    const { stdout } = await runCli("run --issue 7", repoDir, env);
+
+    const log = await readLog(logFile);
+    // Implementation ran on the source worktree; the conflict repair resumed
+    // the same session inside the integration worktree.
+    expect(log.filter((l) => l === "AGENT").length).toBe(1);
+    expect(log).toContain("AGENT_RESUME fake-session-1");
+    // All verification commands re-ran on the integrated tree after repair.
+    expect(log.filter((l) => l === "VERIFY").length).toBe(2);
+    expect(log.some((l) => l.startsWith("gh issue comment 7"))).toBe(true);
+    expect(log.some((l) => l.startsWith("gh issue close 7"))).toBe(true);
+
+    // The repair's resolution landed: the agent's conflict resolution and its
+    // implementation commit are both on main.
+    expect(await git(repoDir, "show main:hello.txt")).toBe("resolved by agent");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+
+    // Attempt counts are visible in the completion report.
+    const raw = await readFile(logFile, "utf-8");
+    expect(raw).toContain("1/1 lần sau xung đột merge");
+
+    // Derived state cleaned up: no integration worktree or branch remains.
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+    expect(stdout).toContain("đã được đóng");
+  });
+
+  it("merge conflict: exhausted repair stops safely, never leaves the active checkout conflicted, issue stays open", async () => {
+    const { repoDir, logFile, env } = await makeFixture(
+      [{ ...ISSUE_5, number: 7 }],
+      { FAKE_AGENT_NO_RESOLVE: "1" },
+    );
     await writeSettings(repoDir);
 
     // Pre-seed the deterministic source branch with a commit that conflicts
@@ -360,6 +564,10 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     });
 
     const log = await readLog(logFile);
+    // The one allowed repair ran (session resumed) and left the merge
+    // conflicted — no second repair, no landing, no close.
+    expect(log).toContain("AGENT_RESUME fake-session-1");
+    expect(log.filter((l) => l.startsWith("AGENT")).length).toBe(2);
     expect(log.some((l) => l.startsWith("gh issue comment 7"))).toBe(true);
     expect(log.some((l) => l.startsWith("gh issue close"))).toBe(false);
 
@@ -377,7 +585,7 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     // No leftover integration worktree.
     const worktrees = await git(repoDir, "worktree list --porcelain");
     expect(worktrees).not.toContain("integrate");
-    // Recovery state preserves the failure for later retry.
+    // Recovery state preserves the failure and the spent repair budget.
     const recovery = JSON.parse(
       await readFile(
         join(repoDir, ".sandcastle", "recovery", "issue-7.json"),
@@ -385,6 +593,83 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
       ),
     );
     expect(recovery.failurePhase).toBe("integration");
+    expect(recovery.attempts).toMatchObject({
+      implementation: 1,
+      mergeConflictRepair: 1,
+    });
+  });
+
+  it("target branch moved during integration: rebuilds once on the new tip and lands", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    // The verify command moves main — but only on its second invocation (the
+    // first integrated-tree verification), so the freshness check fails once
+    // and the rebuild's own verification then leaves the branch alone.
+    const vcount = join(repoDir, ".vcount");
+    const verifyCmd =
+      `n=$(cat "${vcount}" 2>/dev/null || echo 0); echo $((n+1)) > "${vcount}"; ` +
+      `echo VERIFY >> "${logFile}"; ` +
+      `if [ "$n" = "1" ]; then git -C "${repoDir}" commit --allow-empty -qm moved; fi`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    // source verify → integrated verify (moves main) → rebuilt integrated verify.
+    expect(log.filter((l) => l === "VERIFY").length).toBe(3);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    expect(stdout).toContain("dựng lại");
+
+    // Both the agent's work and the racing "moved" commit are on main.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    const mainLog = await git(repoDir, "log --format=%s main");
+    expect(mainLog).toContain("moved");
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+  });
+
+  it("target branch moved twice: rebuild budget exhausted → stops safely, never force-updates", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    // Every verification call moves main, so even the rebuilt integration
+    // state is stale by the time its freshness check runs.
+    const verifyCmd =
+      `echo VERIFY >> "${logFile}" && ` +
+      `git -C "${repoDir}" commit --allow-empty -qm moved`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+
+    const log = await readLog(logFile);
+    // source verify → integrated verify → rebuilt integrated verify → stop.
+    expect(log.filter((l) => l === "VERIFY").length).toBe(3);
+    expect(log.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
+    expect(log.some((l) => l.startsWith("gh issue close"))).toBe(false);
+
+    // The agent's work never landed — main still only has the racing commits.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).not.toContain("agent-work.txt");
+    expect(await git(repoDir, "rev-parse --abbrev-ref HEAD")).toBe("main");
+
+    // Recovery records the landing-phase stop with the spent rebuild budget.
+    const recovery = JSON.parse(
+      await readFile(
+        join(repoDir, ".sandcastle", "recovery", "issue-5.json"),
+        "utf-8",
+      ),
+    );
+    expect(recovery.failurePhase).toBe("landing");
+    expect(recovery.attempts).toMatchObject({
+      implementation: 1,
+      verificationRepair: 0,
+      mergeConflictRepair: 0,
+      integrationRebuild: 1,
+    });
+    // No leftover integration worktree; the source worktree is preserved.
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees).not.toContain("integrate");
+    expect(worktrees).toContain("sandcastle-issue-5");
   });
 
   it("reports no eligible issues and exits 0 when the Sandcastle label has none", async () => {
