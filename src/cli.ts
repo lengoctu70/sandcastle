@@ -49,6 +49,7 @@ import {
   MAX_TARGET_REBUILD_ATTEMPTS,
   MAX_VERIFICATION_REPAIR_ATTEMPTS,
   PHASE_LABEL,
+  runIssueQueueWorkflow,
   runIssueWorkflow,
   type RunIssueWorkflowOptions,
 } from "./WorkflowRun.js";
@@ -62,7 +63,12 @@ import {
   type RecoveryState,
 } from "./recovery.js";
 import type { GithubIssue } from "./githubIssues.js";
-import type { ModelSource, VerificationStatus } from "./ProjectSettings.js";
+import {
+  MAX_PARALLELISM,
+  MIN_PARALLELISM,
+  type ModelSource,
+  type VerificationStatus,
+} from "./ProjectSettings.js";
 import { ConfigDirError, InitError } from "./errors.js";
 import { VERSION } from "./version.js";
 
@@ -1187,51 +1193,202 @@ const podmanCommand = Command.make("podman", {}, () =>
 // --- Run command ---
 
 /**
- * `sandcastle run` — implement one GitHub Issue end to end (ADR 0023/0024/0026).
- *
- * `--issue <number>` selects deterministically (non-interactive/CI). Without
- * it, a TTY picker lists open `Sandcastle`-labeled issues. The workflow
- * itself lives in `WorkflowRun.ts`; this handler only bridges the clack
- * picker and Display service into the service's callbacks, then maps the
- * structured result onto exit status.
+ * `sandcastle run` — implement GitHub Issues end to end (ADR 0023/0024/0026,
+ * #20). Scope: `--issue <number>` runs one issue deterministically
+ * (non-interactive/CI), `--all` runs every open `Sandcastle`-labeled issue —
+ * sequentially by default, or bounded-parallel via `--parallelism`/configured
+ * `parallelism`. Without flags, a TTY picker first asks for the run scope
+ * (one issue / all sequential / all parallel), then the issue when needed.
+ * The workflow itself lives in `WorkflowRun.ts`; this handler only bridges
+ * the clack pickers and Display service into the service's callbacks, then
+ * maps the structured result onto exit status.
  */
 const runIssueOption = Options.integer("issue").pipe(
   Options.withDescription(
-    "GitHub issue number to implement — skips the issue picker",
+    "GitHub issue number to implement — skips the run-scope picker",
   ),
   Options.optional,
 );
 
-const runCommand = Command.make("run", { issue: runIssueOption }, ({ issue }) =>
-  Effect.gen(function* () {
-    const d = yield* Display;
-    const cwd = process.cwd();
-    const isInteractive = process.stdin.isTTY === true;
+const runAllOption = Options.boolean("all").pipe(
+  Options.withDescription(
+    "Run every open Sandcastle-labeled issue — sequential by default, bounded parallel with --parallelism > 1",
+  ),
+);
 
-    yield* runWorkflowAndReport(d, {
-      cwd,
-      issueNumber: issue._tag === "Some" ? issue.value : undefined,
-      // The picker seam is only wired when a TTY exists — without it the
-      // service requires --issue (or reports no eligible issues).
-      ...(isInteractive
-        ? {
-            selectIssue: async (issues: readonly GithubIssue[]) => {
-              const picked = await clack.select<number>({
-                message: "Chọn issue để Sandcastle thực hiện:",
-                options: issues.map((i) => ({
-                  value: i.number,
-                  label: `#${i.number} ${i.title}`,
-                })),
-              });
-              return clack.isCancel(picked) ? undefined : picked;
-            },
-          }
-        : {}),
-      onStatus: (message, severity) => {
-        Effect.runSync(d.status(message, severity));
-      },
-    });
-  }),
+const runParallelismOption = Options.integer("parallelism").pipe(
+  Options.withDescription(
+    `Cap how many --all issues run at once (integer ${MIN_PARALLELISM}-${MAX_PARALLELISM}; default: configured parallelism)`,
+  ),
+  Options.optional,
+);
+
+type RunScope =
+  | { readonly kind: "issue"; readonly issueNumber?: number }
+  | { readonly kind: "all"; readonly parallelism?: number };
+
+const runCommand = Command.make(
+  "run",
+  {
+    issue: runIssueOption,
+    all: runAllOption,
+    parallelism: runParallelismOption,
+  },
+  ({ issue, all, parallelism }) =>
+    Effect.gen(function* () {
+      const d = yield* Display;
+      const cwd = process.cwd();
+      const isInteractive = process.stdin.isTTY === true;
+
+      // #20: --all and --issue name different scopes — never combine them.
+      if (all && issue._tag === "Some") {
+        return yield* Effect.fail(
+          new InitError({
+            message:
+              "`--all` không dùng chung với `--issue` — chọn một issue " +
+              "(`sandcastle run --issue <n>`) hoặc tất cả issue đủ điều kiện " +
+              "(`sandcastle run --all`).",
+          }),
+        );
+      }
+      if (parallelism._tag === "Some") {
+        const p = parallelism.value;
+        if (
+          !Number.isInteger(p) ||
+          p < MIN_PARALLELISM ||
+          p > MAX_PARALLELISM
+        ) {
+          return yield* Effect.fail(
+            new InitError({
+              message:
+                `--parallelism phải là số nguyên từ ${MIN_PARALLELISM} đến ` +
+                `${MAX_PARALLELISM} (nhận: ${p}).`,
+            }),
+          );
+        }
+        if (!all) {
+          // The bound only shapes multi-issue runs — a lone --issue run (or a
+          // non-interactive run without --all) has nothing to parallelize.
+          return yield* Effect.fail(
+            new InitError({
+              message:
+                "`--parallelism` chỉ áp dụng khi chạy nhiều issue — " +
+                "dùng cùng `--all` (hoặc chọn chế độ song song trong picker tương tác).",
+            }),
+          );
+        }
+      }
+
+      // Resolve the run scope: flags win; an interactive TTY gets the
+      // scope picker; non-interactive without flags falls through to the
+      // single-issue path, which reports the missing selection itself.
+      let scope: RunScope;
+      if (issue._tag === "Some") {
+        scope = { kind: "issue", issueNumber: issue.value };
+      } else if (all) {
+        scope = {
+          kind: "all",
+          parallelism:
+            parallelism._tag === "Some" ? parallelism.value : undefined,
+        };
+      } else if (isInteractive) {
+        const pickedScope = yield* Effect.promise(() =>
+          clack.select<"one" | "seq" | "par">({
+            message: "Sandcastle chạy phạm vi nào?",
+            options: [
+              {
+                value: "one" as const,
+                label: "Một issue",
+                hint: "chọn một issue đang mở",
+              },
+              {
+                value: "seq" as const,
+                label: "Tất cả issue đủ điều kiện — tuần tự",
+                hint: "mỗi lần một issue, theo số issue tăng dần",
+              },
+              {
+                value: "par" as const,
+                label: "Tất cả issue đủ điều kiện — song song",
+                hint: `tối đa theo parallelism đã cấu hình (${MIN_PARALLELISM}-${MAX_PARALLELISM})`,
+              },
+            ],
+          }),
+        );
+        if (clack.isCancel(pickedScope)) {
+          return yield* Effect.fail(
+            new InitError({ message: "Đã hủy — chưa chọn phạm vi nào." }),
+          );
+        }
+        scope =
+          pickedScope === "one"
+            ? { kind: "issue" }
+            : pickedScope === "seq"
+              ? { kind: "all", parallelism: MIN_PARALLELISM }
+              : {
+                  kind: "all",
+                  parallelism:
+                    parallelism._tag === "Some" ? parallelism.value : undefined,
+                };
+      } else {
+        scope = { kind: "issue" };
+      }
+
+      if (scope.kind === "all") {
+        const result = yield* Effect.tryPromise({
+          try: () =>
+            runIssueQueueWorkflow({
+              cwd,
+              parallelism: scope.parallelism,
+              onStatus: (message, severity) => {
+                Effect.runSync(d.status(message, severity));
+              },
+            }),
+          catch: (e) =>
+            new InitError({
+              message: e instanceof Error ? e.message : String(e),
+            }),
+        });
+        switch (result.outcome) {
+          case "landed":
+            yield* d.status(result.message, "success");
+            break;
+          case "no-issues":
+            yield* d.status(result.message, "info");
+            break;
+          case "failed":
+            // Per-issue failure reports were already posted; landed issues
+            // stay landed. Exit non-zero so scripts/CI observe the failures.
+            return yield* Effect.fail(
+              new InitError({ message: result.message }),
+            );
+        }
+        return;
+      }
+
+      yield* runWorkflowAndReport(d, {
+        cwd,
+        issueNumber: scope.issueNumber,
+        // The picker seam is only wired when a TTY exists — without it the
+        // service requires --issue (or reports no eligible issues).
+        ...(isInteractive
+          ? {
+              selectIssue: async (issues: readonly GithubIssue[]) => {
+                const picked = await clack.select<number>({
+                  message: "Chọn issue để Sandcastle thực hiện:",
+                  options: issues.map((i) => ({
+                    value: i.number,
+                    label: `#${i.number} ${i.title}`,
+                  })),
+                });
+                return clack.isCancel(picked) ? undefined : picked;
+              },
+            }
+          : {}),
+        onStatus: (message, severity) => {
+          Effect.runSync(d.status(message, severity));
+        },
+      });
+    }),
 );
 
 /**

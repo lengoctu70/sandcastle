@@ -45,6 +45,8 @@ import {
 import { getAgent, listAgents } from "./InitService.js";
 import {
   loadProjectSettingsAsync,
+  MAX_PARALLELISM,
+  MIN_PARALLELISM,
   updateProjectSettingsAsync,
   type ProjectSettings,
   type VerificationStatus,
@@ -72,6 +74,17 @@ import * as WorktreeManager from "./WorktreeManager.js";
  *   select → implement in a dedicated source worktree → verify →
  *   merge in a separate integration worktree → verify again → land on the
  *   target branch → post a Vietnamese completion report → close the issue.
+ *
+ * `runIssueQueueWorkflow` extends the same pipeline to every eligible issue
+ * at once (#20): it lists the open `Sandcastle`-labeled issues in ascending
+ * issue-number order, then runs each through `runIssueWorkflow` —
+ * sequentially (parallelism 1) or with bounded parallelism (the configured
+ * `parallelism`, 1–4). Concurrent runs share one FIFO lock
+ * ({@link createWorkflowRunLock}) that serializes worktree creation and the
+ * integrate → re-verify → land section, so parallel issues can never prune
+ * each other's half-created worktrees or race the target branch. A failing
+ * issue never aborts the others; the queue ends with a Vietnamese summary of
+ * landed vs failed issues.
  *
  * Ordering guarantees that matter (ADR 0023):
  * - The implementation agent never sees issue-closing instructions — the
@@ -216,6 +229,24 @@ export interface RunIssueWorkflowOptions {
   readonly discoveryExec?: DiscoveryExec;
   /** Per-command timeout for verification steps (default 10 minutes). */
   readonly verificationTimeoutMs?: number;
+  /**
+   * Shared FIFO lock serializing shared-repo git mutations across concurrent
+   * queued runs (#20). A queue run (`runIssueQueueWorkflow`) creates one lock
+   * and hands it to every issue's run; a standalone run leaves it unset and
+   * gets the no-op default. The locked sections are worktree creation
+   * (`pruneStale` inside `createWorktree` could otherwise delete a sibling's
+   * half-created worktree) and the whole integrate → re-verify → land loop
+   * (the target-branch freshness check and ref update must never interleave
+   * with a sibling's landing).
+   */
+  readonly sharedLock?: WorkflowRunLock;
+  /**
+   * Pre-computed preflight (settings + gh ops) — a queue run computes it once
+   * and hands it to every issue's run so the `gh` install/auth/label probes
+   * happen once per queue instead of once per issue (#20). Leave unset for
+   * standalone runs.
+   */
+  readonly preflight?: WorkflowRunPreflight;
 }
 
 // Re-exported so existing `WorkflowRun.js` importers keep working — the
@@ -231,6 +262,56 @@ export class WorkflowRunError extends Error {
     this.name = "WorkflowRunError";
   }
 }
+
+/**
+ * A FIFO async mutex serializing shared-repo git mutations across concurrent
+ * queued issue runs (#20). `fn` sections run one at a time, in the order they
+ * were submitted; `onWait` fires once at submission time when the section
+ * will actually wait behind a sibling — used for a Vietnamese status line so
+ * a queued issue explains its pause instead of sitting silent.
+ */
+export interface WorkflowRunLock {
+  readonly withLock: <A>(
+    fn: () => Promise<A>,
+    onWait?: () => void,
+  ) => Promise<A>;
+}
+
+/**
+ * Create the lock shared by every issue run in one queue. Implemented as a
+ * promise chain: each submitted section chains onto the previous one's
+ * settlement, so sections execute sequentially in submission order and a
+ * rejected section never wedges the queue.
+ */
+export const createWorkflowRunLock = (): WorkflowRunLock => {
+  let tail: Promise<unknown> = Promise.resolve();
+  // Queued-or-running section count — read at submission time to decide
+  // whether the new section will have to wait.
+  let pending = 0;
+  return {
+    withLock: (fn, onWait) => {
+      if (pending > 0) onWait?.();
+      pending++;
+      const result = tail.then(fn);
+      result.then(
+        () => {
+          pending--;
+        },
+        () => {
+          pending--;
+        },
+      );
+      tail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+  };
+};
+
+/** No-op lock for standalone single-issue runs. */
+const NO_LOCK: WorkflowRunLock = { withLock: (fn) => fn() };
 
 // ---------------------------------------------------------------------------
 // Small host helpers
@@ -787,30 +868,39 @@ const persistVerificationStatus = async (
 };
 
 // ---------------------------------------------------------------------------
-// The workflow
+// Shared preflight — settings, gh auth, label (ADR 0026 — fail before work)
 // ---------------------------------------------------------------------------
 
-export const runIssueWorkflow = async (
-  options: RunIssueWorkflowOptions,
-): Promise<WorkflowRunResult> => {
-  const cwd = options.cwd ?? process.cwd();
-  const status = (message: string, severity: Severity = "info") =>
-    options.onStatus?.(message, severity);
+export interface WorkflowRunPreflight {
+  readonly settings: ProjectSettings;
+  readonly gh: GithubIssueOps;
+}
+
+/**
+ * The gate every `sandcastle run` path passes before touching issues:
+ * settings load + issue-tracker check, `gh` install/auth probe, and the
+ * `Sandcastle` label check. Shared by {@link runIssueWorkflow} (one issue)
+ * and {@link runIssueQueueWorkflow} (the `--all` queue) so both fail before
+ * any agent work with identical diagnostics.
+ */
+const workflowRunPreflight = async (options: {
+  readonly cwd: string;
+  readonly ghRunner?: GhRunner;
+  readonly discoveryExec?: DiscoveryExec;
+  readonly onStatus?: (message: string, severity: Severity) => void;
+  /**
+   * `true` when the run resumes a preserved failure (`sandcastle retry`) —
+   * the label check gates *selection*, which a retry never re-runs, so the
+   * probe is skipped (a label removed since the run must not block
+   * continuing the preserved work).
+   */
+  readonly resume?: boolean;
+}): Promise<WorkflowRunPreflight> => {
   const gh: GithubIssueOps = makeGithubIssueOps(
-    cwd,
+    options.cwd,
     options.ghRunner ?? nodeGhRunner,
   );
-  const verificationTimeoutMs =
-    options.verificationTimeoutMs ?? VERIFICATION_TIMEOUT_MS;
-  const verificationConfigured = (): boolean =>
-    settings.verificationCommands.length > 0;
-  // `sandcastle retry` hands in the durable record of a failed run — issue
-  // identity, branches, and worktree come from it and selection never runs.
-  const resume = options.resume;
-
-  // ---- Preflight: settings, gh auth, label (ADR 0026 — fail before work) ---
-
-  const settings = await loadProjectSettingsAsync(cwd);
+  const settings = await loadProjectSettingsAsync(options.cwd);
   if (settings.issueTracker !== "github-issues") {
     throw new WorkflowRunError(
       `\`sandcastle run\` hiện chỉ hỗ trợ issue tracker "github-issues" — ` +
@@ -819,10 +909,11 @@ export const runIssueWorkflow = async (
     );
   }
 
-  status(
-    resume === undefined
-      ? "Đang kiểm tra GitHub CLI (gh) và label…"
-      : "Đang kiểm tra GitHub CLI (gh)…",
+  options.onStatus?.(
+    options.resume === true
+      ? "Đang kiểm tra GitHub CLI (gh)…"
+      : "Đang kiểm tra GitHub CLI (gh) và label…",
+    "info",
   );
   const readiness = await probeGhReadiness(
     options.discoveryExec ?? nodeDiscoveryExec,
@@ -840,7 +931,7 @@ export const runIssueWorkflow = async (
   // The label check gates *selection* — a retry never selects (the record
   // proves the issue was chosen), so a label removed since the run must not
   // block continuing the preserved work.
-  if (resume === undefined) {
+  if (options.resume !== true) {
     let labelExists = false;
     try {
       labelExists = await gh.labelExists();
@@ -856,6 +947,38 @@ export const runIssueWorkflow = async (
       );
     }
   }
+
+  return { settings, gh };
+};
+
+// ---------------------------------------------------------------------------
+// The workflow
+// ---------------------------------------------------------------------------
+
+export const runIssueWorkflow = async (
+  options: RunIssueWorkflowOptions,
+): Promise<WorkflowRunResult> => {
+  const cwd = options.cwd ?? process.cwd();
+  const status = (message: string, severity: Severity = "info") =>
+    options.onStatus?.(message, severity);
+  const verificationTimeoutMs =
+    options.verificationTimeoutMs ?? VERIFICATION_TIMEOUT_MS;
+  const lock = options.sharedLock ?? NO_LOCK;
+  // `sandcastle retry` hands in the durable record of a failed run — issue
+  // identity, branches, and worktree come from it and selection never runs.
+  const resume = options.resume;
+
+  const { settings, gh } =
+    options.preflight ??
+    (await workflowRunPreflight({
+      cwd,
+      ghRunner: options.ghRunner,
+      discoveryExec: options.discoveryExec,
+      onStatus: options.onStatus,
+      resume: resume !== undefined,
+    }));
+  const verificationConfigured = (): boolean =>
+    settings.verificationCommands.length > 0;
 
   // ---- Issue selection — immutable once chosen (ADR 0026) -------------------
 
@@ -932,8 +1055,8 @@ export const runIssueWorkflow = async (
     }
     if (options.selectIssue === undefined) {
       throw new WorkflowRunError(
-        "Chế độ không tương tác cần `--issue <number>` để chọn issue " +
-          "(ví dụ `sandcastle run --issue 5`).",
+        "Chế độ không tương tác cần `--issue <number>` hoặc `--all` để chọn issue " +
+          "(ví dụ `sandcastle run --issue 5`, `sandcastle run --all`).",
       );
     }
     const picked = await options.selectIssue(issues);
@@ -1324,16 +1447,25 @@ export const runIssueWorkflow = async (
   // are the work).
 
   try {
-    wt = await createWorktree({
-      cwd,
-      branchStrategy: {
-        type: "branch",
-        branch: sourceBranch,
-        baseBranch: targetBranch,
-      },
-      // A reused preserved worktree already carries its dependency copies.
-      ...(preservedWorktreeUsable ? {} : { copyToWorktree: ["node_modules"] }),
-    });
+    // Locked: `pruneStale` inside createWorktree removes unmanaged-looking
+    // directories under .sandcastle/worktrees/ — without the lock it could
+    // delete a sibling run's half-created worktree (#20).
+    wt = await lock.withLock(
+      () =>
+        createWorktree({
+          cwd,
+          branchStrategy: {
+            type: "branch",
+            branch: sourceBranch,
+            baseBranch: targetBranch,
+          },
+          // A reused preserved worktree already carries its dependency copies.
+          ...(preservedWorktreeUsable
+            ? {}
+            : { copyToWorktree: ["node_modules"] }),
+        }),
+      () => status("Đang chờ một issue khác khởi tạo worktree…"),
+    );
   } catch (e) {
     return fail(e);
   }
@@ -1472,150 +1604,175 @@ export const runIssueWorkflow = async (
   // verification → freshness check → land. A moved target branch discards the
   // integrated state and rebuilds it once; a second movement stops safely
   // instead of force-updating the user's branch.
+  //
+  // The whole section mutates shared-repo state (a new worktree, merges, and
+  // finally the target-branch ref): under a queue run the shared lock
+  // serializes it across concurrent issues so a sibling's landing can never
+  // interleave with the freshness check or ref update, and integration
+  // worktree creation stays serialized with every other worktree
+  // create/prune (#20). Standalone runs see NO_LOCK — identical behavior.
 
   let integrationBaseSha: string | undefined;
   let landedSha: string | undefined;
 
-  for (;;) {
-    phase = "integration";
-    status(
-      `Đang merge \`${sourceBranch}\` vào \`${targetBranch}\` trong worktree tích hợp…`,
-    );
-    try {
-      // Base = the target's CURRENT tip, captured right before the merge — the
-      // freshness check before landing compares against this.
-      integrationBaseSha = await git(
-        ["rev-parse", `refs/heads/${targetBranch}`],
-        cwd,
-      );
-      integrationBranch = WorktreeManager.generateTempBranchName(
-        `issue-${issue.number}-integrate`,
-      );
-      integrationWt = await createWorktree({
-        cwd,
-        branchStrategy: {
-          type: "branch",
-          branch: integrationBranch,
-          baseBranch: targetBranch,
-        },
-      });
-      integrationPath = integrationWt.worktreePath;
-      await runEffect(
-        copyToWorktree(["node_modules"], cwd, integrationPath),
-      ).catch(() => {
-        // Dependency copies are best-effort — verification still runs.
-      });
-      await git(["merge", "--no-edit", sourceBranch], integrationPath);
-    } catch (e) {
-      try {
-        const repaired = await repairMergeConflict(e);
-        if (!repaired) {
-          // Abort any in-progress merge so the worktree is removable; the
-          // active checkout was never touched.
-          if (integrationPath !== undefined) {
-            await gitQuiet(["merge", "--abort"], integrationPath);
+  const integrationFailure = await lock.withLock(
+    async (): Promise<WorkflowRunResult | undefined> => {
+      for (;;) {
+        phase = "integration";
+        status(
+          `Đang merge \`${sourceBranch}\` vào \`${targetBranch}\` trong worktree tích hợp…`,
+        );
+        try {
+          // Base = the target's CURRENT tip, captured right before the merge — the
+          // freshness check before landing compares against this.
+          integrationBaseSha = await git(
+            ["rev-parse", `refs/heads/${targetBranch}`],
+            cwd,
+          );
+          integrationBranch = WorktreeManager.generateTempBranchName(
+            `issue-${issue.number}-integrate`,
+          );
+          integrationWt = await createWorktree({
+            cwd,
+            branchStrategy: {
+              type: "branch",
+              branch: integrationBranch,
+              baseBranch: targetBranch,
+            },
+          });
+          integrationPath = integrationWt.worktreePath;
+          await runEffect(
+            copyToWorktree(["node_modules"], cwd, integrationPath),
+          ).catch(() => {
+            // Dependency copies are best-effort — verification still runs.
+          });
+          await git(["merge", "--no-edit", sourceBranch], integrationPath);
+        } catch (e) {
+          try {
+            const repaired = await repairMergeConflict(e);
+            if (!repaired) {
+              // Abort any in-progress merge so the worktree is removable; the
+              // active checkout was never touched.
+              if (integrationPath !== undefined) {
+                await gitQuiet(["merge", "--abort"], integrationPath);
+              }
+              return fail(e);
+            }
+          } catch (repairError) {
+            return fail(repairError);
           }
+        }
+
+        const integPath = integrationPath;
+        const integBranch = integrationBranch;
+        if (integPath === undefined || integBranch === undefined) {
+          return fail(new Error("Không tạo được worktree tích hợp để merge."));
+        }
+
+        // ---- Re-verify the integrated result --------------------------------
+
+        phase = "integration-verification";
+        if (verificationConfigured()) {
+          status("Đang xác minh lại kết quả sau khi merge…");
+          integrationVerification = await runVerificationCommands(
+            settings.verificationCommands,
+            integPath,
+            verificationTimeoutMs,
+          );
+          await persistVerificationStatus(
+            cwd,
+            hasFailedVerification(integrationVerification)
+              ? "failed"
+              : "passed",
+          );
+          const failed = integrationVerification.find(
+            (r) => r.status === "failed",
+          );
+          if (failed !== undefined) {
+            return fail(
+              new Error(
+                `Lệnh xác minh thất bại sau khi merge: \`${failed.command}\` ` +
+                  `(exit ${failed.exitCode ?? "?"})\n${failed.outputTail}`,
+              ),
+            );
+          }
+        }
+
+        // ---- Landing — freshness check, then a non-conflicting update -------
+
+        phase = "landing";
+        status(`Đang cập nhật nhánh \`${targetBranch}\`…`);
+        try {
+          const integrationHead = await git(["rev-parse", "HEAD"], integPath);
+          const currentTargetSha = await git(
+            ["rev-parse", `refs/heads/${targetBranch}`],
+            cwd,
+          );
+          if (currentTargetSha !== integrationBaseSha) {
+            // The target moved while we integrated. Rebuild the integration state
+            // on the new tip once (ADR 0024); if it moved again, stop safely —
+            // the user's branch is never force-updated.
+            if (attempts.integrationRebuild < MAX_TARGET_REBUILD_ATTEMPTS) {
+              attempts.integrationRebuild++;
+              status(
+                `Nhánh \`${targetBranch}\` đã di chuyển ` +
+                  `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(currentTargetSha)}) — ` +
+                  `đang dựng lại worktree tích hợp trên đầu nhánh mới ` +
+                  `(lần ${attempts.integrationRebuild}/${MAX_TARGET_REBUILD_ATTEMPTS})…`,
+                "warn",
+              );
+              await cleanupIntegration();
+              continue;
+            }
+            return fail(
+              new Error(
+                `Nhánh \`${targetBranch}\` đã di chuyển trong khi Sandcastle đang chạy ` +
+                  `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(currentTargetSha)}) — ` +
+                  "dừng an toàn, không ghi đè công việc mới.",
+              ),
+            );
+          }
+          const headBranch = await git(
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd,
+          );
+          if (headBranch === targetBranch) {
+            // Target is the active checkout — a fast-forward merge can never
+            // conflict and never leaves the checkout mid-merge.
+            await git(["merge", "--ff-only", integBranch], cwd);
+          } else {
+            // Target isn't checked out here — move it atomically. update-ref with
+            // the expected old value is a compare-and-swap: it refuses when the
+            // branch moved after our check, and also when the branch is checked
+            // out in another worktree.
+            await git(
+              [
+                "update-ref",
+                `refs/heads/${targetBranch}`,
+                integrationHead,
+                currentTargetSha,
+              ],
+              cwd,
+            );
+          }
+          landedSha = await git(
+            ["rev-parse", `refs/heads/${targetBranch}`],
+            cwd,
+          );
+          return undefined;
+        } catch (e) {
           return fail(e);
         }
-      } catch (repairError) {
-        return fail(repairError);
       }
-    }
-
-    const integPath = integrationPath;
-    const integBranch = integrationBranch;
-    if (integPath === undefined || integBranch === undefined) {
-      return fail(new Error("Không tạo được worktree tích hợp để merge."));
-    }
-
-    // ---- Re-verify the integrated result ------------------------------------
-
-    phase = "integration-verification";
-    if (verificationConfigured()) {
-      status("Đang xác minh lại kết quả sau khi merge…");
-      integrationVerification = await runVerificationCommands(
-        settings.verificationCommands,
-        integPath,
-        verificationTimeoutMs,
-      );
-      await persistVerificationStatus(
-        cwd,
-        hasFailedVerification(integrationVerification) ? "failed" : "passed",
-      );
-      const failed = integrationVerification.find((r) => r.status === "failed");
-      if (failed !== undefined) {
-        return fail(
-          new Error(
-            `Lệnh xác minh thất bại sau khi merge: \`${failed.command}\` ` +
-              `(exit ${failed.exitCode ?? "?"})\n${failed.outputTail}`,
-          ),
-        );
-      }
-    }
-
-    // ---- Landing — freshness check, then a non-conflicting update -----------
-
-    phase = "landing";
-    status(`Đang cập nhật nhánh \`${targetBranch}\`…`);
-    try {
-      const integrationHead = await git(["rev-parse", "HEAD"], integPath);
-      const currentTargetSha = await git(
-        ["rev-parse", `refs/heads/${targetBranch}`],
-        cwd,
-      );
-      if (currentTargetSha !== integrationBaseSha) {
-        // The target moved while we integrated. Rebuild the integration state
-        // on the new tip once (ADR 0024); if it moved again, stop safely —
-        // the user's branch is never force-updated.
-        if (attempts.integrationRebuild < MAX_TARGET_REBUILD_ATTEMPTS) {
-          attempts.integrationRebuild++;
-          status(
-            `Nhánh \`${targetBranch}\` đã di chuyển ` +
-              `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(currentTargetSha)}) — ` +
-              `đang dựng lại worktree tích hợp trên đầu nhánh mới ` +
-              `(lần ${attempts.integrationRebuild}/${MAX_TARGET_REBUILD_ATTEMPTS})…`,
-            "warn",
-          );
-          await cleanupIntegration();
-          continue;
-        }
-        return fail(
-          new Error(
-            `Nhánh \`${targetBranch}\` đã di chuyển trong khi Sandcastle đang chạy ` +
-              `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(currentTargetSha)}) — ` +
-              "dừng an toàn, không ghi đè công việc mới.",
-          ),
-        );
-      }
-      const headBranch = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
-      if (headBranch === targetBranch) {
-        // Target is the active checkout — a fast-forward merge can never
-        // conflict and never leaves the checkout mid-merge.
-        await git(["merge", "--ff-only", integBranch], cwd);
-      } else {
-        // Target isn't checked out here — move it atomically. update-ref with
-        // the expected old value is a compare-and-swap: it refuses when the
-        // branch moved after our check, and also when the branch is checked
-        // out in another worktree.
-        await git(
-          [
-            "update-ref",
-            `refs/heads/${targetBranch}`,
-            integrationHead,
-            currentTargetSha,
-          ],
-          cwd,
-        );
-      }
-      landedSha = await git(["rev-parse", `refs/heads/${targetBranch}`], cwd);
-      break;
-    } catch (e) {
-      return fail(e);
-    }
-  }
+    },
+    () =>
+      status(`Đang chờ một issue khác hoàn tất merge vào \`${targetBranch}\`…`),
+  );
+  if (integrationFailure !== undefined) return integrationFailure;
 
   if (landedSha === undefined) {
-    // Unreachable — the loop only exits via break after a successful landing.
+    // Unreachable — the locked section only resolves undefined after a
+    // successful landing.
     return fail(new Error("Landing kết thúc mà không cập nhật nhánh đích."));
   }
   const landedTargetSha: string = landedSha;
@@ -1745,6 +1902,226 @@ export const runIssueWorkflow = async (
     logFilePath: lastLogFilePath,
     sessionId: lastSessionId,
     attempts,
+    message,
+  };
+};
+
+// ---------------------------------------------------------------------------
+// Queue execution (#20) — all eligible issues, sequential or bounded parallel
+// ---------------------------------------------------------------------------
+
+export interface RunIssueQueueOptions {
+  /** Repo root — git and `.sandcastle/` anchor. Defaults to `process.cwd()`. */
+  readonly cwd?: string;
+  /**
+   * Bounded parallelism for this queue (integer 1–4). Defaults to the
+   * configured `settings.parallelism`. `1` is the sequential mode — at most
+   * one issue active at a time; there is no unbounded option (ADR 0025).
+   */
+  readonly parallelism?: number;
+  /** Vietnamese phase/status lines — cli.ts wires this to the Display service. */
+  readonly onStatus?: (message: string, severity: Severity) => void;
+  /** `gh` process boundary (tests substitute a fake executable on PATH). */
+  readonly ghRunner?: GhRunner;
+  /** Discovery-exec boundary used for the `gh` readiness probe. */
+  readonly discoveryExec?: DiscoveryExec;
+  /** Per-command timeout for verification steps (default 10 minutes). */
+  readonly verificationTimeoutMs?: number;
+}
+
+/** Structured result of one queued `sandcastle run --all` invocation. */
+export interface WorkflowQueueResult {
+  /**
+   * `"landed"` — every queued issue landed. `"failed"` — at least one issue
+   * failed (per-issue results carry the details; landed issues still landed
+   * and were closed). `"no-issues"` — the eligible list was empty.
+   */
+  readonly outcome: "landed" | "failed" | "no-issues";
+  /** The concurrency bound actually applied (1–4). */
+  readonly parallelism: number;
+  /** Per-issue results in queue order (issue number ascending). */
+  readonly results: readonly WorkflowRunResult[];
+  /** Vietnamese summary listing landed vs failed issues. */
+  readonly message: string;
+}
+
+/**
+ * Map `fn` over `items` with at most `limit` invocations in flight, worker
+ * style: each worker pulls the next index (atomic in a single-threaded
+ * runtime), so starts happen in input order and results land in input order.
+ * `fn` must settle its own failures — a thrown rejection abandons the
+ * remaining work for that worker only.
+ */
+const mapWithConcurrency = async <A, R>(
+  items: readonly A[],
+  limit: number,
+  fn: (item: A) => Promise<R>,
+): Promise<R[]> => {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index] as A);
+    }
+  };
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+};
+
+/**
+ * Run every open `Sandcastle`-labeled issue through the same single-issue
+ * pipeline as {@link runIssueWorkflow} (`--all` / interactive "all" mode,
+ * #20). The queue is deterministic — issues run in ascending issue-number
+ * order — and bounded: `parallelism` (default `settings.parallelism`, 1–4)
+ * caps how many issues are active at once; `1` is the sequential mode.
+ *
+ * Every issue still gets its own `sandcastle/issue-<N>` branch, worktree,
+ * integration worktree, verification, landing, report, and recovery record —
+ * the per-issue run is the full `runIssueWorkflow`, so the guarantees are
+ * identical to a single run. Concurrent runs share one
+ * {@link createWorkflowRunLock}: worktree creation and the whole
+ * integrate → re-verify → land section are serialized, which is also what
+ * protects the common target branch from merge races.
+ *
+ * A failing issue never aborts the others: in-flight issues finish and the
+ * queue continues, then the Vietnamese summary names landed vs failed
+ * issues. The outcome is `"failed"` when at least one issue failed, so the
+ * CLI can exit non-zero while landed issues stay landed.
+ */
+export const runIssueQueueWorkflow = async (
+  options: RunIssueQueueOptions,
+): Promise<WorkflowQueueResult> => {
+  const cwd = options.cwd ?? process.cwd();
+  const status = (message: string, severity: Severity = "info") =>
+    options.onStatus?.(message, severity);
+  const { settings, gh } = await workflowRunPreflight({
+    cwd,
+    ghRunner: options.ghRunner,
+    discoveryExec: options.discoveryExec,
+    onStatus: options.onStatus,
+  });
+
+  let issues: GithubIssue[];
+  try {
+    issues = await gh.listEligibleIssues();
+  } catch (e) {
+    throw new WorkflowRunError(
+      `Không lấy được danh sách issue: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+
+  // Deterministic queue order — issue number ascending.
+  const queue = [...issues].sort((a, b) => a.number - b.number);
+  if (queue.length === 0) {
+    return {
+      outcome: "no-issues",
+      parallelism: 1,
+      results: [],
+      message: `Không có issue nào đang mở với label "${SANDCASTLE_LABEL}".`,
+    };
+  }
+
+  const parallelism = options.parallelism ?? settings.parallelism;
+  if (
+    !Number.isInteger(parallelism) ||
+    parallelism < MIN_PARALLELISM ||
+    parallelism > MAX_PARALLELISM
+  ) {
+    throw new WorkflowRunError(
+      `Giới hạn song song không hợp lệ: ${parallelism} — ` +
+        `phải là số nguyên từ ${MIN_PARALLELISM} đến ${MAX_PARALLELISM} ` +
+        "(sửa `parallelism` trong .sandcastle/settings.json hoặc bỏ --parallelism).",
+    );
+  }
+
+  const issueNumbers = queue.map((i) => `#${i.number}`).join(", ");
+  status(
+    parallelism === 1
+      ? `Chạy tuần tự ${queue.length} issue: ${issueNumbers}.`
+      : `Chạy ${queue.length} issue — tối đa ${parallelism} issue song song cùng lúc: ${issueNumbers}.`,
+  );
+
+  const lock = createWorkflowRunLock();
+  const results = await mapWithConcurrency(
+    queue,
+    parallelism,
+    async (issue) => {
+      const issueStatus = (message: string, severity: Severity = "info") =>
+        status(`[#${issue.number}] ${message}`, severity);
+      try {
+        // The per-issue run is the unchanged single-issue pipeline: own branch,
+        // worktree, integration worktree, verification, landing, report, and
+        // recovery state — sharedLock guards the shared-repo sections.
+        const result = await runIssueWorkflow({
+          cwd,
+          issueNumber: issue.number,
+          onStatus: issueStatus,
+          ghRunner: options.ghRunner,
+          discoveryExec: options.discoveryExec,
+          verificationTimeoutMs: options.verificationTimeoutMs,
+          sharedLock: lock,
+          // One preflight per queue — the per-issue run skips its own probes.
+          preflight: { settings, gh },
+        });
+        issueStatus(
+          result.message,
+          result.outcome === "landed" ? "success" : "warn",
+        );
+        return result;
+      } catch (e) {
+        // A pre-pipeline failure (e.g. the issue went stale between listing and
+        // its turn) must not abort the queue — record it as a failed issue.
+        const detail = e instanceof Error ? e.message : String(e);
+        issueStatus(`Thất bại: ${firstLine(detail)}`, "warn");
+        return {
+          outcome: "failed" as const,
+          failurePhase: "preflight" as const,
+          issue,
+          commits: [],
+          verification: [],
+          completionSignalSeen: false,
+          reportPosted: false,
+          issueClosed: false,
+          attempts: {
+            implementation: 0,
+            verificationRepair: 0,
+            mergeConflictRepair: 0,
+            integrationRebuild: 0,
+          },
+          message: `Issue #${issue.number} thất bại: ${firstLine(detail)}`,
+        };
+      }
+    },
+  );
+
+  const landed = results.filter((r) => r.outcome === "landed");
+  const failed = results.filter((r) => r.outcome !== "landed");
+  const targetBranch = results
+    .map((r) => r.targetBranch)
+    .find((b): b is string => b !== undefined);
+  const issueList = (rs: readonly WorkflowRunResult[]): string =>
+    rs.map((r) => `#${r.issue?.number ?? "?"}`).join(", ");
+  const landedTarget =
+    targetBranch !== undefined ? ` vào \`${targetBranch}\`` : "";
+
+  const message =
+    failed.length === 0
+      ? `Hoàn thành tất cả ${landed.length} issue — đã merge${landedTarget}: ${issueList(landed)}.`
+      : landed.length === 0
+        ? `Cả ${failed.length} issue đều thất bại: ${issueList(failed)} — không có thay đổi nào được merge. ` +
+          "Các issue vẫn mở và giữ recovery state để retry."
+        : `Hoàn thành ${landed.length}/${results.length} issue — ` +
+          `đã merge${landedTarget}: ${issueList(landed)}; ` +
+          `thất bại: ${issueList(failed)} (vẫn mở, giữ recovery state để retry).`;
+
+  return {
+    outcome: failed.length === 0 ? "landed" : "failed",
+    parallelism,
+    results,
     message,
   };
 };
