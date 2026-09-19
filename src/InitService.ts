@@ -2,6 +2,11 @@ import { FileSystem } from "@effect/platform";
 import { Effect } from "effect";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makeProjectSettings, saveProjectSettings } from "./ProjectSettings.js";
+import type {
+  ProjectSettingsInitOverrides,
+  SandboxProviderChoice,
+} from "./ProjectSettings.js";
 import { SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 
 const GITIGNORE = `.env
@@ -983,6 +988,14 @@ export interface ScaffoldOptions {
   createLabel?: boolean;
   issueTracker?: IssueTrackerEntry;
   sandboxProvider?: SandboxProviderEntry;
+  /**
+   * Optional extras folded into the initial `.sandcastle/settings.json`
+   * (effort, model discovery state, verification commands, parallelism,
+   * per-role overrides, and a sandbox choice — `"host"` — for when host mode
+   * has no `SandboxProviderEntry` yet). Anything omitted falls back to the
+   * other scaffold options.
+   */
+  settings?: ProjectSettingsInitOverrides;
 }
 
 export interface ScaffoldResult {
@@ -1026,6 +1039,7 @@ export const scaffold = (
       createLabel = true,
       issueTracker = ISSUE_TRACKER_REGISTRY[0]!, // default: github-issues
       sandboxProvider = SANDBOX_PROVIDER_REGISTRY[0]!, // default: docker
+      settings: settingsOverrides,
     } = options;
     const fs = yield* FileSystem.FileSystem;
     const configDir = join(repoDir, ".sandcastle");
@@ -1073,6 +1087,31 @@ export const scaffold = (
         copyTemplateFiles(templateDir, configDir, mainFilename),
       ],
       { concurrency: "unbounded" },
+    );
+
+    // Persist the reloadable project-settings seam so later `run`/`configure`
+    // commands can reload the init choices without re-prompting. Writes only
+    // settings.json — generated prompts and workflow code are untouched.
+    // Parallel workflows default to two active issues, everything else to one
+    // (ADR 0025's bounded parallelism).
+    yield* saveProjectSettings(
+      repoDir,
+      makeProjectSettings({
+        agent: agent.name,
+        model,
+        effort: settingsOverrides?.effort,
+        modelSource: settingsOverrides?.modelSource,
+        workflow: templateName,
+        sandbox:
+          settingsOverrides?.sandbox ??
+          (sandboxProvider.name as SandboxProviderChoice),
+        verificationCommands: settingsOverrides?.verificationCommands,
+        parallelism:
+          settingsOverrides?.parallelism ??
+          (templateName.startsWith("parallel-") ? 2 : 1),
+        roleOverrides: settingsOverrides?.roleOverrides,
+        issueTracker: issueTracker.name,
+      }),
     );
 
     // Rewrite main file with the selected agent factory, model, and sandbox provider

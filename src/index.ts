@@ -98,3 +98,35 @@ export type {
   MergeToHeadBranchStrategy,
   NamedBranchStrategy,
 } from "./SandboxProvider.js";
+// The project-settings seam (`.sandcastle/settings.json`) is Effect-based
+// internally; index.ts re-exports Promise wrappers under the canonical names
+// because Effect types must never reach the published .d.ts surface.
+export {
+  PROJECT_SETTINGS_VERSION,
+  PROJECT_SETTINGS_DIR,
+  PROJECT_SETTINGS_FILENAME,
+  projectSettingsPath,
+  ProjectSettingsNotFoundError,
+  ProjectSettingsMalformedError,
+  ProjectSettingsUnsupportedVersionError,
+  ProjectSettingsValidationError,
+  ProjectSettingsIoError,
+  loadProjectSettingsAsync as loadProjectSettings,
+  saveProjectSettingsAsync as saveProjectSettings,
+  updateProjectSettingsAsync as updateProjectSettings,
+} from "./ProjectSettings.js";
+export type {
+  InitialProjectSettings,
+  ModelSource,
+  ProjectSettings,
+  ProjectSettingsError,
+  ProjectSettingsInitOverrides,
+  ProjectSettingsLoadError,
+  ProjectSettingsSaveError,
+  ProjectSettingsUpdate,
+  RoleOverride,
+  RoleOverrideUpdate,
+  RoleOverrides,
+  SandboxProviderChoice,
+  WorkflowRole,
+} from "./ProjectSettings.js";
