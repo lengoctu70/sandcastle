@@ -88,11 +88,19 @@ describe("discovery registry", () => {
     expect(codex?.loginGuidance).toContain("codex login");
   });
 
+  it("registers the OpenCode adapter", () => {
+    const opencode = getDiscoveryAdapter("opencode");
+    expect(opencode?.executable).toBe("opencode");
+    expect(opencode?.installGuidance).toContain("opencode-ai");
+    expect(opencode?.loginGuidance).toContain("opencode auth login");
+  });
+
   it("returns undefined for agents without an adapter", async () => {
     expect(getDiscoveryAdapter("claude-code")).toBeUndefined();
-    // OpenCode, Claude & friends are later tickets — they resolve to
+    // Claude, Cursor & friends are later tickets — they resolve to
     // `undefined` so init keeps them on the static path for now.
     expect(await discoverAgent("claude-code", READY_EXEC)).toBeUndefined();
+    expect(await discoverAgent("cursor", READY_EXEC)).toBeUndefined();
   });
 
   it("discovers a ready codex through the injected boundary", async () => {

@@ -136,6 +136,7 @@ export type {
 export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
 export { codexDiscoveryAdapter } from "./discovery/codex.js";
 export { piDiscoveryAdapter } from "./discovery/pi.js";
+export { opencodeDiscoveryAdapter } from "./discovery/opencode.js";
 export {
   listDiscoveryAdapters,
   getDiscoveryAdapter,

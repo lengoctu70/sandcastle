@@ -767,7 +767,7 @@ Select a template during `sandcastle init` when prompted, or re-run init in a fr
 
 Scaffolds the `.sandcastle/` config directory and builds the container image. This is the first command you run in a new repo. You choose a sandbox provider (Host, Docker, or Podman) during init — selecting Podman writes a `Containerfile` instead of `Dockerfile` and uses `sandcastle podman build-image` for the build step. Selecting **Host** runs the agent directly on your machine via `noSandbox()` — it reuses your agent CLI's existing login (no API key to copy), writes no Dockerfile/Containerfile, builds no image, and pins `branchStrategy: { type: "merge-to-head" }` so the agent works in a separate git worktree. In the parallel planner templates every concurrent implementer instead gets its own explicit `{ type: "branch" }` branch and host worktree, with review sharing the implementation's worktree and no container-only setup generated. A worktree is **not** OS isolation — the agent keeps your user privileges, so choose Docker or Podman when you need a real security boundary.
 
-In host mode, init also _discovers_ agents that support it (currently Codex and Pi): it verifies the executable on `PATH` is the real CLI, checks you're logged in, and reads the live model catalog so you pick a model and reasoning effort that actually exist — the choice is persisted to `settings.json` and generated into `main.mts`. If discovery fails, init tells you what to fix (install or log in) instead of guessing.
+In host mode, init also _discovers_ agents that support it (currently Codex, Pi, and OpenCode): it verifies the executable on `PATH` is the real CLI, checks you're logged in, and reads the live model catalog so you pick a model and reasoning effort that actually exist — the choice is persisted to `settings.json` and generated into `main.mts`. Pi models are grouped by model provider and pick a thinking level; for OpenCode, models are grouped by provider (`opencode`, `opencode-go`, `openai`, …) and each model's reasoning effort is its catalog variant (`opencode run --variant`). If discovery fails, init tells you what to fix (install or log in) instead of guessing.
 
 Init detects your host package manager (npm, pnpm, yarn, or bun) from a `packageManager` field or lockfile, defaulting to npm. Templates whose `main` file imports a host dependency — the planner templates import [Zod](https://zod.dev) for their `<plan>` output schema — prompt you to install it with that package manager when it isn't already in your `package.json`, so the first `npx tsx .sandcastle/main.ts` doesn't fail with `ERR_MODULE_NOT_FOUND`.
 
@@ -994,11 +994,11 @@ The `pi()` factory accepts an optional second argument for provider-specific opt
 agent: pi("claude-sonnet-4-6", { thinking: "high" });
 ```
 
-| Option            | Type                                                                     | Default | Description                                              |
-| ----------------- | ------------------------------------------------------------------------ | ------- | -------------------------------------------------------- |
+| Option            | Type                                                                                | Default | Description                                              |
+| ----------------- | ----------------------------------------------------------------------------------- | ------- | -------------------------------------------------------- |
 | `thinking`        | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` | —       | Pi reasoning effort level via the `--thinking` flag      |
-| `env`             | `Record<string, string>`                                                 | `{}`    | Environment variables injected by this agent provider    |
-| `captureSessions` | `boolean`                                                                | `true`  | Capture pi session JSONL to host for `pi --session <id>` |
+| `env`             | `Record<string, string>`                                                            | `{}`    | Environment variables injected by this agent provider    |
+| `captureSessions` | `boolean`                                                                           | `true`  | Capture pi session JSONL to host for `pi --session <id>` |
 
 ### Provider `env`
 
