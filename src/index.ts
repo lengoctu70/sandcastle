@@ -134,7 +134,10 @@ export type {
 // model/effort catalog) — Promise-based and Effect-free like the settings
 // seam above. `sandcastle init` uses it to verify host-mode agents.
 export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
+export { claudeCodeDiscoveryAdapter } from "./discovery/claude-code.js";
 export { codexDiscoveryAdapter } from "./discovery/codex.js";
+export { copilotDiscoveryAdapter } from "./discovery/copilot.js";
+export { cursorDiscoveryAdapter } from "./discovery/cursor.js";
 export {
   listDiscoveryAdapters,
   getDiscoveryAdapter,
