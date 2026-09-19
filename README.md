@@ -759,7 +759,7 @@ try {
 | `parallel-planner`             | Plans parallelizable issues, executes on separate branches, then merges   |
 | `parallel-planner-with-review` | Plans parallelizable issues, executes with per-branch review, then merges |
 
-Select a template during `sandcastle init` when prompted, or re-run init in a fresh repo to try a different one.
+Select a template during `sandcastle init` when prompted, or re-run init in a fresh repo to try a different one. When **Host** is the sandbox provider, `simple-loop` and `sequential-reviewer` scaffold host-native mains instead: `noSandbox()` in a git worktree (explicit `merge-to-head` for `simple-loop`; a shared explicit branch for `sequential-reviewer` so implement and review stay in the same worktree), host `node_modules` reuse via `copyToWorktree`, and no container-only install hooks.
 
 ## CLI commands
 
