@@ -186,6 +186,7 @@ const invokeAgent = (
         },
         cwd: sandboxRepoDir,
         stdin: printCmd.stdin,
+        signal,
       });
 
       if (execResult.exitCode !== 0) {
