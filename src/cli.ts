@@ -43,6 +43,7 @@ import {
   INIT_STOPPED_MESSAGE,
 } from "./discoveryPicker.js";
 import { probeGhReadiness, createSandcastleLabel } from "./githubSetup.js";
+import { configureCommand } from "./configure.js";
 import type { ModelSource, VerificationStatus } from "./ProjectSettings.js";
 import { ConfigDirError, InitError } from "./errors.js";
 import { VERSION } from "./version.js";
@@ -1176,7 +1177,12 @@ const rootCommand = Command.make("sandcastle", {}, () =>
 );
 
 export const sandcastle = rootCommand.pipe(
-  Command.withSubcommands([initCommand, dockerCommand, podmanCommand]),
+  Command.withSubcommands([
+    initCommand,
+    configureCommand,
+    dockerCommand,
+    podmanCommand,
+  ]),
 );
 
 export const cli = Command.run(sandcastle, {

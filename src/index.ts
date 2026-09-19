@@ -115,6 +115,7 @@ export {
   PROJECT_SETTINGS_VERSION,
   PROJECT_SETTINGS_DIR,
   PROJECT_SETTINGS_FILENAME,
+  WORKFLOW_ROLES,
   projectSettingsPath,
   ProjectSettingsNotFoundError,
   ProjectSettingsMalformedError,

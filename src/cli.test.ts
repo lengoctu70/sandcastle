@@ -2049,4 +2049,600 @@ if (key === "--version") {
     expect(sandcastleFiles).toContain("settings.json");
     expect(sandcastleFiles).toContain("main.mts");
   });
+
+  // ---------------------------------------------------------------------
+  // `sandcastle configure` (ticket #16): updates `.sandcastle/settings.json`
+  // through updateProjectSettings only — prompts, workflow code, and
+  // package.json stay byte-for-byte identical. vitest workers have no TTY,
+  // so these tests exercise the flag-driven non-interactive path; a bare
+  // `configure` displays the current settings instead of prompting. A
+  // cancelled interactive run can't be simulated without a TTY — the
+  // failed-run tests cover the "prior settings intact" guarantee since the
+  // write only happens after every choice resolves.
+  // ---------------------------------------------------------------------
+  describe("configure", () => {
+    const configure = (args: string, cwd: string, env?: NodeJS.ProcessEnv) =>
+      execAsync(`node ${cliPath} configure ${args}`, {
+        cwd,
+        ...(env !== undefined ? { env } : {}),
+      });
+
+    const settingsFile = (dir: string) =>
+      join(dir, ".sandcastle", "settings.json");
+
+    /** Scaffold a docker+beads project — no shims needed (no host probe, no gh). */
+    const initDockerProject = async (hostDir: string) => {
+      await runCli(
+        "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+        hostDir,
+      );
+    };
+
+    /** Every file under `root`, mapped to its UTF-8 content. */
+    const snapshotTree = async (root: string): Promise<Map<string, string>> => {
+      const files = new Map<string, string>();
+      const walk = async (dir: string) => {
+        for (const entry of await readdir(dir, { withFileTypes: true })) {
+          const p = join(dir, entry.name);
+          if (entry.isDirectory()) await walk(p);
+          else files.set(p, await readFile(p, "utf-8"));
+        }
+      };
+      await walk(root);
+      return files;
+    };
+
+    /**
+     * Assert `after` is `before` plus possibly a changed settings.json — same
+     * file set, every other file byte-identical.
+     */
+    const expectOnlySettingsChanged = (
+      hostDir: string,
+      before: Map<string, string>,
+      after: Map<string, string>,
+    ) => {
+      expect([...after.keys()].sort()).toEqual([...before.keys()].sort());
+      for (const [path, content] of after) {
+        if (path === settingsFile(hostDir)) continue;
+        expect(content, `${path} must be byte-identical`).toBe(
+          before.get(path),
+        );
+      }
+    };
+
+    it("configure --help exposes the flag surface", async () => {
+      const { stdout } = await runCli("configure --help", process.cwd());
+      for (const flag of [
+        "--agent",
+        "--model",
+        "--effort",
+        "--clear-effort",
+        "--allow-unverified",
+        "--verification-commands",
+        "--skip-verification",
+        "--parallelism",
+        "--set-role",
+        "--clear-role",
+      ]) {
+        expect(stdout).toContain(flag);
+      }
+    });
+
+    it("configure errors when settings.json is missing", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+
+      try {
+        await configure("", hostDir);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain(
+          "Không tìm thấy tệp cấu hình Sandcastle",
+        );
+      }
+    });
+
+    it("configure errors on malformed settings.json", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      await writeFile(settingsFile(hostDir), "not json{");
+
+      try {
+        await configure("", hostDir);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("không hợp lệ");
+      }
+    });
+
+    it("configure errors on an unsupported settings version", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      const raw = JSON.parse(
+        await readFile(settingsFile(hostDir), "utf-8"),
+      ) as Record<string, unknown>;
+      raw["version"] = 2;
+      await writeFile(settingsFile(hostDir), JSON.stringify(raw, null, 2));
+
+      try {
+        await configure("", hostDir);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("không được hỗ trợ");
+      }
+    });
+
+    it("configure with no flags prints current settings and changes nothing (non-interactive)", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      const before = await readFile(settingsFile(hostDir), "utf-8");
+
+      const { stdout } = await configure("", hostDir);
+      // The current settings are displayed…
+      expect(stdout).toContain("Cấu hình Sandcastle hiện tại");
+      expect(stdout).toContain("claude-code");
+      expect(stdout).toContain("claude-opus-4-8");
+      // …and nothing was written.
+      expect(await readFile(settingsFile(hostDir), "utf-8")).toBe(before);
+    });
+
+    it("configure --parallelism/--verification-commands update settings while every other file stays byte-identical", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await writeFile(
+        join(hostDir, "package.json"),
+        JSON.stringify({
+          name: "cfg-fixture",
+          scripts: { test: "vitest", typecheck: "tsc --noEmit" },
+        }),
+      );
+      await initDockerProject(hostDir);
+      // Customize the scaffold the way a user would — these edits must survive.
+      await writeFile(
+        join(hostDir, ".sandcastle", "prompt.md"),
+        (await readFile(join(hostDir, ".sandcastle", "prompt.md"), "utf-8")) +
+          "\nCUSTOM USER EDITS — do not erase\n",
+      );
+      await writeFile(
+        join(hostDir, ".sandcastle", "main.mts"),
+        (await readFile(join(hostDir, ".sandcastle", "main.mts"), "utf-8")) +
+          "\n// user customization\n",
+      );
+      await writeFile(join(hostDir, ".sandcastle", "NOTES.md"), "user notes\n");
+      const pkgBefore = await readFile(join(hostDir, "package.json"), "utf-8");
+      const treeBefore = await snapshotTree(join(hostDir, ".sandcastle"));
+
+      await configure(
+        '--parallelism 3 --verification-commands "npm test, make check"',
+        hostDir,
+      );
+
+      const settings = await readSettings(hostDir);
+      expect(settings["parallelism"]).toBe(3);
+      expect(settings["verificationCommands"]).toEqual([
+        "npm test",
+        "make check",
+      ]);
+      // A rewritten command list clears the stale status back to
+      // "configured, not yet run" — the key is absent.
+      expect("verificationStatus" in settings).toBe(false);
+      // package.json (with its init-added sandcastle script) is untouched.
+      expect(await readFile(join(hostDir, "package.json"), "utf-8")).toBe(
+        pkgBefore,
+      );
+      const treeAfter = await snapshotTree(join(hostDir, ".sandcastle"));
+      // settings.json may differ — everything else must be identical.
+      expectOnlySettingsChanged(hostDir, treeBefore, treeAfter);
+    });
+
+    it.each([0, 5, 99])(
+      "configure --parallelism %i fails and leaves settings intact",
+      async (n) => {
+        const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+        await initRepo(hostDir);
+        await initDockerProject(hostDir);
+        const before = await readFile(settingsFile(hostDir), "utf-8");
+
+        try {
+          await configure(`--parallelism ${n}`, hostDir);
+          expect.fail("Expected command to fail");
+        } catch (err: unknown) {
+          const { stdout, stderr } = err as {
+            stdout: string;
+            stderr: string;
+          };
+          expect(stdout + stderr).toContain("--parallelism");
+          expect(stdout + stderr).toContain("1");
+          expect(stdout + stderr).toContain("4");
+        }
+        expect(await readFile(settingsFile(hostDir), "utf-8")).toBe(before);
+      },
+    );
+
+    it("configure --set-role/--clear-role manage per-role overrides and restore inheritance", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+
+      await configure(
+        "--set-role planner.model=gpt-5.4-mini --set-role planner.effort=low --set-role merger.agent=codex",
+        hostDir,
+      );
+      let settings = await readSettings(hostDir);
+      expect(settings["roleOverrides"]).toEqual({
+        planner: { model: "gpt-5.4-mini", effort: "low" },
+        merger: { agent: "codex" },
+      });
+
+      // Clearing one role drops just that override; the other survives.
+      await configure("--clear-role planner", hostDir);
+      settings = await readSettings(hostDir);
+      expect(settings["roleOverrides"]).toEqual({
+        merger: { agent: "codex" },
+      });
+
+      // Clearing the last override removes the roleOverrides key entirely —
+      // every role inherits the shared defaults again.
+      await configure("--clear-role merger", hostDir);
+      settings = await readSettings(hostDir);
+      expect("roleOverrides" in settings).toBe(false);
+    });
+
+    it("configure --set-role rejects malformed entries with clear errors", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      const before = await readFile(settingsFile(hostDir), "utf-8");
+
+      const cases: [string, string][] = [
+        ["--set-role planner.model", "expects"],
+        ["--set-role bogus.model=x", 'unknown role "bogus"'],
+        ["--set-role planner.bogus=x", 'unknown field "bogus"'],
+        ["--set-role planner.model=", "empty value"],
+        ["--set-role planner.agent=nonexistent", 'unknown agent "nonexistent"'],
+      ];
+      for (const [args, needle] of cases) {
+        try {
+          await configure(args, hostDir);
+          expect.fail(`Expected "${args}" to fail`);
+        } catch (err: unknown) {
+          const { stdout, stderr } = err as {
+            stdout: string;
+            stderr: string;
+          };
+          expect(stdout + stderr).toContain(needle);
+        }
+        expect(await readFile(settingsFile(hostDir), "utf-8")).toBe(before);
+      }
+    });
+
+    it("configure fails when --set-role and --clear-role target the same role", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+
+      try {
+        await configure(
+          "--set-role planner.model=x --clear-role planner",
+          hostDir,
+        );
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("cannot both target");
+      }
+    });
+
+    it("configure --verification-commands conflicts with --skip-verification, and an empty list fails", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      const before = await readFile(settingsFile(hostDir), "utf-8");
+
+      try {
+        await configure(
+          '--verification-commands "npm test" --skip-verification',
+          hostDir,
+        );
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("cannot be combined");
+      }
+      try {
+        await configure('--verification-commands ""', hostDir);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("at least one command");
+      }
+      expect(await readFile(settingsFile(hostDir), "utf-8")).toBe(before);
+    });
+
+    it("configure --skip-verification clears commands and records status skipped", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await writeFile(
+        join(hostDir, "package.json"),
+        JSON.stringify({ scripts: { test: "vitest" } }),
+      );
+      await initDockerProject(hostDir);
+      // Init detected `npm test` — configure must be able to turn it off.
+      expect((await readSettings(hostDir))["verificationCommands"]).toEqual([
+        "npm test",
+      ]);
+
+      await configure("--skip-verification", hostDir);
+      const settings = await readSettings(hostDir);
+      expect(settings["verificationCommands"]).toEqual([]);
+      expect(settings["verificationStatus"]).toBe("skipped");
+    });
+
+    it("configure --model/--effort on a container project apply as manual-unverified without touching files", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      const treeBefore = await snapshotTree(join(hostDir, ".sandcastle"));
+
+      await configure("--model claude-sonnet-4-6 --effort high", hostDir);
+      const settings = await readSettings(hostDir);
+      expect(settings).toMatchObject({
+        agent: "claude-code",
+        model: "claude-sonnet-4-6",
+        effort: "high",
+        // No live catalog was consulted on a docker project — honest label.
+        modelSource: "manual-unverified",
+      });
+      const treeAfter = await snapshotTree(join(hostDir, ".sandcastle"));
+      expectOnlySettingsChanged(hostDir, treeBefore, treeAfter);
+    });
+
+    it("configure --agent on a container project swaps to the registry default model", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      // Persist an effort first so the agent swap's reset is observable.
+      await configure("--effort high", hostDir);
+
+      await configure("--agent pi", hostDir);
+      const settings = await readSettings(hostDir);
+      expect(settings).toMatchObject({
+        agent: "pi",
+        // pi's registry default — the old model/effort don't carry over.
+        model: "claude-sonnet-4-6",
+        modelSource: "manual-unverified",
+      });
+      expect(settings["effort"]).toBeUndefined();
+    });
+
+    it("configure --agent on a host project re-discovers model and effort; every other file is unchanged", async () => {
+      if (process.platform === "win32") return; // POSIX shim only
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-agents-"));
+      await writeFakeClaude(shimDir, true);
+      await writeFakeCodex(shimDir, true);
+
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      // A user customization that must survive.
+      await writeFile(
+        join(hostDir, ".sandcastle", "main.mts"),
+        (await readFile(join(hostDir, ".sandcastle", "main.mts"), "utf-8")) +
+          "\n// user customization\n",
+      );
+      const treeBefore = await snapshotTree(join(hostDir, ".sandcastle"));
+
+      await configure("--agent codex", hostDir, {
+        ...process.env,
+        PATH: shimmedPath(shimDir),
+      });
+
+      const settings = await readSettings(hostDir);
+      // The changed agent re-ran live discovery: catalog default + effort.
+      expect(settings).toMatchObject({
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        modelSource: "discovered",
+        sandbox: "host",
+      });
+      const treeAfter = await snapshotTree(join(hostDir, ".sandcastle"));
+      expectOnlySettingsChanged(hostDir, treeBefore, treeAfter);
+      // Explicitly: the generated main still carries the init-time agent —
+      // configure never rewrites workflow code.
+      const main = await readFile(
+        join(hostDir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(main).toContain('claudeCode("claude-opus-4-8")');
+      expect(main).toContain("user customization");
+    });
+
+    it("configure --model/--effort on a host project validate against the live catalog", async () => {
+      if (process.platform === "win32") return;
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+      await writeFakeCodex(shimDir, true);
+      const env = { ...process.env, PATH: shimmedPath(shimDir) };
+
+      await execAsync(
+        `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env },
+      );
+
+      await configure("--model gpt-5.6-terra --effort xhigh", hostDir, env);
+      let settings = await readSettings(hostDir);
+      expect(settings).toMatchObject({
+        agent: "codex",
+        model: "gpt-5.6-terra",
+        effort: "xhigh",
+        modelSource: "discovered",
+      });
+
+      // --effort alone re-validates against the persisted model's catalog —
+      // terra only supports medium/xhigh, so medium is accepted.
+      await configure("--effort medium", hostDir, env);
+      settings = await readSettings(hostDir);
+      expect(settings).toMatchObject({
+        model: "gpt-5.6-terra",
+        effort: "medium",
+        modelSource: "discovered",
+      });
+    });
+
+    it("configure --effort on a host project fails for a catalog-unsupported value", async () => {
+      if (process.platform === "win32") return;
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+      await writeFakeCodex(shimDir, true);
+      const env = { ...process.env, PATH: shimmedPath(shimDir) };
+
+      await execAsync(
+        `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env },
+      );
+      const before = await readFile(settingsFile(hostDir), "utf-8");
+
+      // sol's catalog efforts are low/medium/high/xhigh — "ultra" is rejected.
+      try {
+        await configure("--effort ultra", hostDir, env);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("ultra");
+        expect(stdout + stderr).toContain("không được model");
+      }
+      expect(await readFile(settingsFile(hostDir), "utf-8")).toBe(before);
+    });
+
+    it("configure --agent fails with login guidance and leaves settings intact when discovery fails", async () => {
+      if (process.platform === "win32") return;
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-agents-"));
+      await writeFakeClaude(shimDir, true);
+      await writeFakeCodex(shimDir, false); // unauthenticated
+      const env = { ...process.env, PATH: shimmedPath(shimDir) };
+
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env },
+      );
+      const before = await readFile(settingsFile(hostDir), "utf-8");
+
+      try {
+        await configure("--agent codex", hostDir, env);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("codex login");
+      }
+      // A failed configure writes nothing — prior settings stay intact.
+      expect(await readFile(settingsFile(hostDir), "utf-8")).toBe(before);
+    });
+
+    it("configure --agent --allow-unverified accepts the flag pair when discovery cannot verify", async () => {
+      if (process.platform === "win32") return;
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-agents-"));
+      await writeFakeClaude(shimDir, true);
+      await writeFakeCodex(shimDir, false);
+      const env = { ...process.env, PATH: shimmedPath(shimDir) };
+
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env },
+      );
+
+      await configure(
+        "--agent codex --model custom-model --effort ultra --allow-unverified",
+        hostDir,
+        env,
+      );
+      const settings = await readSettings(hostDir);
+      expect(settings).toMatchObject({
+        agent: "codex",
+        model: "custom-model",
+        effort: "ultra",
+        modelSource: "manual-unverified",
+      });
+    });
+
+    it("configure --clear-effort removes the persisted effort", async () => {
+      if (process.platform === "win32") return;
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+      await writeFakeCodex(shimDir, true);
+      const env = { ...process.env, PATH: shimmedPath(shimDir) };
+
+      await execAsync(
+        `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env },
+      );
+      expect((await readSettings(hostDir))["effort"]).toBe("medium");
+
+      await configure("--clear-effort", hostDir, env);
+      const settings = await readSettings(hostDir);
+      expect("effort" in settings).toBe(false);
+      // The model stays discovered — clearing effort never un-verifies it.
+      expect(settings["modelSource"]).toBe("discovered");
+    });
+
+    it("configure rejects --effort combined with --clear-effort and empty flag values", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      const before = await readFile(settingsFile(hostDir), "utf-8");
+
+      try {
+        await configure("--effort high --clear-effort", hostDir);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("cannot be combined");
+      }
+      try {
+        await configure('--effort ""', hostDir);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("--clear-effort");
+      }
+      expect(await readFile(settingsFile(hostDir), "utf-8")).toBe(before);
+    });
+
+    it("configure --agent nonexistent fails listing available agents", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+
+      try {
+        await configure("--agent nonexistent", hostDir);
+        expect.fail("Expected command to fail");
+      } catch (err: unknown) {
+        const { stdout, stderr } = err as { stdout: string; stderr: string };
+        expect(stdout + stderr).toContain("nonexistent");
+        expect(stdout + stderr).toContain("claude-code");
+      }
+    });
+  });
 });

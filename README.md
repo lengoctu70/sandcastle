@@ -810,6 +810,31 @@ Creates the following files:
 
 Errors if `.sandcastle/` already exists to prevent overwriting customizations.
 
+### `sandcastle configure`
+
+Updates durable project settings in `.sandcastle/settings.json` without re-scaffolding — the command loads the file, displays the current values, and writes only `settings.json` through the same update path init uses, so generated prompts, `main.mts`/`main.ts`, `CODING_STANDARDS.md`, `package.json`, and your other customizations stay byte-for-byte intact. A cancelled or failed run leaves the prior settings in place: nothing is written until every choice resolves.
+
+With no flags on an interactive terminal, a section menu walks through shared agent/model/effort, verification commands, parallelism, and per-role overrides before you confirm the save. Every section also has flags so the whole update can run non-interactively; a bare `configure` on a non-TTY just prints the current settings.
+
+On a `host` sandbox, changing the shared agent/model/effort reuses init's live discovery — switching agents re-probes the executable for its real model catalog, and `--model`/`--effort` are validated against it (`modelSource: "discovered"`). Docker and Podman projects keep the static registry instead, since probing host CLIs says nothing about what the image installs; values there persist as `manual-unverified`.
+
+Per-role overrides (`planner`, `implementer`, `reviewer`, `merger`) let one role diverge from the shared agent/model/effort — e.g. a cheaper model for the planner. Clearing an override restores inheritance from the shared defaults.
+
+| Option                    | Required | Default         | Description                                                                                                                                                                                 |
+| ------------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--agent`                 | No       | Current setting | Change the shared agent. On a host sandbox its live discovery re-resolves model and effort                                                                                                  |
+| `--model`                 | No       | Current setting | Change the shared model. On a host sandbox it is validated against the agent's live catalog                                                                                                 |
+| `--effort`                | No       | Current setting | Change the shared reasoning effort (e.g. `low`, `medium`, `high`). Cannot be combined with `--clear-effort`                                                                                 |
+| `--clear-effort`          | No       | `false`         | Remove the configured shared effort                                                                                                                                                         |
+| `--allow-unverified`      | No       | `false`         | Host sandbox: accept `--model`/`--effort` without live-catalog verification (persisted as `manual-unverified`). Without it, discovery failures exit non-zero                                |
+| `--verification-commands` | No       | Current list    | Replace the ordered verification commands (comma-separated, e.g. `"npm run typecheck,npm test"`); clears `verificationStatus`. Cannot be combined with `--skip-verification`                |
+| `--skip-verification`     | No       | `false`         | Clear the verification commands and record `verificationStatus: "skipped"`                                                                                                                  |
+| `--parallelism`           | No       | Current setting | Bounded parallelism for parallel workflows (integer `1`–`4`)                                                                                                                                |
+| `--set-role`              | No       | —               | Per-role override entry `"role.field=value"` (role: `planner`/`implementer`/`reviewer`/`merger`; field: `agent`/`model`/`effort`). Repeatable, e.g. `--set-role planner.model=gpt-5.4-mini` |
+| `--clear-role`            | No       | —               | Remove a role's override so it inherits the shared defaults (`planner`/`implementer`/`reviewer`/`merger`). Repeatable                                                                       |
+
+Fails with a clear error when `settings.json` is missing or malformed — run `sandcastle init` first.
+
 ### `sandcastle docker build-image`
 
 Rebuilds the Docker image from an existing `.sandcastle/` directory. Use this after modifying the Dockerfile. On Linux/macOS, the build automatically passes `--build-arg AGENT_UID=$(id -u)` and `AGENT_GID=$(id -g)` so the image's `agent` user matches the host UID — this prevents permission errors on image-built files without runtime chown.
