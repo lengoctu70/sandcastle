@@ -36,11 +36,15 @@ export type { AgentStreamEvent } from "./AgentStreamEmitter.js";
 export {
   transferClaudeSession,
   transferCodexSession,
+  transferGrokSessionFile,
   encodeProjectPath,
+  encodeGrokSessionDir,
   claudeHostSessionPath,
   claudeSandboxSessionPath,
+  grokSessionDirPath,
   findClaudeSessionOnHost,
   findCodexSessionOnHost,
+  findGrokSessionOnHost,
 } from "./SessionStore.js";
 export type { HostSessionLookup } from "./SessionStore.js";
 export type { SandboxHooks } from "./SandboxLifecycle.js";
@@ -60,6 +64,9 @@ export {
   opencode,
   pi,
 } from "./AgentProvider.js";
+export { devin } from "./agents/devin.js";
+export type { DevinOptions } from "./agents/devin.js";
+export { grok } from "./agents/grok.js";
 export type {
   AgentProvider,
   AgentCommandOptions,
@@ -71,6 +78,9 @@ export type {
   OpenCodeOptions,
   PiOptions,
 } from "./AgentProvider.js";
+export type { GrokOptions } from "./agents/grok.js";
+export { antigravity } from "./agents/antigravity.js";
+export type { AntigravityOptions } from "./agents/antigravity.js";
 export {
   createBindMountSandboxProvider,
   createIsolatedSandboxProvider,
@@ -98,3 +108,66 @@ export type {
   MergeToHeadBranchStrategy,
   NamedBranchStrategy,
 } from "./SandboxProvider.js";
+// The project-settings seam (`.sandcastle/settings.json`) is Effect-based
+// internally; index.ts re-exports Promise wrappers under the canonical names
+// because Effect types must never reach the published .d.ts surface.
+export {
+  PROJECT_SETTINGS_VERSION,
+  PROJECT_SETTINGS_DIR,
+  PROJECT_SETTINGS_FILENAME,
+  WORKFLOW_ROLES,
+  projectSettingsPath,
+  ProjectSettingsNotFoundError,
+  ProjectSettingsMalformedError,
+  ProjectSettingsUnsupportedVersionError,
+  ProjectSettingsValidationError,
+  ProjectSettingsIoError,
+  loadProjectSettingsAsync as loadProjectSettings,
+  saveProjectSettingsAsync as saveProjectSettings,
+  updateProjectSettingsAsync as updateProjectSettings,
+} from "./ProjectSettings.js";
+export type {
+  InitialProjectSettings,
+  ModelSource,
+  ProjectSettings,
+  ProjectSettingsError,
+  ProjectSettingsInitOverrides,
+  ProjectSettingsLoadError,
+  ProjectSettingsSaveError,
+  ProjectSettingsUpdate,
+  RoleOverride,
+  RoleOverrideUpdate,
+  RoleOverrides,
+  SandboxProviderChoice,
+  WorkflowRole,
+} from "./ProjectSettings.js";
+// The agent-discovery contract (identity fingerprint, auth readiness, live
+// model/effort catalog) — Promise-based and Effect-free like the settings
+// seam above. `sandcastle init` uses it to verify host-mode agents.
+export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
+export { claudeCodeDiscoveryAdapter } from "./discovery/claude-code.js";
+export { codexDiscoveryAdapter } from "./discovery/codex.js";
+export { piDiscoveryAdapter } from "./discovery/pi.js";
+export { opencodeDiscoveryAdapter } from "./discovery/opencode.js";
+export { devinDiscoveryAdapter } from "./discovery/devin.js";
+export { cursorDiscoveryAdapter } from "./discovery/cursor.js";
+export { copilotDiscoveryAdapter } from "./discovery/copilot.js";
+export { grokDiscoveryAdapter } from "./discovery/grok.js";
+export { antigravityDiscoveryAdapter } from "./discovery/antigravity.js";
+export {
+  listDiscoveryAdapters,
+  getDiscoveryAdapter,
+  discoverAgent,
+  discoverAgents,
+} from "./discovery/registry.js";
+export { nodeDiscoveryExec } from "./discovery/nodeExec.js";
+export type {
+  AgentDiscoveryAdapter,
+  AgentDiscoveryReport,
+  DiscoveredEffort,
+  DiscoveredModel,
+  DiscoveryExec,
+  DiscoveryExecOptions,
+  DiscoveryExecResult,
+  DiscoveryState,
+} from "./discovery/contract.js";

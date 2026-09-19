@@ -9,7 +9,7 @@
  */
 
 import { access, readdir } from "node:fs/promises";
-import { join, posix, relative } from "node:path";
+import { join, posix, relative, sep } from "node:path";
 import type { BindMountSandboxHandle } from "./SandboxProvider.js";
 
 // ---------------------------------------------------------------------------
@@ -421,4 +421,186 @@ export const transferPiSession = (
       }
     })
     .join("\n");
+};
+
+// ---------------------------------------------------------------------------
+// Grok session paths and transfer
+// ---------------------------------------------------------------------------
+
+/**
+ * Encode a cwd into Grok's `~/.grok/sessions/<encoded-cwd>/` layout. Grok
+ * percent-encodes the whole path (`/Users/x` → `%2FUsers%2Fx`), matching
+ * `encodeURIComponent` output (verified against grok 1.0.30).
+ */
+export const encodeGrokSessionDir = (cwd: string): string =>
+  encodeURIComponent(cwd);
+
+/** Absolute host path to a Grok session directory for a given (cwd, id). */
+export const grokSessionDirPath = (
+  cwd: string,
+  id: string,
+  sessionsDir?: string,
+): string => {
+  const base =
+    sessionsDir ?? join(process.env.HOME ?? "~", ".grok", "sessions");
+  return join(base, encodeGrokSessionDir(cwd), id);
+};
+
+const grokSessionsRoot = (sessionsDir?: string): string =>
+  sessionsDir ?? join(process.env.HOME ?? "~", ".grok", "sessions");
+
+/**
+ * Locate a Grok session directory on the host by its unique id, scanning each
+ * `<encoded-cwd>/` group under `~/.grok/sessions/`. Grok stores a session as a
+ * directory (`<encoded-cwd>/<id>/summary.json`, `updates.jsonl`, …), so the
+ * located path is the session directory itself.
+ */
+export const findGrokSessionOnHost = async (
+  id: string,
+  sessionsDir?: string,
+): Promise<HostSessionLookup> => {
+  const root = grokSessionsRoot(sessionsDir);
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return { path: undefined, searchedRoot: root };
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = join(root, entry.name, id);
+    if (await pathExists(candidate)) {
+      return { path: candidate, searchedRoot: root };
+    }
+  }
+  return { path: undefined, searchedRoot: root };
+};
+
+/**
+ * List the files inside a host Grok session directory, as session-relative
+ * paths (handles nested subdirectories such as `subagents/`). Lock files are
+ * excluded — they are zero-length advisory locks that must not be copied.
+ * Throws when the directory cannot be read.
+ */
+export const listGrokSessionFilesOnHost = async (
+  sessionDir: string,
+): Promise<string[]> => {
+  const files: string[] = [];
+  const visit = async (dir: string): Promise<void> => {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.endsWith(".lock")) continue;
+      const child = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await visit(child);
+      } else if (entry.isFile()) {
+        // Normalise to POSIX separators — the returned paths are also used to
+        // build sandbox-side destinations on Linux containers.
+        files.push(relative(sessionDir, child).split(sep).join("/"));
+      }
+    }
+  };
+  await visit(sessionDir);
+  return files;
+};
+
+/**
+ * Locate a Grok session directory inside the sandbox by its unique id and
+ * list its files (session-relative, lock files excluded) in one `find` pass.
+ * The session id is globally unique across the encoded-cwd groups, so the
+ * first match wins — the same resolution `grok --resume <id>` applies.
+ */
+export const locateGrokSandboxSession = async (
+  id: string,
+  handle: Pick<BindMountSandboxHandle, "exec">,
+  sessionsDir: string,
+): Promise<{ readonly path: string; readonly files: string[] }> => {
+  const dirResult = await handle.exec(
+    `find ${JSON.stringify(sessionsDir)} -type d -name ${JSON.stringify(id)} -print -quit`,
+  );
+  const dir = dirResult.stdout.trim().split("\n")[0];
+  if (dirResult.exitCode !== 0 || !dir) {
+    throw new Error(`session ${id} not found in ${sessionsDir}`);
+  }
+  const filesResult = await handle.exec(
+    `find ${JSON.stringify(dir)} -type f ! -name ${JSON.stringify("*.lock")}`,
+  );
+  if (filesResult.exitCode !== 0) {
+    throw new Error(`cannot list session files in ${dir}`);
+  }
+  const files = filesResult.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((abs) => posix.relative(dir, abs));
+  return { path: dir, files };
+};
+
+/** cwd-valued keys Grok persists inside session files. */
+const GROK_CWD_KEYS = new Set(["cwd", "git_root_dir", "working_directory"]);
+
+const rewriteGrokCwdFields = (
+  value: unknown,
+  fromCwd: string,
+  toCwd: string,
+): void => {
+  if (Array.isArray(value)) {
+    for (const item of value) rewriteGrokCwdFields(item, fromCwd, toCwd);
+    return;
+  }
+  if (typeof value !== "object" || value === null) return;
+  for (const [key, fieldValue] of Object.entries(value)) {
+    if (GROK_CWD_KEYS.has(key) && typeof fieldValue === "string") {
+      // `git_root_dir` is observed with a trailing slash — compare with a
+      // single trailing slash stripped so both spellings rewrite.
+      const stripped = fieldValue.replace(/[\\/]+$/, "");
+      const fromStripped = fromCwd.replace(/[\\/]+$/, "");
+      if (stripped === fromStripped) {
+        (value as Record<string, unknown>)[key] =
+          fieldValue.endsWith("/") || fieldValue.endsWith("\\")
+            ? `${toCwd}/`
+            : toCwd;
+      }
+    } else {
+      rewriteGrokCwdFields(fieldValue, fromCwd, toCwd);
+    }
+  }
+};
+
+/**
+ * Rewrite one file of a Grok session directory for a host↔sandbox transfer,
+ * replacing cwd references that match `fromCwd` with `toCwd`. Pure function —
+ * no file I/O.
+ *
+ * Known cwd carriers (verified against grok 1.0.30 session dirs):
+ * - `summary.json` → `info.cwd`, `git_root_dir`
+ * - `prompt_context.json` → `working_directory`
+ * - `chat_history.jsonl` → the `Workspace Path: <cwd>` marker inside the
+ *   `user_info` system text — the path the resumed agent believes it is in.
+ *
+ * Every other file (`updates.jsonl`, `events.jsonl`, `signals.json`, …)
+ * transfers verbatim — they carry historical turn data, not the live cwd.
+ */
+export const transferGrokSessionFile = (
+  fileName: string,
+  content: string,
+  fromCwd: string,
+  toCwd: string,
+): string => {
+  if (content === "") return "";
+  if (fileName === "summary.json" || fileName === "prompt_context.json") {
+    try {
+      const doc = JSON.parse(content) as unknown;
+      rewriteGrokCwdFields(doc, fromCwd, toCwd);
+      return JSON.stringify(doc);
+    } catch {
+      return content;
+    }
+  }
+  if (fileName === "chat_history.jsonl") {
+    return content
+      .split(`Workspace Path: ${fromCwd}`)
+      .join(`Workspace Path: ${toCwd}`);
+  }
+  return content;
 };

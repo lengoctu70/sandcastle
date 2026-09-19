@@ -6,6 +6,105 @@
   </picture>
 </div>
 
+## Bắt đầu nhanh
+
+> Hướng dẫn ngắn nhất để cài đặt và chạy Sandcastle — dùng lại tài khoản subscription của agent CLI bạn đã đăng nhập trên máy. Tài liệu tham khảo chi tiết phía dưới (API, sandbox providers, prompts, templates, CLI options) vẫn bằng tiếng Anh.
+
+### Bạn cần có
+
+- [Node.js](https://nodejs.org/) và [Git](https://git-scm.com/).
+- [GitHub CLI (`gh`)](https://cli.github.com/) đã đăng nhập (`gh auth login`) — Sandcastle dùng `gh` để đọc issue, đăng báo cáo và đóng issue.
+- Một agent CLI đã cài và đăng nhập sẵn trên máy — ví dụ Claude Code, Codex, Pi, OpenCode, Devin, Cursor, Copilot, Grok hoặc Antigravity. **Không cần API key**: chế độ host tái sử dụng phiên đăng nhập subscription hiện có của agent.
+- (Không bắt buộc) [Docker](https://www.docker.com/) hoặc [Podman](https://podman.io/) nếu bạn muốn agent chạy trong container thay vì trên host.
+
+### 1. Cài đặt
+
+```bash
+npm i -D @lengoctu70/sandcastle
+```
+
+(Không cần cài cũng được — `npx @lengoctu70/sandcastle init` chạy thẳng từ npm.)
+
+### 2. Khởi tạo trong repo của bạn
+
+```bash
+npx sandcastle init
+```
+
+Init hỏi bạn bằng tiếng Việt (mọi bước đều có flag tương đương cho chế độ non-interactive — xem [`sandcastle init`](#sandcastle-init)):
+
+- **Nơi chạy agent**: `host`, `docker` hoặc `podman`.
+- **Agent + model + effort**: trong chế độ host, init tự khám phá các agent CLI đã cài, kiểm tra đăng nhập, và liệt kê model/effort thật từ chính CLI đó.
+- **Workflow**: chọn theo kết quả bạn muốn — một issue có review (khuyến nghị), nhanh tuần tự, song song, hoặc workflow tùy chỉnh.
+- **Issue tracker**: chọn `github-issues` để Sandcastle làm việc với GitHub Issue.
+- **Lệnh xác minh**: init phát hiện sẵn các lệnh như `npm run typecheck`, `npm test`… để bạn xác nhận hoặc chỉnh sửa.
+
+Khi chọn `github-issues`, init kiểm tra `gh` đã cài và đăng nhập trước khi scaffold, và chỉ tạo label `Sandcastle` trên repo sau khi bạn xác nhận. Init cũng tự thêm script này vào `package.json`:
+
+```json
+"scripts": {
+  "sandcastle": "sandcastle run"
+}
+```
+
+### 3. Chạy
+
+Gắn label `Sandcastle` cho các issue bạn muốn giao cho Sandcastle, rồi:
+
+```bash
+npm run sandcastle
+```
+
+Bạn sẽ được hỏi chọn **một issue** đang mở, chạy **tất cả tuần tự**, hoặc **tất cả song song** (giới hạn `parallelism` 1–4). Trong CI/script không tương tác, dùng `sandcastle run --issue <N>` hoặc `sandcastle run --all`.
+
+### Chế độ host — hiểu rõ trước khi chọn
+
+Chế độ host là đường đi khuyến nghị cho subscription: agent chạy trực tiếp trên máy của bạn trong một **git worktree riêng** (không đụng vào checkout đang mở), tái sử dụng phiên đăng nhập CLI hiện có — không cần cài lại agent hay copy API key vào container.
+
+**Worktree KHÔNG phải cách ly hệ điều hành.** Agent vẫn giữ toàn bộ quyền truy cập tệp và tiến trình của tài khoản bạn. Nếu cần ranh giới bảo mật thực sự, chọn `docker` hoặc `podman` trong init — agent chạy trong container riêng với image do Sandcastle build (`sandcastle docker build-image` / `sandcastle podman build-image`).
+
+Sandcastle cũng **xác minh danh tính** của executable trước khi tin đó là agent bạn chọn: một lệnh trùng tên (ví dụ `agent` trỏ tới sản phẩm khác) bị báo `wrong-product` thay vì bị gọi nhầm.
+
+### Model và effort: khám phá trực tiếp, không đoán
+
+Init đọc catalog model/effort **trực tiếp từ CLI của agent** — không hard-code "model mới nhất". Khi agent có nhiều model provider (Pi, OpenCode, Devin), model được nhóm theo provider; model và effort được khuyến nghị đánh dấu `(khuyến nghị)`.
+
+Nếu discovery thất bại, bạn có 3 lựa chọn an toàn: **thử lại**, **nhập model thủ công** — lựa chọn được lưu là `modelSource: "manual-unverified"` và UI không bao giờ trình bày nó là đã xác minh — hoặc **dừng lại** trước khi scaffold. Đổi sau bằng [`sandcastle configure`](#sandcastle-configure).
+
+### Mỗi lần chạy diễn ra thế nào
+
+Với mỗi issue được chọn, Sandcastle tự làm trọn chuỗi:
+
+1. **Implement** — agent làm việc trên nhánh `sandcastle/issue-<N>` trong worktree riêng; agent **không** nhận được quyền đóng issue.
+2. **Xác minh** — các lệnh xác minh bạn đã xác nhận chạy trong worktree.
+3. **Merge tích hợp** — kết quả merge trong một worktree tích hợp riêng, rồi xác minh lại lần nữa trên cây đã merge.
+4. **Landing** — nhánh đích chỉ được cập nhật sau khi xác minh pass và tip nhánh không bị động.
+5. **Báo cáo + đóng** — Sandcastle đăng báo cáo hoàn thành tiếng Việt lên issue rồi mới `gh issue close`.
+
+### Sửa tự động có giới hạn
+
+- Xác minh thất bại → agent sửa trong cùng worktree, **tối đa 2 lần** (tiếp tục đúng agent session khi agent hỗ trợ resume).
+- Xung đột merge → **tối đa 1 lần** sửa trong worktree tích hợp.
+- Nhánh đích bị động trong lúc merge → dựng lại tích hợp **tối đa 1 lần**; Sandcastle không bao giờ force-update.
+
+### Khi một tác vụ thất bại
+
+Issue vẫn **mở** kèm báo cáo thất bại tiếng Việt; nhánh + worktree + chi tiết lỗi được giữ trong `.sandcastle/recovery/`:
+
+```bash
+sandcastle status      # liệt kê các tác vụ thất bại được giữ lại
+sandcastle retry <N>   # tiếp tục từ đúng bước đã dừng — không chọn lại issue, không implement lại
+sandcastle discard <N> # xóa worktree + nhánh + bản ghi (hỏi xác nhận, hoặc --yes)
+```
+
+### Issue chỉ đóng sau khi code đã nằm trên nhánh đích
+
+`gh issue close` chỉ chạy **sau khi** code của issue đã pass xác minh và được merge — "closed" nghĩa là hoàn thành thật trong repo, không phải "agent nói xong".
+
+---
+
+_Tài liệu tham khảo đầy đủ bên dưới — API, sandbox providers, prompts, templates, CLI options — vẫn bằng tiếng Anh._
+
 ## What Is Sandcastle?
 
 A TypeScript library for orchestrating AI coding agents in isolated sandboxes:
@@ -30,13 +129,13 @@ Sandcastle is provider-agnostic — it ships with built-in providers for Docker,
 1. Install the package:
 
 ```bash
-npm install --save-dev @ai-hero/sandcastle
+npm install --save-dev @lengoctu70/sandcastle
 ```
 
-2. Run `npx @ai-hero/sandcastle init`. This scaffolds a `.sandcastle` directory with all the files needed.
+2. Run `npx @lengoctu70/sandcastle init`. This scaffolds a `.sandcastle` directory with all the files needed.
 
 ```bash
-npx @ai-hero/sandcastle init
+npx @lengoctu70/sandcastle init
 ```
 
 3. Edit `.sandcastle/.env` and fill in your default values for `CLAUDE_CODE_OAUTH_TOKEN` (run `claude setup-token` on your host to get one). To use an Anthropic API key instead, uncomment and fill in `ANTHROPIC_API_KEY`.
@@ -45,16 +144,18 @@ npx @ai-hero/sandcastle init
 cp .sandcastle/.env.example .sandcastle/.env
 ```
 
-4. Run the `.sandcastle/main.ts` (or `main.mts`) file with `npx tsx`
+4. Launch the workflow. Init adds a `"sandcastle": "sandcastle run"` script to your `package.json`, so the normal command is:
 
 ```bash
-npx tsx .sandcastle/main.ts
+npm run sandcastle
 ```
+
+(Advanced: you can also execute the scaffolded file directly with `npx tsx .sandcastle/main.ts` — or `main.mts`.)
 
 ```typescript
 // 3. Run the agent via the JS API
-import { run, claudeCode } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { run, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 await run({
   agent: claudeCode("claude-opus-4-8"),
@@ -67,20 +168,21 @@ await run({
 
 Sandcastle uses a `SandboxProvider` to create isolated environments. The `sandbox` option on `run()`, `interactive()`, and `createSandbox()` accepts any provider, including `noSandbox()` — opt in to running the agent directly on the host when container isolation is undesired. Built-in providers:
 
-| Provider   | Import path                                | Type       | Accepted by                                 |
-| ---------- | ------------------------------------------ | ---------- | ------------------------------------------- |
-| Docker     | `@ai-hero/sandcastle/sandboxes/docker`     | Bind-mount | `run()`, `createSandbox()`, `interactive()` |
-| Podman     | `@ai-hero/sandcastle/sandboxes/podman`     | Bind-mount | `run()`, `createSandbox()`, `interactive()` |
-| Vercel     | `@ai-hero/sandcastle/sandboxes/vercel`     | Isolated   | `run()`, `createSandbox()`, `interactive()` |
-| No-sandbox | `@ai-hero/sandcastle/sandboxes/no-sandbox` | None       | `run()`, `createSandbox()`, `interactive()` |
+| Provider   | Import path                                   | Type       | Accepted by                                 |
+| ---------- | --------------------------------------------- | ---------- | ------------------------------------------- |
+| Docker     | `@lengoctu70/sandcastle/sandboxes/docker`     | Bind-mount | `run()`, `createSandbox()`, `interactive()` |
+| Podman     | `@lengoctu70/sandcastle/sandboxes/podman`     | Bind-mount | `run()`, `createSandbox()`, `interactive()` |
+| Vercel     | `@lengoctu70/sandcastle/sandboxes/vercel`     | Isolated   | `run()`, `createSandbox()`, `interactive()` |
+| No-sandbox | `@lengoctu70/sandcastle/sandboxes/no-sandbox` | None       | `run()`, `createSandbox()`, `interactive()` |
 
 Worktree methods (`wt.run()`, `wt.interactive()`, `wt.createSandbox()`) accept the same providers as their top-level counterparts. `wt.interactive()` defaults to `noSandbox()` when no sandbox is specified.
 
 ```typescript
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
-import { vercel } from "@ai-hero/sandcastle/sandboxes/vercel";
-import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
+import { run, interactive, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
+import { podman } from "@lengoctu70/sandcastle/sandboxes/podman";
+import { vercel } from "@lengoctu70/sandcastle/sandboxes/vercel";
+import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox";
 
 // Docker, Podman, and Vercel are interchangeable in run() and createSandbox():
 await run({
@@ -106,8 +208,8 @@ You can also [create your own provider](#custom-sandbox-providers) using `create
 Sandcastle exports a programmatic `run()` function for use in scripts, CI pipelines, or custom tooling. The examples below use `docker()`, but any `SandboxProvider` works in its place.
 
 ```typescript
-import { run, claudeCode } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { run, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 const result = await run({
   agent: claudeCode("claude-opus-4-8"),
@@ -124,8 +226,11 @@ console.log(result.branch); // target branch name
 ### All options
 
 ```typescript
-import { run, claudeCode } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { run, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
+
+// Stand-in for your observability client used by onAgentStreamEvent below.
+const myLogger = console;
 
 const result = await run({
   // Agent provider — required. Pass a model string to claudeCode().
@@ -267,8 +372,8 @@ Use `run()` instead when you only need a single one-shot invocation — it handl
 #### Basic single-run usage
 
 ```typescript
-import { createSandbox, claudeCode } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { createSandbox, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 await using sandbox = await createSandbox({
   branch: "agent/fix-42",
@@ -286,8 +391,8 @@ console.log(result.commits); // [{ sha: "abc123" }]
 #### Multi-run implement-then-review
 
 ```typescript
-import { createSandbox, claudeCode } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { createSandbox, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 await using sandbox = await createSandbox({
   branch: "agent/fix-42",
@@ -425,7 +530,7 @@ Only `branch` and `merge-to-head` strategies are accepted; `head` is a compile-t
 Pass `cwd` to target a repo other than `process.cwd()`. Relative paths resolve against `process.cwd()`; absolute paths pass through. A `CwdError` is thrown if the path does not exist or is not a directory.
 
 ```typescript
-import { createWorktree } from "@ai-hero/sandcastle";
+import { createWorktree, claudeCode } from "@lengoctu70/sandcastle";
 
 await using wt = await createWorktree({
   branchStrategy: { type: "branch", branch: "agent/fix-42" },
@@ -452,7 +557,7 @@ const result = await wt.run({
 console.log(result.commits); // commits made during the run
 
 // Create a long-lived sandbox from the worktree
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 await using sandbox = await wt.createSandbox({
   sandbox: docker(),
@@ -599,9 +704,12 @@ If any command exits with a non-zero code, the run fails immediately with an err
 Use `{{KEY}}` placeholders in your prompt to inject values from the `promptArgs` option. This is useful for reusing the same prompt file across multiple runs with different parameters.
 
 ```typescript
-import { run } from "@ai-hero/sandcastle";
+import { run, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 await run({
+  agent: claudeCode("claude-opus-4-8"),
+  sandbox: docker(),
   promptFile: "./my-prompt.md",
   promptArgs: { ISSUE_NUMBER: 42, PRIORITY: "high" },
 });
@@ -687,8 +795,8 @@ This is independent of `idleTimeoutSeconds`. They cover different phases: `idleT
 Use `Output.object()` to extract a typed, schema-validated JSON payload from the agent's stdout. The agent emits its answer inside an XML tag you specify, and Sandcastle parses, validates, and returns it on `result.output`. The schema can be any [Standard Schema](https://standardschema.dev) validator — the examples below use [Zod](https://zod.dev), but Valibot, ArkType, and others work identically. See [ADR 0010](docs/adr/0010-structured-output.md) for design rationale.
 
 ```ts
-import { run, Output, claudeCode } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { run, Output, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 import { z } from "zod";
 
 const result = await run({
@@ -712,7 +820,7 @@ console.log(result.output.score); // typed as number
 
 When extraction or validation fails, `run()` throws a `StructuredOutputError`. Alongside `tag`, `rawMatched`, `cause`, `commits`, `branch`, and `preservedWorktreePath`, the error carries the `sessionId` (and `sessionFilePath`, when the session was captured) of the run that produced the bad output.
 
-Pass `maxRetries` to have Sandcastle handle the retry loop for you. Each retry resumes the same agent session and feeds back a token-efficient description of the error, so the agent can re-emit a corrected tag without redoing the work. Retries require an agent provider that supports session resumption (`claudeCode`, `codex`, `pi`) — calling `run()` with `maxRetries > 0` against a non-resumable provider (`cursor`, `opencode`, `copilot`) throws immediately.
+Pass `maxRetries` to have Sandcastle handle the retry loop for you. Each retry resumes the same agent session and feeds back a token-efficient description of the error, so the agent can re-emit a corrected tag without redoing the work. Retries require an agent provider that supports session resumption (`claudeCode`, `codex`, `pi`, `grok`) — calling `run()` with `maxRetries > 0` against a non-resumable provider (`cursor`, `opencode`, `copilot`, `devin`, `antigravity`) throws immediately.
 
 ```ts
 const result = await run({
@@ -730,7 +838,7 @@ const result = await run({
 If you need to drive the retry loop manually — for example, to customise the feedback prompt or rotate models on each attempt — leave `maxRetries` at its default of `0` and resume the failed session yourself:
 
 ```ts
-import { run, Output, StructuredOutputError } from "@ai-hero/sandcastle";
+import { run, Output, StructuredOutputError } from "@lengoctu70/sandcastle";
 
 try {
   return await run({ ...opts, output });
@@ -749,39 +857,54 @@ try {
 
 ### Templates
 
-`sandcastle init` prompts you to choose a sandbox provider (Docker or Podman), an issue tracker (GitHub Issues, Beads, or Custom), and a template, which scaffolds a ready-to-use prompt and `main.mts` suited to a specific workflow. If your project's `package.json` has `"type": "module"`, the file will be named `main.ts` instead. Choosing **Custom** scaffolds the project in a deliberately broken-until-configured state plus a `.sandcastle/SETUP_ISSUE_TRACKER.md` prompt you feed to your coding agent, which wires up your own tracker by editing the scaffolded files in place. Five templates are available:
+`sandcastle init` prompts you to choose a sandbox provider (Host, Docker, or Podman), an issue tracker (GitHub Issues, Beads, or Custom), and a template, which scaffolds a ready-to-use prompt and `main.mts` suited to a specific workflow. If your project's `package.json` has `"type": "module"`, the file will be named `main.ts` instead. Choosing **Custom** scaffolds the project in a deliberately broken-until-configured state plus a `.sandcastle/SETUP_ISSUE_TRACKER.md` prompt you feed to your coding agent, which wires up your own tracker by editing the scaffolded files in place. Five templates are available:
 
 | Template                       | Description                                                               |
 | ------------------------------ | ------------------------------------------------------------------------- |
 | `blank`                        | Bare scaffold — write your own prompt and orchestration                   |
-| `simple-loop`                  | Picks issues one by one and closes them                                   |
+| `simple-loop`                  | Picks issues one by one in a loop                                         |
 | `sequential-reviewer`          | Implements issues one by one, with a code review step after each          |
 | `parallel-planner`             | Plans parallelizable issues, executes on separate branches, then merges   |
 | `parallel-planner-with-review` | Plans parallelizable issues, executes with per-branch review, then merges |
 
-Select a template during `sandcastle init` when prompted, or re-run init in a fresh repo to try a different one.
+Who closes an issue depends on the configured tracker: on GitHub Issues the generated prompts never close or comment — `sandcastle run` reports and closes each issue only after its work is verified and landed — while self-managed trackers (Beads, Custom) keep their agent-side close commands. The parallel templates also bound concurrency: at most `parallelism` issues run at once (1–4, set with `sandcastle configure --parallelism`), and `SANDCASTLE_MAX_PARALLEL` overrides that for a single run.
+
+Select a template during `sandcastle init` when prompted, or re-run init in a fresh repo to try a different one. When **Host** is the sandbox provider, `simple-loop` and `sequential-reviewer` scaffold host-native mains instead: `noSandbox()` in a git worktree (explicit `merge-to-head` for `simple-loop`; a shared explicit branch for `sequential-reviewer` so implement and review stay in the same worktree), host `node_modules` reuse via `copyToWorktree`, and no container-only install hooks.
 
 ## CLI commands
 
 ### `sandcastle init`
 
-Scaffolds the `.sandcastle/` config directory and builds the container image. This is the first command you run in a new repo. You choose a sandbox provider (Docker or Podman) during init — selecting Podman writes a `Containerfile` instead of `Dockerfile` and uses `sandcastle podman build-image` for the build step.
+Scaffolds the `.sandcastle/` config directory and builds the container image. This is the first command you run in a new repo. You choose a sandbox provider (Host, Docker, or Podman) during init — selecting Podman writes a `Containerfile` instead of `Dockerfile` and uses `sandcastle podman build-image` for the build step. Selecting **Host** runs the agent directly on your machine via `noSandbox()` — it reuses your agent CLI's existing login (no API key to copy), writes no Dockerfile/Containerfile, builds no image, and pins `branchStrategy: { type: "merge-to-head" }` so the agent works in a separate git worktree. In the parallel planner templates every concurrent implementer instead gets its own explicit `{ type: "branch" }` branch and host worktree, with review sharing the implementation's worktree and no container-only setup generated. A worktree is **not** OS isolation — the agent keeps your user privileges, so choose Docker or Podman when you need a real security boundary.
+
+In host mode, init also _discovers_ agents that support it (Codex, Pi, OpenCode, Devin, Claude Code, Cursor, Copilot, Grok, and Antigravity): it verifies the executable on `PATH` is the real CLI — a command name alone is never proof, since e.g. `agent` can resolve to a different product than Cursor — checks you're logged in, and reads the live model catalog so you pick a model and reasoning effort that actually exist — the choice is persisted to `settings.json` and generated into `main.mts`. Pi models are grouped by model provider and pick a thinking level; for OpenCode, models are grouped by provider (`opencode`, `opencode-go`, `openai`, …) and each model's reasoning effort is its catalog variant (`opencode run --variant`); for Devin, thinking levels are model variants in the account catalog (`devin models list --format json`), so the effort picker lists exact `model_uid`s like `claude-opus-5-high` and the chosen uid is passed to `--model` unchanged — no separate effort flag exists; for Grok, the probe tries `grok` first, then the `agent` alias xAI installs under the same binary (identity always comes from observed output, so a Cursor `agent` is never claimed as Grok), and `grok models` doubles as the login check and live catalog, with `--reasoning-effort` gating the effort choices (the observed list is advisory — an unlisted value is accepted as unverified rather than rejected, because the CLI never enumerates its valid set); for Antigravity, `agy models` doubles as the sign-in check and live catalog, and the reasoning effort is encoded in the model slug (`gemini-3.8-flash-high` → `--effort high`). Agents whose CLI has no catalog command (Claude Code, Copilot) still get identity and login verification, then keep the `--model` flag or the agent's default model marked as unverified rather than pretending it was checked. Without `--agent`, init probes every registered adapter at once and lists the verified-ready agents first — each hint shows the installed version and live model count — while unavailable agents sit behind an "other agents" choice that shows whether each is missing, not logged in, the wrong executable, or hit a discovery error, along with what to do about it and a recheck option. If the agent you want can't be verified, init offers a retry, an explicit manual entry (persisted as unverified, never presented as discovered), or a safe stop — all before anything is scaffolded. The non-interactive equivalent is `--allow-unverified`: with it, a `--model`/`--effort` pair that couldn't be verified against the live catalog is accepted and marked `manual-unverified`; without it those runs exit non-zero with the same guidance.
 
 Init detects your host package manager (npm, pnpm, yarn, or bun) from a `packageManager` field or lockfile, defaulting to npm. Templates whose `main` file imports a host dependency — the planner templates import [Zod](https://zod.dev) for their `<plan>` output schema — prompt you to install it with that package manager when it isn't already in your `package.json`, so the first `npx tsx .sandcastle/main.ts` doesn't fail with `ERR_MODULE_NOT_FOUND`.
 
+Init also detects candidate verification commands — `package.json` scripts (`typecheck`, `lint`, `test`, `build`, in run order via the detected package manager) plus non-npm markers such as `Cargo.toml`, `go.mod`, Python test configs, and a `Makefile` `test:` target — and lets you confirm, edit, or explicitly skip them. The result is persisted to `settings.json` as `verificationCommands` with an honest `verificationStatus` (`skipped` when declined, `unavailable` when nothing could be detected — a skipped setup is never reported as passed). In non-interactive runs, pass `--verification-commands` with a comma-separated list or `--skip-verification`; without a flag, headless init adopts whatever was detected.
+
+For the GitHub Issues tracker, init verifies the `gh` CLI is installed and authenticated (`gh auth status`) before anything is scaffolded — interactive runs offer a recheck after `gh auth login`, headless runs fail with guidance. Creating the `Sandcastle` label on the repository only happens after explicit confirmation (`--create-label true`), and permission failures are reported with gh's own error line.
+
+Finally, init inserts `"sandcastle": "sandcastle run"` into your `package.json` scripts (creating a minimal `package.json` when none exists) so the normal launch is `npm run sandcastle`. Unrelated scripts are preserved, and an existing `sandcastle` script with different content is never silently overwritten — interactive init asks first, while non-interactive init fails unless `--overwrite-script true|false` decides.
+
 Every interactive prompt has a paired `--flag` so the entire init can run non-interactively (e.g. in CI or a scripted setup). When stdin is not a TTY and a required flag is missing, init fails fast with a clear error rather than wedging on a prompt.
 
-| Option                    | Required | Default                      | Description                                                                                                    |
-| ------------------------- | -------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `--image-name`            | No       | `sandcastle:<repo-dir-name>` | Docker image name                                                                                              |
-| `--agent`                 | No       | Interactive prompt           | Agent to use (`claude-code`, `pi`, `codex`, `cursor`, `opencode`, `copilot`)                                   |
-| `--model`                 | No       | Agent's default model        | Model to use (e.g. `claude-sonnet-4-6`). Defaults to agent's default                                           |
-| `--sandbox`               | No       | Interactive prompt           | Sandbox provider to use (`docker`, `podman`)                                                                   |
-| `--template`              | No       | Interactive prompt           | Template to scaffold (e.g. `blank`, `simple-loop`)                                                             |
-| `--issue-tracker`         | No       | Interactive prompt           | Issue tracker to use (`github-issues`, `beads`, `custom`)                                                      |
-| `--create-label`          | No       | Interactive prompt           | `true` / `false` — whether to create the `Sandcastle` GitHub label (only with `--issue-tracker github-issues`) |
-| `--build-image`           | No       | Interactive prompt           | `true` / `false` — whether to build the sandbox image now (silently ignored with `--issue-tracker custom`)     |
-| `--install-template-deps` | No       | Interactive prompt           | `true` / `false` — whether to install template host deps (e.g. `zod` for the planner templates)                |
+| Option                    | Required | Default                      | Description                                                                                                                                                                              |
+| ------------------------- | -------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--image-name`            | No       | `sandcastle:<repo-dir-name>` | Docker image name                                                                                                                                                                        |
+| `--agent`                 | No       | Interactive prompt           | Agent to use (`claude-code`, `pi`, `codex`, `cursor`, `opencode`, `copilot`, `devin`, `grok`, `antigravity`)                                                                             |
+| `--model`                 | No       | Agent's default model        | Model to use (e.g. `claude-sonnet-4-6`). Defaults to agent's default                                                                                                                     |
+| `--effort`                | No       | Model's default effort       | Reasoning effort (e.g. `low`, `medium`, `high`). With `--sandbox host` and a discoverable agent, validated against the model's live catalog                                              |
+| `--allow-unverified`      | No       | `false`                      | With `--sandbox host`: accept a `--model`/`--effort` pair that live discovery could not verify, persisted as `manual-unverified`. Without it, unverifiable selections fail with guidance |
+| `--sandbox`               | No       | Interactive prompt           | Sandbox provider to use (`host`, `docker`, `podman`)                                                                                                                                     |
+| `--template`              | No       | Interactive prompt           | Template to scaffold (e.g. `blank`, `simple-loop`)                                                                                                                                       |
+| `--issue-tracker`         | No       | Interactive prompt           | Issue tracker to use (`github-issues`, `beads`, `custom`)                                                                                                                                |
+| `--create-label`          | No       | Interactive prompt           | `true` / `false` — whether to create the `Sandcastle` GitHub label (only with `--issue-tracker github-issues`; requires an installed, authenticated `gh`)                                |
+| `--build-image`           | No       | Interactive prompt           | `true` / `false` — whether to build the sandbox image now (silently ignored with `--issue-tracker custom`)                                                                               |
+| `--install-template-deps` | No       | Interactive prompt           | `true` / `false` — whether to install template host deps (e.g. `zod` for the planner templates)                                                                                          |
+| `--verification-commands` | No       | Detected candidates          | Comma-separated verification commands to persist (e.g. `"npm run typecheck,npm test"`); overrides detection. Cannot be combined with `--skip-verification`                               |
+| `--skip-verification`     | No       | `false`                      | Skip verification-command setup — `settings.json` records `verificationStatus: "skipped"`                                                                                                |
+| `--overwrite-script`      | No       | Interactive prompt           | `true` / `false` — resolve a conflicting existing `"sandcastle"` package script: overwrite with `"sandcastle run"` or keep it. Required when a conflict is hit non-interactively         |
 
 Creates the following files:
 
@@ -794,6 +917,71 @@ Creates the following files:
 ```
 
 Errors if `.sandcastle/` already exists to prevent overwriting customizations.
+
+### `sandcastle configure`
+
+Updates durable project settings in `.sandcastle/settings.json` without re-scaffolding — the command loads the file, displays the current values, and writes only `settings.json` through the same update path init uses, so generated prompts, `main.mts`/`main.ts`, `CODING_STANDARDS.md`, `package.json`, and your other customizations stay byte-for-byte intact. A cancelled or failed run leaves the prior settings in place: nothing is written until every choice resolves.
+
+With no flags on an interactive terminal, a section menu walks through shared agent/model/effort, verification commands, parallelism, and per-role overrides before you confirm the save. Every section also has flags so the whole update can run non-interactively; a bare `configure` on a non-TTY just prints the current settings.
+
+On a `host` sandbox, changing the shared agent/model/effort reuses init's live discovery — switching agents re-probes the executable for its real model catalog, and `--model`/`--effort` are validated against it (`modelSource: "discovered"`). Docker and Podman projects keep the static registry instead, since probing host CLIs says nothing about what the image installs; values there persist as `manual-unverified`.
+
+Per-role overrides (`planner`, `implementer`, `reviewer`, `merger`) let one role diverge from the shared agent/model/effort — e.g. a cheaper model for the planner. Clearing an override restores inheritance from the shared defaults.
+
+| Option                    | Required | Default         | Description                                                                                                                                                                                 |
+| ------------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--agent`                 | No       | Current setting | Change the shared agent. On a host sandbox its live discovery re-resolves model and effort                                                                                                  |
+| `--model`                 | No       | Current setting | Change the shared model. On a host sandbox it is validated against the agent's live catalog                                                                                                 |
+| `--effort`                | No       | Current setting | Change the shared reasoning effort (e.g. `low`, `medium`, `high`). Cannot be combined with `--clear-effort`                                                                                 |
+| `--clear-effort`          | No       | `false`         | Remove the configured shared effort                                                                                                                                                         |
+| `--allow-unverified`      | No       | `false`         | Host sandbox: accept `--model`/`--effort` without live-catalog verification (persisted as `manual-unverified`). Without it, discovery failures exit non-zero                                |
+| `--verification-commands` | No       | Current list    | Replace the ordered verification commands (comma-separated, e.g. `"npm run typecheck,npm test"`); clears `verificationStatus`. Cannot be combined with `--skip-verification`                |
+| `--skip-verification`     | No       | `false`         | Clear the verification commands and record `verificationStatus: "skipped"`                                                                                                                  |
+| `--parallelism`           | No       | Current setting | Bounded parallelism for parallel workflows (integer `1`–`4`)                                                                                                                                |
+| `--set-role`              | No       | —               | Per-role override entry `"role.field=value"` (role: `planner`/`implementer`/`reviewer`/`merger`; field: `agent`/`model`/`effort`). Repeatable, e.g. `--set-role planner.model=gpt-5.4-mini` |
+| `--clear-role`            | No       | —               | Remove a role's override so it inherits the shared defaults (`planner`/`implementer`/`reviewer`/`merger`). Repeatable                                                                       |
+
+Fails with a clear error when `settings.json` is missing or malformed — run `sandcastle init` first.
+
+### `sandcastle run`
+
+Runs the full issue workflow for one or all eligible GitHub Issues — the normal entry point after `init` (usually via `npm run sandcastle`). It requires the `github-issues` issue tracker, an installed and authenticated `gh` CLI, and the `Sandcastle` label on the repository — all checked up front, before any agent work.
+
+Interactively, `run` first asks for the scope: **one issue** (you then pick from the open `Sandcastle`-labeled issues), **all eligible issues sequentially**, or **all eligible issues in parallel** bounded by the configured `parallelism`. Non-interactively (CI, scripts), `--issue <number>` selects one issue deterministically and `--all` queues every open `Sandcastle`-labeled issue; without a TTY and without either flag it fails fast. `--all` and `--issue` are mutually exclusive.
+
+For `--all`, issues run in ascending issue-number order and each gets the identical single-issue pipeline below — its own `sandcastle/issue-<number>` branch, worktree, integration worktree, verification, landing, report, and (on failure) recovery record. Sequential is the default (`parallelism` 1); parallel mode caps how many issues are in flight at once — the bound comes from `--parallelism` when given, otherwise the `parallelism` in `settings.json` (integer 1–4, set it with `sandcastle configure --parallelism`). There is no unbounded option. A failing issue never aborts the others: in-flight issues finish, the queue continues, and the run ends with a Vietnamese summary listing which issues landed and which failed (failed issues stay open with their recovery state). Integration and landing are serialized across concurrent issues, so parallel runs can never race the target branch.
+
+For the selected issue, Sandcastle then owns the whole sequence (ADR 0023/0024): the configured agent implements it on a dedicated `sandcastle/issue-<number>` branch in its own worktree — the agent never sees issue-closing instructions — the configured verification commands run in that worktree, the result is merged in a separate integration worktree based on the target branch's current tip, verification runs again on the integrated tree, and the target branch is updated only after integrated verification passes and a freshness check confirms the target hasn't moved (fast-forward when it's your current checkout, atomic compare-and-swap otherwise — never a force-update).
+
+Deterministic failures get bounded automatic repair instead of an immediate stop (ADR 0024): a failed source-stage verification sends the exact failed command and its output back to the agent in the same worktree — resuming the same agent session when the provider supports native resume (Claude Code, Codex, Pi, Grok), otherwise a fresh invocation against the preserved worktree with the task and failure inlined — for at most two repairs, each re-running all verification commands. A merge conflict triggers at most one repair inside the integration worktree itself (the agent resolves the conflicted files and commits the merge there), after which all verification commands re-run on the integrated tree before landing. If the target branch moved while integrating, Sandcastle discards the integration state and rebuilds it on the new tip at most once — it never force-updates a moved branch.
+
+When a repair budget is exhausted (or the failure isn't repairable), the run stops safely: it posts a Vietnamese failure report naming the phase and the attempts spent, keeps the issue open, preserves the source branch and worktree, and writes a machine-local recovery record to `.sandcastle/recovery/issue-<number>.json` (ignored by git) carrying the issue identity, branches, target base SHA, failure phase, attempt counters, verification results, and agent session id. The record survives process exit — `sandcastle status` lists it, `sandcastle retry <issue-number>` continues the preserved work, and `sandcastle discard <issue-number>` removes it after confirmation.
+
+Only after landing does Sandcastle post a Vietnamese completion report (outcome, landed commits and change summary, executed verification, cautions — including how many repairs were needed) and then close the issue. On any pre-landing failure it posts a Vietnamese failure report instead, keeps the issue open, preserves the source branch and worktree under `.sandcastle/` for recovery, and never leaves your active checkout conflicted.
+
+| Option          | Required | Default                        | Description                                                                      |
+| --------------- | -------- | ------------------------------ | -------------------------------------------------------------------------------- |
+| `--issue`       | No       | Interactive run-scope picker   | GitHub issue number to implement — mutually exclusive with `--all`               |
+| `--all`         | No       | `false`                        | Run every open `Sandcastle`-labeled issue (ascending issue-number order)         |
+| `--parallelism` | No       | Configured `parallelism` (1–4) | Cap on how many `--all` issues run at once — `1` is sequential; requires `--all` |
+
+### `sandcastle status`
+
+Lists every preserved failed task — one entry per recovery record under `.sandcastle/recovery/`. Each entry shows the issue, the phase it stopped in, when it failed, how often it was retried, the preserved source branch and worktree (including whether they still exist), the bounded-repair attempts already spent, and the first line of the recorded error. Stale signals are marked explicitly — a missing source branch, a branch with no unmerged commits (possibly landed elsewhere), or a worktree that is gone (a `retry` rebuilds it from the branch). A record Sandcastle cannot parse is reported as corrupt — it is never silently dropped. With nothing preserved, `status` reports there are no failed tasks.
+
+### `sandcastle retry <issue-number>`
+
+Continues one preserved failed task. The recovery record pins the task: `retry` never re-selects an issue, never creates a new implementation branch, and never starts the work over. It re-enters the workflow at the recorded failure phase — re-running verification (with a fresh bounded repair budget), or going straight to the integration/landing sequence when the failure happened there — inside the preserved worktree and on the preserved source branch. When the record carries an agent session id and the provider supports session storage, the next agent invocation resumes that session across the process restart; otherwise a fresh invocation against the preserved code carries the issue identity and failure context.
+
+A successful `retry` runs the normal safe path: verification, integration, freshness-checked landing, the Vietnamese completion report, issue closure, and cleanup of the recovery record, worktree, and branch. A `retry` that fails again rewrites the record with the new failure phase and an incremented retry count. Stale records are diagnosed in Vietnamese instead of being silently used — the issue now closed (work may have landed elsewhere), the target branch gone, or no committed work left to continue — and point at `sandcastle discard` for cleanup.
+
+### `sandcastle discard <issue-number>`
+
+Permanently deletes one preserved failed task: the preserved worktree, the source branch, and the recovery record. It first lists exactly what will be removed. Interactive runs ask for confirmation first; a declined confirmation leaves everything untouched. Non-interactive runs (no TTY) require `--yes`, so scripts can never delete preserved work accidentally. The record is deleted last — if removing a worktree or branch fails, the record survives so the task stays visible in `status`. Missing or corrupt records produce a Vietnamese diagnosis and nothing is removed.
+
+| Option  | Required | Default             | Description                                            |
+| ------- | -------- | ------------------- | ------------------------------------------------------ |
+| `--yes` | No       | Interactive confirm | Confirm the discard — required when stdin is not a TTY |
 
 ### `sandcastle docker build-image`
 
@@ -831,27 +1019,27 @@ Removes the Podman image.
 
 ### `RunOptions`
 
-| Option                     | Type               | Default                       | Description                                                                                                                                                                                                                  |
-| -------------------------- | ------------------ | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `agent`                    | AgentProvider      | —                             | **Required.** Agent provider (e.g. `claudeCode("claude-opus-4-8")`, `pi("claude-sonnet-4-6")`, `codex("gpt-5.4")`, `cursor("composer-2")`, `opencode("opencode/big-pickle")`, `copilot("claude-sonnet-4.5")`)                |
-| `sandbox`                  | SandboxProvider    | —                             | **Required.** Sandbox provider (e.g. `docker()`, `podman()`, `docker({ imageName: "sandcastle:local" })`)                                                                                                                    |
-| `cwd`                      | string             | `process.cwd()`               | Host repo directory — anchor for `.sandcastle/` artifacts and git operations. Relative paths resolve against `process.cwd()`.                                                                                                |
-| `prompt`                   | string             | —                             | Inline prompt (mutually exclusive with `promptFile`)                                                                                                                                                                         |
-| `promptFile`               | string             | —                             | Path to prompt file (mutually exclusive with `prompt`). Resolves against `process.cwd()`, **not** `cwd`.                                                                                                                     |
-| `maxIterations`            | number             | `1`                           | Maximum iterations to run                                                                                                                                                                                                    |
-| `hooks`                    | SandboxHooks       | —                             | Lifecycle hooks (`host.*`, `sandbox.*`)                                                                                                                                                                                      |
-| `name`                     | string             | —                             | Display name for the run, shown as a prefix in log output                                                                                                                                                                    |
-| `promptArgs`               | PromptArgs         | —                             | Key-value map for `{{KEY}}` placeholder substitution                                                                                                                                                                         |
-| `branchStrategy`           | BranchStrategy     | per-provider default          | Branch strategy: `{ type: 'head' }`, `{ type: 'merge-to-head' }`, or `{ type: 'branch', branch: '…' }`                                                                                                                       |
-| `copyToWorktree`           | string[]           | —                             | Host-relative file paths to copy into the sandbox before start (not supported with `branchStrategy: { type: 'head' }`)                                                                                                       |
-| `logging`                  | object             | file (auto-generated)         | `{ type: 'file', path }` or `{ type: 'stdout' }`                                                                                                                                                                             |
-| `completionSignal`         | string \| string[] | `<promise>COMPLETE</promise>` | String or array of strings the agent emits to stop the iteration loop early                                                                                                                                                  |
-| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on each agent output event                                                                                                                                                                  |
-| `completionTimeoutSeconds` | number             | `60`                          | Grace window in seconds after the completion signal is observed but the agent process has not exited (hanging process). See [Hanging processes after the completion signal](#hanging-processes-after-the-completion-signal). |
-| `resumeSession`            | string             | —                             | Resume a prior session by ID for agents that support resume. Incompatible with `maxIterations > 1`. Session file must exist on host.                                                                                         |
-| `signal`                   | AbortSignal        | —                             | Cancel the run when aborted. Kills the in-flight agent subprocess and cancels lifecycle hooks; the worktree is preserved on disk. Rejects with `signal.reason`.                                                              |
-| `timeouts`                 | Timeouts           | —                             | Override default timeouts for built-in lifecycle steps: `copyToWorktreeMs` (60 000), `gitSetupMs` (10 000), `commitCollectionMs` (30 000), `mergeToHostMs` (30 000).                                                         |
-| `output`                   | OutputDefinition   | —                             | Structured output definition (`Output.object(…)` or `Output.string(…)`). Requires `maxIterations === 1`. See [Structured output](#structured-output).                                                                        |
+| Option                     | Type               | Default                       | Description                                                                                                                                                                                                                                                                                         |
+| -------------------------- | ------------------ | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent`                    | AgentProvider      | —                             | **Required.** Agent provider (e.g. `claudeCode("claude-opus-4-8")`, `pi("claude-sonnet-4-6")`, `codex("gpt-5.4")`, `cursor("composer-2")`, `opencode("opencode/big-pickle")`, `copilot("claude-sonnet-4.5")`, `devin("claude-opus-5")`, `grok("grok-4.6")`, `antigravity("gemini-3.8-flash-high")`) |
+| `sandbox`                  | SandboxProvider    | —                             | **Required.** Sandbox provider (e.g. `docker()`, `podman()`, `docker({ imageName: "sandcastle:local" })`)                                                                                                                                                                                           |
+| `cwd`                      | string             | `process.cwd()`               | Host repo directory — anchor for `.sandcastle/` artifacts and git operations. Relative paths resolve against `process.cwd()`.                                                                                                                                                                       |
+| `prompt`                   | string             | —                             | Inline prompt (mutually exclusive with `promptFile`)                                                                                                                                                                                                                                                |
+| `promptFile`               | string             | —                             | Path to prompt file (mutually exclusive with `prompt`). Resolves against `process.cwd()`, **not** `cwd`.                                                                                                                                                                                            |
+| `maxIterations`            | number             | `1`                           | Maximum iterations to run                                                                                                                                                                                                                                                                           |
+| `hooks`                    | SandboxHooks       | —                             | Lifecycle hooks (`host.*`, `sandbox.*`)                                                                                                                                                                                                                                                             |
+| `name`                     | string             | —                             | Display name for the run, shown as a prefix in log output                                                                                                                                                                                                                                           |
+| `promptArgs`               | PromptArgs         | —                             | Key-value map for `{{KEY}}` placeholder substitution                                                                                                                                                                                                                                                |
+| `branchStrategy`           | BranchStrategy     | per-provider default          | Branch strategy: `{ type: 'head' }`, `{ type: 'merge-to-head' }`, or `{ type: 'branch', branch: '…' }`                                                                                                                                                                                              |
+| `copyToWorktree`           | string[]           | —                             | Host-relative file paths to copy into the sandbox before start (not supported with `branchStrategy: { type: 'head' }`)                                                                                                                                                                              |
+| `logging`                  | object             | file (auto-generated)         | `{ type: 'file', path }` or `{ type: 'stdout' }`                                                                                                                                                                                                                                                    |
+| `completionSignal`         | string \| string[] | `<promise>COMPLETE</promise>` | String or array of strings the agent emits to stop the iteration loop early                                                                                                                                                                                                                         |
+| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on each agent output event                                                                                                                                                                                                                                         |
+| `completionTimeoutSeconds` | number             | `60`                          | Grace window in seconds after the completion signal is observed but the agent process has not exited (hanging process). See [Hanging processes after the completion signal](#hanging-processes-after-the-completion-signal).                                                                        |
+| `resumeSession`            | string             | —                             | Resume a prior session by ID for agents that support resume. Incompatible with `maxIterations > 1`. Session file must exist on host.                                                                                                                                                                |
+| `signal`                   | AbortSignal        | —                             | Cancel the run when aborted. Kills the in-flight agent subprocess and cancels lifecycle hooks; the worktree is preserved on disk. Rejects with `signal.reason`.                                                                                                                                     |
+| `timeouts`                 | Timeouts           | —                             | Override default timeouts for built-in lifecycle steps: `copyToWorktreeMs` (60 000), `gitSetupMs` (10 000), `commitCollectionMs` (30 000), `mergeToHostMs` (30 000).                                                                                                                                |
+| `output`                   | OutputDefinition   | —                             | Structured output definition (`Output.object(…)` or `Output.string(…)`). Requires `maxIterations === 1`. See [Structured output](#structured-output).                                                                                                                                               |
 
 ### `RunResult`
 
@@ -884,15 +1072,15 @@ Removes the Podman image.
 
 ### Session capture
 
-After each resumable provider iteration, Sandcastle automatically captures the agent's session file from the sandbox to the host. Claude Code sessions are stored under `~/.claude/projects/<encoded-path>/<session-id>.jsonl`; Codex sessions are stored under `~/.codex/sessions/YYYY/MM/DD/rollout-*-<session-id>.jsonl`; Pi sessions are stored under `~/.pi/agent/sessions/--<encoded-cwd>--/<timestamp>_<session-id>.jsonl`. Any provider-specific `cwd` fields are rewritten to match the host repo root, so the provider's native resume command works.
+After each resumable provider iteration, Sandcastle automatically captures the agent's session file from the sandbox to the host. Claude Code sessions are stored under `~/.claude/projects/<encoded-path>/<session-id>.jsonl`; Codex sessions are stored under `~/.codex/sessions/YYYY/MM/DD/rollout-*-<session-id>.jsonl`; Pi sessions are stored under `~/.pi/agent/sessions/--<encoded-cwd>--/<timestamp>_<session-id>.jsonl`; Grok sessions are directory trees under `~/.grok/sessions/<percent-encoded-cwd>/<session-id>/` (the whole tree is captured, lock files excluded). Any provider-specific `cwd` fields are rewritten to match the host repo root, so the provider's native resume command works.
 
 For Claude Code, any `Agent`-tool or `Workflow`-tool subagent transcripts written under `<session-id>/subagents/agent-*.jsonl` are captured alongside the main session. Subagent capture is best-effort: a failure on an individual transcript logs a warning and lets siblings and the main session through. Main-session capture failure still fails the run (see below).
 
-Session capture is enabled by default for `claudeCode()`, `codex()`, and `pi()` and can be opted out via `captureSessions: false`. Providers without `sessionStorage` do not attempt capture. Capture failure fails the run.
+Session capture is enabled by default for `claudeCode()`, `codex()`, `pi()`, and `grok()` and can be opted out via `captureSessions: false`. Providers without `sessionStorage` do not attempt capture. Capture failure fails the run.
 
 ### Session resume
 
-Pass `resumeSession` to `run()` to continue a prior Claude Code, Codex, or Pi conversation inside a new sandbox:
+Pass `resumeSession` to `run()` to continue a prior Claude Code, Codex, Pi, or Grok conversation inside a new sandbox:
 
 ```typescript
 const result = await run({
@@ -915,9 +1103,9 @@ const first = await run({
 const second = await first.resume?.("Now implement the plan");
 ```
 
-`resume` is present only on results from resumable providers (Claude Code, Codex, Pi) — hence the optional-chaining call.
+`resume` is present only on results from resumable providers (Claude Code, Codex, Pi, Grok) — hence the optional-chaining call.
 
-Before the sandbox starts, Sandcastle validates that the session file exists on the host and transfers it into the sandbox with `cwd` fields rewritten to match the sandbox-side path. Claude Code receives `--resume <id>`; Codex receives `codex exec resume <id>` with the prompt piped over stdin; Pi receives `--session <id>`.
+Before the sandbox starts, Sandcastle validates that the session file exists on the host and transfers it into the sandbox with `cwd` fields rewritten to match the sandbox-side path. Claude Code receives `--resume <id>`; Codex receives `codex exec resume <id>` with the prompt piped over stdin; Pi receives `--session <id>`; Grok receives `--resume <id>` and its session directory tree is transferred (Grok stores sessions as directories under `~/.grok/sessions/`, not single JSONL files).
 
 Constraints:
 
@@ -951,7 +1139,7 @@ const [reviewA, reviewB] = await Promise.all([
 
 **Fork is session-only.** `--fork-session` and `codex exec fork` isolate the agent session JSONL — they do **not** isolate the branch, worktree, or sandbox. Safe concurrent fan-out (`Promise.all([r.fork(a), r.fork(b)])`) requires the caller to give each child a distinct `branch` via `branchStrategy: { type: "branch", branch: "..." }`. The default `head` and `merge-to-head` strategies are **not** safe for concurrent forks: `head` shares the host working directory across all children, and `merge-to-head` races `git merge` against the same HEAD. See [ADR 0018](docs/adr/0018-fork-is-session-only.md).
 
-`fork` is present only on results from providers with `sessionStorage` (Claude Code, Codex) — hence the optional-chaining call. The same single-iteration and session-file constraints as `.resume()` apply.
+`fork` is present only on results from providers with `sessionStorage` (Claude Code, Codex, Grok) — hence the optional-chaining call. The same single-iteration and session-file constraints as `.resume()` apply.
 
 ### `ClaudeCodeOptions`
 
@@ -976,12 +1164,12 @@ The `codex()` factory accepts an optional second argument for provider-specific 
 agent: codex("gpt-5.4", { effort: "high" });
 ```
 
-| Option              | Type                                           | Default | Description                                                                                                                                                                                                           |
-| ------------------- | ---------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `effort`            | `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` | —       | Codex reasoning effort level via `model_reasoning_effort`                                                                                                                                                             |
-| `env`               | `Record<string, string>`                       | `{}`    | Environment variables injected by this agent provider                                                                                                                                                                 |
-| `captureSessions`   | `boolean`                                      | `true`  | Capture Codex rollout JSONL to host for resume                                                                                                                                                                        |
-| `approvalsReviewer` | `"user"` \| `"auto_review"`                    | —       | Maps to Codex's `approvals_reviewer` config. When `"auto_review"`, swaps `--dangerously-bypass-approvals-and-sandbox` for `-a on-request -s danger-full-access` so the reviewer agent evaluates each approval prompt. |
+| Option              | Type                        | Default | Description                                                                                                                                                                                                           |
+| ------------------- | --------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `effort`            | `string`                    | —       | Codex reasoning effort via `model_reasoning_effort`. Free-form because valid values are model-dependent and read live from Codex's catalog at `init` (observed: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`)     |
+| `env`               | `Record<string, string>`    | `{}`    | Environment variables injected by this agent provider                                                                                                                                                                 |
+| `captureSessions`   | `boolean`                   | `true`  | Capture Codex rollout JSONL to host for resume                                                                                                                                                                        |
+| `approvalsReviewer` | `"user"` \| `"auto_review"` | —       | Maps to Codex's `approvals_reviewer` config. When `"auto_review"`, swaps `--dangerously-bypass-approvals-and-sandbox` for `-a on-request -s danger-full-access` so the reviewer agent evaluates each approval prompt. |
 
 ### `PiOptions`
 
@@ -991,11 +1179,58 @@ The `pi()` factory accepts an optional second argument for provider-specific opt
 agent: pi("claude-sonnet-4-6", { thinking: "high" });
 ```
 
-| Option            | Type                                                                     | Default | Description                                              |
-| ----------------- | ------------------------------------------------------------------------ | ------- | -------------------------------------------------------- |
-| `thinking`        | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` | —       | Pi reasoning effort level via the `--thinking` flag      |
-| `env`             | `Record<string, string>`                                                 | `{}`    | Environment variables injected by this agent provider    |
-| `captureSessions` | `boolean`                                                                | `true`  | Capture pi session JSONL to host for `pi --session <id>` |
+| Option            | Type                                                                                | Default | Description                                              |
+| ----------------- | ----------------------------------------------------------------------------------- | ------- | -------------------------------------------------------- |
+| `thinking`        | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` | —       | Pi reasoning effort level via the `--thinking` flag      |
+| `env`             | `Record<string, string>`                                                            | `{}`    | Environment variables injected by this agent provider    |
+| `captureSessions` | `boolean`                                                                           | `true`  | Capture pi session JSONL to host for `pi --session <id>` |
+
+### `DevinOptions`
+
+The `devin()` factory accepts an optional second argument for provider-specific options:
+
+```typescript
+agent: devin("claude-opus-5", { variant: "claude-opus-5-high" });
+```
+
+| Option           | Type                                                       | Default | Description                                                                                                                                                                                                     |
+| ---------------- | ---------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `variant`        | `string`                                                   | —       | Exact Devin variant `model_uid` (e.g. `"claude-opus-5-high"`, `"MODEL_GPT_5_2_XHIGH"`). Devin encodes thinking level in the model identifier — when set, this replaces the family/alias as the `--model` value. |
+| `permissionMode` | `"auto"` \| `"accept-edits"` \| `"smart"` \| `"dangerous"` | —       | Maps to Devin's `--permission-mode` flag. When set, replaces the `--permission-mode dangerous` Sandcastle passes on AFK runs.                                                                                   |
+| `env`            | `Record<string, string>`                                   | `{}`    | Environment variables injected by this agent provider                                                                                                                                                           |
+
+Devin runs non-interactively via `devin -p` (plain-text output, no JSON stream) and keeps sessions in a SQLite store, so it is non-resumable like `cursor`/`opencode`/`copilot`.
+
+### `GrokOptions`
+
+The `grok()` factory accepts an optional second argument for provider-specific options:
+
+```typescript
+agent: grok("grok-4.6", { effort: "high" });
+```
+
+| Option            | Type                                                                                           | Default  | Description                                                                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `effort`          | `string`                                                                                       | —        | Grok reasoning effort via `--reasoning-effort`. Free-form because the CLI does not enumerate values; `init` surfaces the discovered set (`low`, `medium`, `high`, `xhigh` on 1.0.30)     |
+| `env`             | `Record<string, string>`                                                                       | `{}`     | Environment variables injected by this agent provider                                                                                                                                    |
+| `captureSessions` | `boolean`                                                                                      | `true`   | Capture the Grok session directory tree to host for `grok --resume <id>`                                                                                                                 |
+| `executable`      | `string`                                                                                       | `"grok"` | Grok executable name — xAI also ships the same binary as `agent`; set this when only that entrypoint is on PATH                                                                          |
+| `permissionMode`  | `"default"` \| `"acceptEdits"` \| `"auto"` \| `"dontAsk"` \| `"bypassPermissions"` \| `"plan"` | —        | Maps to Grok's `--permission-mode` flag. When set, replaces Sandcastle's default `--always-approve` on AFK runs. Use `"auto"` for AI-mediated per-tool approve/deny on unsandboxed runs. |
+
+### `AntigravityOptions`
+
+The `antigravity()` factory drives the Google Antigravity CLI (`agy`) in its headless stream-json mode — the prompt travels on stdin as one NDJSON `user` message, so large prompts never hit argv size limits:
+
+```typescript
+agent: antigravity("gemini-3.8-flash-high", { effort: "high" });
+```
+
+| Option   | Type                     | Default | Description                                                                                                                                                                                                                               |
+| -------- | ------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `effort` | `string`                 | —       | Reasoning effort via `--effort` (`low`, `medium`, `high`). Model-dependent: agy encodes effort in the model slug (`gemini-3.8-flash-high` requires `high`); models without a suffix (e.g. `claude-sonnet-4-6`) reject `--effort` entirely |
+| `env`    | `Record<string, string>` | `{}`    | Environment variables injected by this agent provider                                                                                                                                                                                     |
+
+Antigravity stores conversations as SQLite databases indexed by a shared `conversation_summaries.db`, so a single session file cannot be transferred host↔sandbox while preserving resume state ([ADR 0016](docs/adr/0016-resume-requires-filesystem-backed-sessions.md)). The provider is therefore **non-resumable** for now (`resumeSession`, `RunResult.resume`, and `RunResult.fork` are unavailable), even though `agy --conversation <id>` works natively on the host. Install `agy` via `curl -fsSL https://antigravity.google/cli/install.sh | bash` and sign in by launching `agy` interactively; in containers, `GEMINI_API_KEY` plus `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` authenticates without OAuth.
 
 ### Provider `env`
 
@@ -1063,7 +1298,7 @@ import {
   type BindMountCreateOptions,
   type BindMountSandboxHandle,
   type ExecResult,
-} from "@ai-hero/sandcastle";
+} from "@lengoctu70/sandcastle";
 import { execFile, spawn } from "node:child_process";
 import { copyFile as fsCopyFile, mkdir as fsMkdir } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -1163,9 +1398,9 @@ import {
   createIsolatedSandboxProvider,
   type IsolatedSandboxHandle,
   type ExecResult,
-} from "@ai-hero/sandcastle";
+} from "@lengoctu70/sandcastle";
 import { execFile, spawn } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -1279,8 +1514,8 @@ A branch strategy controls where the agent's commits land. Configure it when con
 Branch strategy is now configured on `run()`, not on the provider:
 
 ```typescript
-import { run, claudeCode } from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { run, claudeCode } from "@lengoctu70/sandcastle";
+import { docker } from "@lengoctu70/sandcastle/sandboxes/docker";
 
 // head — direct write, bind-mount only (default for bind-mount providers)
 await run({
@@ -1308,7 +1543,7 @@ await run({
 Pass your custom provider via the `sandbox` option — it works the same as the built-in `docker()` provider:
 
 ```typescript
-import { run, claudeCode } from "@ai-hero/sandcastle";
+import { run, claudeCode } from "@lengoctu70/sandcastle";
 
 const result = await run({
   agent: claudeCode("claude-opus-4-8"),

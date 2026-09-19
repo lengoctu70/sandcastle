@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as sandcastle from "@ai-hero/sandcastle";
-import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
+import * as sandcastle from "@lengoctu70/sandcastle";
+import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox";
 import {
   claudeAgent,
   fail,

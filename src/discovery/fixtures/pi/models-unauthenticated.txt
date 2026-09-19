@@ -1,0 +1,4 @@
+[paseo-team] PASEO_PI_ROLE unset — extension passive
+No models available. Use /login to log into a provider via OAuth or API key. See:
+  /Users/lengoctu70/.nvm/versions/node/v22.23.2/lib/node_modules/@earendil-works/pi-coding-agent/docs/providers.md
+  /Users/lengoctu70/.nvm/versions/node/v22.23.2/lib/node_modules/@earendil-works/pi-coding-agent/docs/models.md

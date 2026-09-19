@@ -95,4 +95,58 @@ describe("Agent registry", () => {
     expect(agent!.dockerfileTemplate).toContain("FROM");
     expect(agent!.dockerfileTemplate).toContain("@github/copilot");
   });
+
+  it("listAgents includes devin", () => {
+    const agents = listAgents();
+    expect(agents.some((a) => a.name === "devin")).toBe(true);
+  });
+
+  it("getAgent returns devin entry with expected fields", () => {
+    const agent = getAgent("devin");
+    expect(agent).toBeDefined();
+    expect(agent!.name).toBe("devin");
+    expect(agent!.defaultModel).toBe("claude-opus-5");
+    expect(agent!.factoryImport).toBe("devin");
+    // Devin's "effort" is a catalog model_uid emitted as the variant option.
+    expect(agent!.effortOption).toBe("variant");
+    expect(agent!.dockerfileTemplate).toContain("FROM");
+    expect(agent!.dockerfileTemplate).toContain("cli.devin.ai/install.sh");
+    // No API-key scaffolding — Devin reuses its account login.
+    expect(agent!.envExample).not.toContain("API_KEY=");
+  });
+
+  it("listAgents includes grok", () => {
+    const agents = listAgents();
+    expect(agents.some((a) => a.name === "grok")).toBe(true);
+  });
+
+  it("getAgent returns grok entry with expected fields", () => {
+    const agent = getAgent("grok");
+    expect(agent).toBeDefined();
+    expect(agent!.name).toBe("grok");
+    expect(agent!.defaultModel).toBe("grok-4.6");
+    expect(agent!.factoryImport).toBe("grok");
+    expect(agent!.effortOption).toBe("effort");
+    expect(agent!.dockerfileTemplate).toContain("FROM");
+    expect(agent!.dockerfileTemplate).toContain("x.ai/cli/install.sh");
+  });
+
+  it("listAgents includes antigravity", () => {
+    const agents = listAgents();
+    expect(agents.some((a) => a.name === "antigravity")).toBe(true);
+  });
+
+  it("getAgent returns antigravity entry with expected fields", () => {
+    const agent = getAgent("antigravity");
+    expect(agent).toBeDefined();
+    expect(agent!.name).toBe("antigravity");
+    expect(agent!.defaultModel).toBe("gemini-3.8-flash-high");
+    expect(agent!.factoryImport).toBe("antigravity");
+    expect(agent!.effortOption).toBe("effort");
+    expect(agent!.dockerfileTemplate).toContain("FROM");
+    expect(agent!.dockerfileTemplate).toContain(
+      "antigravity.google/cli/install.sh",
+    );
+    expect(agent!.setupCommand).toContain("agy");
+  });
 });

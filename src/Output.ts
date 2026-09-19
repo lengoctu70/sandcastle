@@ -54,7 +54,7 @@ export type OutputDefinition =
  * Helpers for declaring structured output on `run()`.
  *
  * ```ts
- * import { Output, run } from "@ai-hero/sandcastle";
+ * import { Output, run } from "@lengoctu70/sandcastle";
  * import { z } from "zod";
  *
  * const result = await run({

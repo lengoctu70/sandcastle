@@ -156,19 +156,35 @@ GOOGLE_API_KEY=`,
 
 And a Dockerfile constant alongside the existing ones. Use `CLAUDE_CODE_DOCKERFILE` as a structural reference — keep the `usermod` block, the `{{ISSUE_TRACKER_TOOLS}}` placeholder, the `USER agent` line, and the `ENTRYPOINT ["sleep", "infinity"]`. Only the install line should differ.
 
+## Agent discovery (host mode)
+
+`sandcastle init --sandbox host` verifies an agent is actually usable on this machine before scaffolding — executable fingerprint, login readiness, and the live model/effort catalog — via a per-agent `AgentDiscoveryAdapter` in [`src/discovery/`](../../src/discovery/). Adding discovery for an agent is additive:
+
+1. Create `src/discovery/<agent>.ts` exporting an `AgentDiscoveryAdapter` (see `codex.ts` for the reference implementation). Every CLI call goes through the injected `DiscoveryExec` boundary — never spawn directly, and `discover()` must never reject (report failures via `state`).
+2. Register it with ONE line in `src/discovery/registry.ts` (`DISCOVERY_ADAPTERS`).
+
+Contract notes:
+
+- Fingerprint by **observed output**, not PATH presence — e.g. Codex requires `codex-cli` in `--version`; a same-named executable reporting a different product becomes `state: "wrong-product"`.
+- Prefer the CLI's own catalog protocol (Codex uses app-server `model/list` over stdio JSON-RPC) over any hard-coded model registry; tolerate unknown fields, and treat malformed _required_ data as `DiscoveryDataError` (terminal — never masked by a fallback).
+- `guidance`/`detail` strings are Vietnamese (ADR 0026); keep them actionable (install/login commands).
+- Tests use a fake executable on PATH or the injected boundary plus captured fixtures — never a real CLI or subscription.
+
+Agents without an adapter stay on the static picker until their adapter lands.
+
 ## Implementation checklist
 
 For a new agent provider `foo`:
 
-- [ ] Verify session-ID round-trip stability empirically (see [Resume support](#resume-support-required)).
-- [ ] Factory `foo()` in [`src/AgentProvider.ts`](../../src/AgentProvider.ts), with options interface `FooOptions` (including `captureSessions?: boolean`).
+- [ ] Verify session-ID round-trip stability empirically (see [Resume support](#resume-support-required)). When the agent stores sessions in a shared/indexed database rather than one addressable file per session (Copilot, Antigravity), resume is deferred per [ADR 0016](../adr/0016-resume-requires-filesystem-backed-sessions.md): `captureSessions: false`, no `sessionStorage`.
+- [ ] Factory `foo()` in `src/agents/foo.ts`, with options interface `FooOptions` (including `captureSessions?: boolean`). Established providers live in [`src/AgentProvider.ts`](../../src/AgentProvider.ts); new providers are isolated modules — import the shared helpers (`shellEscape`, `TOOL_ARG_FIELDS`, `extractErrorMessage`, `readSandboxFile`, `writeSandboxFile`) from `AgentProvider.ts` rather than editing it (see `src/agents/grok.ts` for the module pattern).
 - [ ] Stream-parsing helper `parseFooStreamLine` that emits `session_id` events alongside `text` / `result` / `tool_call`.
 - [ ] `sessionStorage` sub-object on the factory's return value, implementing `captureToHost`, `resumeIntoSandbox`, `readHostSession`, `existsOnHost`, `hostSessionFilePath`, and `findByIdOnHost` for `foo`'s on-disk layout.
 - [ ] `buildPrintCommand` honours `resumeSession` by appending `foo`'s native resume CLI flag.
-- [ ] Tests in `src/AgentProvider.test.ts` covering `buildPrintCommand` (both fresh and resume forms), `buildInteractiveArgs`, and stream parsing — including session-ID extraction and error events on stdout if applicable.
+- [ ] Tests in `src/agents/foo.test.ts` (or `src/AgentProvider.test.ts` for established in-`AgentProvider.ts` providers) covering `buildPrintCommand` (both fresh and resume forms), `buildInteractiveArgs`, and stream parsing — including session-ID extraction and error events on stdout if applicable.
 - [ ] Tests covering `sessionStorage` round-trip: capture host↔sandbox, content preserved (and rewritten correctly if `foo`'s format requires it).
 - [ ] Public export from [`src/index.ts`](../../src/index.ts): the `foo` factory and the `FooOptions` type.
 - [ ] `AGENT_REGISTRY` entry in [`src/InitService.ts`](../../src/InitService.ts).
 - [ ] `FOO_DOCKERFILE` constant in `src/InitService.ts`.
-- [ ] Changeset in `.changeset/` (patch, since pre-1.0). See [`CLAUDE.md`](../../CLAUDE.md).
+- [ ] Changeset in `.changeset/` (minor for a new provider — new feature, pre-1.0). See [`AGENTS.md`](../../AGENTS.md).
 - [ ] `README.md` update if the public-facing list of supported agents is mentioned there.

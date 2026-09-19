@@ -1,0 +1,9 @@
+[0m
+┌  Credentials [90m~/.local/share/opencode/auth.json
+│
+●  OpenAI [90moauth
+│
+●  OpenCode Go [90mapi
+│
+└  2 credentials
+

@@ -1,0 +1,248 @@
+{
+  "families": [
+    {
+      "family_label": "Claude Opus 5",
+      "family_uid": "claude-opus-5",
+      "slug": "claude-opus-5",
+      "aliases": [
+        "opus"
+      ],
+      "variants": [
+        {
+          "model_uid": "claude-opus-5-medium",
+          "label": "Claude Opus 5 Medium",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$5 / 1M Input · $0.5 / 1M Cached input · $25 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-low",
+          "label": "Claude Opus 5 Low",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$5 / 1M Input · $0.5 / 1M Cached input · $25 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-high",
+          "label": "Claude Opus 5 High",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$5 / 1M Input · $0.5 / 1M Cached input · $25 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-xhigh",
+          "label": "Claude Opus 5 XHigh",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$5 / 1M Input · $0.5 / 1M Cached input · $25 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-max",
+          "label": "Claude Opus 5 Max",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$5 / 1M Input · $0.5 / 1M Cached input · $25 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-low-fast",
+          "label": "Claude Opus 5 Low Fast",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$10 / 1M Input · $1 / 1M Cached input · $50 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-medium-fast",
+          "label": "Claude Opus 5 Medium Fast",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$10 / 1M Input · $1 / 1M Cached input · $50 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-high-fast",
+          "label": "Claude Opus 5 High Fast",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$10 / 1M Input · $1 / 1M Cached input · $50 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-xhigh-fast",
+          "label": "Claude Opus 5 XHigh Fast",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$10 / 1M Input · $1 / 1M Cached input · $50 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-max-fast",
+          "label": "Claude Opus 5 Max Fast",
+          "max_context_tokens": 1000000,
+          "max_output_tokens": 128000,
+          "cost_tier": "High cost",
+          "cost_summary": "$10 / 1M Input · $1 / 1M Cached input · $50 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    },
+    {
+      "family_label": "Gemini 3.8 Flash",
+      "family_uid": "gemini-3-8-flash",
+      "slug": "gemini-3.8-flash",
+      "aliases": [
+        "gemini"
+      ],
+      "variants": [
+        {
+          "model_uid": "gemini-3-8-flash-medium",
+          "label": "Gemini 3.8 Flash Medium",
+          "max_context_tokens": 1048576,
+          "max_output_tokens": 65535,
+          "cost_tier": "Med cost",
+          "cost_summary": "$0.75 / 1M Input · $0.08 / 1M Cached input · $3.75 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "gemini-3-8-flash-low",
+          "label": "Gemini 3.8 Flash Low",
+          "max_context_tokens": 1048576,
+          "max_output_tokens": 65535,
+          "cost_tier": "Med cost",
+          "cost_summary": "$0.75 / 1M Input · $0.08 / 1M Cached input · $3.75 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "gemini-3-8-flash-high",
+          "label": "Gemini 3.8 Flash High",
+          "max_context_tokens": 1048576,
+          "max_output_tokens": 65535,
+          "cost_tier": "Med cost",
+          "cost_summary": "$0.75 / 1M Input · $0.08 / 1M Cached input · $3.75 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    },
+    {
+      "family_label": "Adaptive",
+      "family_uid": "Adaptive",
+      "slug": "adaptive",
+      "aliases": [],
+      "variants": [
+        {
+          "model_uid": "adaptive",
+          "label": "Adaptive",
+          "description": "Automatically balances quality and cost",
+          "cost_summary": "$0.5 / 1M Input · $0.1 / 1M Cached input · $2 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    },
+    {
+      "family_label": "GPT-5.2",
+      "family_uid": "gpt-5.2",
+      "slug": "gpt-5.2",
+      "aliases": [],
+      "variants": [
+        {
+          "model_uid": "MODEL_GPT_5_2_LOW",
+          "label": "GPT-5.2 Low Thinking",
+          "max_context_tokens": 384000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Med cost",
+          "cost_summary": "$1.75 / 1M Input · $0.17 / 1M Cached input · $14 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "MODEL_GPT_5_2_MEDIUM",
+          "label": "GPT-5.2 Medium Thinking",
+          "max_context_tokens": 384000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Med cost",
+          "cost_summary": "$1.75 / 1M Input · $0.17 / 1M Cached input · $14 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "MODEL_GPT_5_2_NONE",
+          "label": "GPT-5.2 No Thinking",
+          "max_context_tokens": 384000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Med cost",
+          "cost_summary": "$1.75 / 1M Input · $0.17 / 1M Cached input · $14 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "MODEL_GPT_5_2_HIGH",
+          "label": "GPT-5.2 High Thinking",
+          "max_context_tokens": 384000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Med cost",
+          "cost_summary": "$1.75 / 1M Input · $0.17 / 1M Cached input · $14 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "MODEL_GPT_5_2_XHIGH",
+          "label": "GPT-5.2 XHigh Thinking",
+          "max_context_tokens": 384000,
+          "max_output_tokens": 128000,
+          "cost_tier": "Med cost",
+          "cost_summary": "$1.75 / 1M Input · $0.17 / 1M Cached input · $14 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    },
+    {
+      "family_label": "Claude Haiku 4.5",
+      "family_uid": "Claude Haiku 4.5",
+      "slug": "claude-haiku-4.5",
+      "aliases": [
+        "haiku"
+      ],
+      "variants": [
+        {
+          "model_uid": "MODEL_PRIVATE_11",
+          "label": "Claude Haiku 4.5",
+          "max_context_tokens": 200000,
+          "max_output_tokens": 64000,
+          "cost_tier": "Med cost",
+          "cost_summary": "$1 / 1M Input · $0.1 / 1M Cached input · $5 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    }
+  ]
+}
