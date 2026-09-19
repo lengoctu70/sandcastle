@@ -997,11 +997,40 @@ export interface IssueTrackerEntry {
   readonly templateArgs: {
     readonly LIST_TASKS_COMMAND: string;
     readonly VIEW_TASK_COMMAND: string;
-    readonly CLOSE_TASK_COMMAND: string;
+    /**
+     * The workflow step that finishes a completed issue in simple-loop and
+     * sequential-reviewer prompts — a close command for self-managed trackers
+     * (beads, custom), a do-not-close instruction for GitHub Issues (ADR 0023:
+     * `sandcastle run` reports and closes only after verified landing).
+     */
+    readonly CLOSE_TASK_INSTRUCTION: string;
+    /**
+     * Bullet-point rules about mutating issue state in the two sequential
+     * prompts (what the agent may close/comment and when).
+     */
+    readonly ISSUE_MUTATION_RULES: string;
+    /**
+     * The "# THE ISSUE" guidance in the parallel implementer prompts — what
+     * to do with the issue when the task is left incomplete, and who closes it.
+     */
+    readonly INCOMPLETE_TASK_INSTRUCTION: string;
+    /**
+     * The issue-handling step in the parallel merge prompts — a close command
+     * for self-managed trackers, a do-not-mutate instruction for GitHub Issues.
+     */
+    readonly MERGE_CLOSE_INSTRUCTION: string;
     readonly ISSUE_TRACKER_TOOLS: string;
   };
   /** Lines to append to `.env.example` for this issue tracker, or empty string if none needed. */
   readonly envExample: string;
+  /**
+   * `.env.example` block used instead of `envExample` when the sandbox
+   * provider runs on the host (ADR 0021). Host mode reuses the machine's
+   * existing CLI logins, so a tracker that would need a token inside a
+   * container (e.g. GitHub Issues' `GH_TOKEN`, replaced on the host by the
+   * `gh` CLI's own `gh auth login` session) emits nothing there.
+   */
+  readonly hostEnvExample?: string;
 }
 
 const GITHUB_CLI_TOOLS = `# Install GitHub CLI
@@ -1044,13 +1073,29 @@ const ISSUE_TRACKER_REGISTRY: IssueTrackerEntry[] = [
     templateArgs: {
       LIST_TASKS_COMMAND: `gh issue list --state open --label Sandcastle --limit 100 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`,
       VIEW_TASK_COMMAND: "gh issue view <ID>",
-      CLOSE_TASK_COMMAND: `gh issue close <ID> --comment "Completed by Sandcastle"`,
+      // ADR 0023: the agent never mutates a GitHub Issue — `sandcastle run`
+      // owns the completion report and the close, and only after the work is
+      // verified and landed. The generated prompts therefore carry explicit
+      // do-not-close/do-not-comment instructions instead of a close command.
+      CLOSE_TASK_INSTRUCTION:
+        "**Done** — do NOT close or comment on the issue. Sandcastle verifies, merges, reports, and closes it after your work lands.",
+      ISSUE_MUTATION_RULES:
+        "- Never mutate the issue — no close, comment, edit, or label commands. Sandcastle reports and closes it after your work lands.\n" +
+        "- An issue whose work is already committed counts as done — check the recent commits list before picking.\n" +
+        "- If you are blocked (missing context, failing tests you cannot fix, external dependency), describe the blocker in your final output and move on.",
+      INCOMPLETE_TASK_INSTRUCTION:
+        "Do NOT close or comment on the issue — Sandcastle verifies, merges, reports, and closes it after your work lands. If the task is not complete, describe what was done and what remains in your final output.",
+      MERGE_CLOSE_INSTRUCTION:
+        "Do not close or comment on any issue — Sandcastle reports and closes each one after its merged work is verified and landed.",
       ISSUE_TRACKER_TOOLS: GITHUB_CLI_TOOLS,
     },
     envExample: `# GitHub personal access token — the agent uses it to read and manage GitHub Issues
 # Create a fine-grained token: https://github.com/settings/personal-access-tokens/new
 # Required repository permissions: Issues (Read and write) and Metadata (Read)
 GH_TOKEN=`,
+    // Host mode talks to GitHub through the `gh` CLI on this machine, which
+    // reuses the existing `gh auth login` session — no token is scaffolded.
+    hostEnvExample: "",
   },
   {
     name: "beads",
@@ -1058,7 +1103,15 @@ GH_TOKEN=`,
     templateArgs: {
       LIST_TASKS_COMMAND: "bd ready --json",
       VIEW_TASK_COMMAND: "bd show <ID>",
-      CLOSE_TASK_COMMAND: `bd close <ID> --reason="Completed by Sandcastle"`,
+      CLOSE_TASK_INSTRUCTION:
+        '**Close** — close the issue with `bd close <ID> --reason="<what was done>"` explaining what was done.',
+      ISSUE_MUTATION_RULES:
+        "- Do not close an issue until you have committed the fix and verified tests pass.\n" +
+        "- If you are blocked (missing context, failing tests you cannot fix, external dependency), leave a comment on the issue and move on — do not close it.",
+      INCOMPLETE_TASK_INSTRUCTION:
+        "If the task is not complete, leave a comment on the issue with what was done. Do not close the issue — it is closed after its branch is merged.",
+      MERGE_CLOSE_INSTRUCTION:
+        'For each branch that was merged, close its issue with `bd close <ID> --reason="<what was done>"`.',
       ISSUE_TRACKER_TOOLS: BEADS_TOOLS,
     },
     envExample: "",
@@ -1073,7 +1126,13 @@ GH_TOKEN=`,
       LIST_TASKS_COMMAND: CUSTOM_LIST_TASKS_SENTINEL,
       // Inline text markers — replaced by the setup agent, never executed.
       VIEW_TASK_COMMAND: CUSTOM_VIEW_TASK_MARKER,
-      CLOSE_TASK_COMMAND: CUSTOM_CLOSE_TASK_MARKER,
+      CLOSE_TASK_INSTRUCTION: `**Close** — close the issue with \`${CUSTOM_CLOSE_TASK_MARKER}\` explaining what was done.`,
+      ISSUE_MUTATION_RULES:
+        "- Do not close an issue until you have committed the fix and verified tests pass.\n" +
+        "- If you are blocked (missing context, failing tests you cannot fix, external dependency), leave a comment on the issue and move on — do not close it.",
+      INCOMPLETE_TASK_INSTRUCTION:
+        "If the task is not complete, leave a comment on the issue with what was done. Do not close the issue — it is closed after its branch is merged.",
+      MERGE_CLOSE_INSTRUCTION: `For each branch that was merged, close its issue with \`${CUSTOM_CLOSE_TASK_MARKER}\`.`,
       ISSUE_TRACKER_TOOLS: CUSTOM_TRACKER_TOOLS,
     },
     envExample: CUSTOM_ENV_EXAMPLE,
@@ -1085,6 +1144,21 @@ export const listIssueTrackers = (): IssueTrackerEntry[] =>
 
 export const getIssueTracker = (name: string): IssueTrackerEntry | undefined =>
   ISSUE_TRACKER_REGISTRY.find((b) => b.name === name);
+
+/**
+ * The `.env.example` block a tracker contributes for the chosen provider.
+ * Host mode reuses the machine's existing CLI logins (ADR 0021), so a tracker
+ * that only needed a token for in-sandbox use — GitHub Issues' `GH_TOKEN`,
+ * which host mode replaces with the `gh` CLI's own login — can substitute a
+ * different block (or none) via `hostEnvExample`.
+ */
+const trackerEnvExample = (
+  issueTracker: IssueTrackerEntry,
+  runsOnHost: boolean,
+): string =>
+  runsOnHost
+    ? (issueTracker.hostEnvExample ?? issueTracker.envExample)
+    : issueTracker.envExample;
 
 export const getAgent = (name: string): AgentEntry | undefined =>
   AGENT_REGISTRY.find((a) => a.name === name);
@@ -1108,6 +1182,13 @@ export interface SandboxProviderEntry {
    * Vietnamese per ADR 0026; identifiers stay English.
    */
   readonly selectHint?: string;
+  /**
+   * `true` on the entry the interactive picker marks "(khuyến nghị)" and
+   * preselects — host mode, the subscription path ADR 0021 recommends. This
+   * only steers the interactive default; the scaffold's own default stays
+   * docker so library consumers keep the containerized baseline.
+   */
+  readonly recommended?: boolean;
   /**
    * Image file written to `.sandcastle/` (e.g. "Dockerfile" or
    * "Containerfile"). Absent for providers that never build an image — host
@@ -1153,9 +1234,12 @@ export interface SandboxProviderEntry {
 }
 
 const SANDBOX_PROVIDER_REGISTRY: SandboxProviderEntry[] = [
+  // Host first: the subscription-reusing path ADR 0021 recommends for
+  // interactive init, so it leads the picker and carries the marker.
   {
     name: "host",
     label: "Host",
+    recommended: true,
     selectHint:
       "Chạy agent trực tiếp trên máy này — dùng lại đăng nhập CLI sẵn có, không cô lập hệ điều hành",
     runsOnHost: true,
@@ -1320,7 +1404,10 @@ const hostNextStepsLines = (
     `1. Đảm bảo ${agent.label} đã được cài đặt và đăng nhập trên máy này — host mode dùng lại phiên đăng nhập CLI hiện có, không cần API key.`,
   ];
   let step = 2;
-  if (issueTracker.envExample) {
+  // The env step only appears when the tracker actually needs configuration
+  // on the host — GitHub Issues needs none because `gh` reuses the existing
+  // login, so host + github-issues scaffolds get no env-var step at all.
+  if (trackerEnvExample(issueTracker, true)) {
     lines.push(
       `${step++}. Đặt các biến môi trường cần thiết trong .sandcastle/.env (xem .sandcastle/.env.example)`,
     );
@@ -1910,12 +1997,18 @@ export const scaffold = (
     // Build .env.example from agent + issue tracker env blocks. Host mode
     // reuses the agent's existing host CLI login (ADR 0021), so no agent
     // API-key block is scaffolded — only env the project itself needs (e.g.
-    // the issue tracker's) is emitted.
+    // the issue tracker's) is emitted. The tracker's host variant applies
+    // too: GitHub Issues needs no GH_TOKEN on the host because the `gh` CLI
+    // already carries the user's login.
     const envExampleParts = [
-      sandboxProvider.runsOnHost ? HOST_ENV_NOTE : agent.envExample,
+      sandboxProvider.runsOnHost === true ? HOST_ENV_NOTE : agent.envExample,
     ];
-    if (issueTracker.envExample) {
-      envExampleParts.push(issueTracker.envExample);
+    const trackerEnv = trackerEnvExample(
+      issueTracker,
+      sandboxProvider.runsOnHost === true,
+    );
+    if (trackerEnv) {
+      envExampleParts.push(trackerEnv);
     }
     const envExampleContent = envExampleParts.join("\n") + "\n";
 

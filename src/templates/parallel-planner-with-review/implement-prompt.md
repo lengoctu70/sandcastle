@@ -41,7 +41,7 @@ Before committing, run `npm run typecheck` and `npm run test` to ensure the test
 
 Make a git commit. The commit message must:
 
-1. Start with `RALPH:` prefix
+1. Start with `SANDCASTLE:` prefix
 2. Include task completed + PRD reference
 3. Key decisions made
 4. Files changed
@@ -51,9 +51,7 @@ Keep it concise.
 
 # THE ISSUE
 
-If the task is not complete, leave a comment on the issue with what was done.
-
-Do not close the issue - this will be done later.
+{{INCOMPLETE_TASK_INSTRUCTION}}
 
 Once complete, output <promise>COMPLETE</promise>.
 

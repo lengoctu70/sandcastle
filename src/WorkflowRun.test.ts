@@ -21,12 +21,19 @@ const issue: GithubIssue = {
   labels: ["Sandcastle"],
 };
 
+/** The shared task context the three prompt builders take as one bundle. */
+const promptContext = (
+  verificationCommands: readonly string[] = ["npm test"],
+) => ({
+  issue,
+  sourceBranch: "sandcastle/issue-42",
+  targetBranch: "main",
+  verificationCommands,
+});
+
 describe("buildImplementationPrompt", () => {
   const prompt = buildImplementationPrompt({
-    issue,
-    sourceBranch: "sandcastle/issue-42",
-    targetBranch: "main",
-    verificationCommands: ["npm test"],
+    context: promptContext(),
   });
 
   it("embeds the immutable issue identity and branches", () => {
@@ -38,10 +45,10 @@ describe("buildImplementationPrompt", () => {
   });
 
   it("keeps issue closure out of the agent's reach (ADR 0023)", () => {
-    // The prompt forbids issue mutations rather than carrying the legacy
-    // agent-closes-issue contract ({{CLOSE_TASK_COMMAND}} etc.).
+    // The prompt forbids issue mutations rather than carrying a close
+    // command or unresolved template slots.
     expect(prompt).toContain("Do NOT run `gh issue close`");
-    expect(prompt).not.toContain("CLOSE_TASK_COMMAND");
+    expect(prompt).not.toContain("CLOSE_TASK");
     expect(prompt).not.toContain("{{");
     expect(prompt).not.toContain("!`");
   });
@@ -53,10 +60,7 @@ describe("buildImplementationPrompt", () => {
 
   it("omits the verification block when no commands are configured", () => {
     const bare = buildImplementationPrompt({
-      issue,
-      sourceBranch: "sandcastle/issue-42",
-      targetBranch: "main",
-      verificationCommands: [],
+      context: promptContext([]),
     });
     expect(bare).not.toContain("## Verification");
   });
@@ -72,10 +76,7 @@ describe("buildVerificationRepairPrompt", () => {
   };
 
   const base = {
-    issue,
-    sourceBranch: "sandcastle/issue-42",
-    targetBranch: "main",
-    verificationCommands: ["npm test", "npm run typecheck"],
+    context: promptContext(["npm test", "npm run typecheck"]),
     failure,
     attempt: 1,
     maxAttempts: 2,
@@ -125,12 +126,9 @@ describe("buildVerificationRepairPrompt", () => {
 
 describe("buildMergeConflictRepairPrompt", () => {
   const base = {
-    issue,
-    sourceBranch: "sandcastle/issue-42",
-    targetBranch: "main",
+    context: promptContext(),
     integrationBranch: "sandcastle/issue-42-integrate/20260101-000000-ab12",
     mergeOutput: "CONFLICT (content): Merge conflict in hello.txt",
-    verificationCommands: ["npm test"],
   };
 
   it("describes the in-progress merge, its output, and the one-shot rules", () => {

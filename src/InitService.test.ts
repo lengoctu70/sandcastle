@@ -573,7 +573,7 @@ describe("InitService scaffold", () => {
       expect(mainTs).toContain("implement.commits.length");
     });
 
-    it("implement-prompt.md contains issue selection and closure, not prompt argument placeholders", async () => {
+    it("implement-prompt.md contains issue selection and the do-not-close rule, not prompt argument placeholders", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "sequential-reviewer" });
 
@@ -582,7 +582,12 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(prompt).toContain("gh issue list");
-      expect(prompt).toContain("gh issue close");
+      // GitHub Issues: the agent never closes or comments — Sandcastle does
+      // (ADR 0023). No issue-mutating command may reach the prompt.
+      expect(prompt).not.toContain("gh issue close");
+      expect(prompt).not.toContain("gh issue comment");
+      expect(prompt).toContain("do NOT close or comment on the issue");
+      expect(prompt).not.toContain("Completed by Sandcastle");
       expect(prompt).not.toContain("{{ISSUE_NUMBER}}");
       expect(prompt).not.toContain("{{ISSUE_TITLE}}");
       expect(prompt).not.toContain("{{BRANCH}}");
@@ -970,8 +975,10 @@ describe("InitService scaffold", () => {
       const beads = getIssueTracker("beads")!;
       const withGithub = hostNext("blank", "main.mts", ghIssues);
       const withBeads = hostNext("blank", "main.mts", beads);
-      // github-issues requires GH_TOKEN; beads requires nothing.
-      expect(withGithub).toContain(".env");
+      // On the host, `gh` reuses the existing login — github-issues needs no
+      // env vars, same as beads. (A custom tracker takes the dedicated
+      // setup-doc steps instead of this list.)
+      expect(withGithub).not.toContain(".env.example");
       expect(withBeads).not.toContain(".env.example");
     });
 
@@ -1462,7 +1469,7 @@ describe("InitService scaffold", () => {
 
   it("scaffolded prompts that lack a runtime TASK_ID do not contain {{TASK_ID}}", async () => {
     // Regression test for #477: the {{TASK_ID}} placeholder inside
-    // VIEW_TASK_COMMAND / CLOSE_TASK_COMMAND used to leak into prompts
+    // VIEW_TASK_COMMAND / the close instruction used to leak into prompts
     // whose runtime promptArgs do not include TASK_ID (simple-loop,
     // sequential-reviewer's implement, parallel-planner*'s merge),
     // causing PromptArgumentSubstitution to throw on every iteration.
@@ -1687,7 +1694,7 @@ describe("InitService scaffold", () => {
       expect(mainTs).toContain("review.commits");
     });
 
-    it("main.mts uses Promise.allSettled for parallel execution", async () => {
+    it("main.mts runs issue pipelines through the bounded worker pool", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "parallel-planner-with-review" });
 
@@ -1695,7 +1702,8 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      expect(mainTs).toContain("Promise.allSettled");
+      expect(mainTs).toContain("mapSettled(issues, MAX_PARALLEL");
+      expect(mainTs).not.toContain("await Promise.allSettled(");
     });
 
     it("main.mts has correct maxIterations: planner=1, implementer=100, reviewer=1, merger=1", async () => {
@@ -1870,7 +1878,16 @@ describe("InitService scaffold", () => {
       expect(manager!.templateArgs.VIEW_TASK_COMMAND).toContain(
         "gh issue view",
       );
-      expect(manager!.templateArgs.CLOSE_TASK_COMMAND).toContain(
+      // ADR 0023: GitHub Issues carries no close command — the generated
+      // prompts instruct the agent not to mutate the issue; `sandcastle run`
+      // reports and closes it after verified landing.
+      expect(manager!.templateArgs.CLOSE_TASK_INSTRUCTION).toContain(
+        "do NOT close or comment",
+      );
+      expect(manager!.templateArgs.CLOSE_TASK_INSTRUCTION).not.toContain(
+        "gh issue close",
+      );
+      expect(manager!.templateArgs.MERGE_CLOSE_INSTRUCTION).not.toContain(
         "gh issue close",
       );
       expect(manager!.templateArgs.ISSUE_TRACKER_TOOLS).toContain("GitHub CLI");
@@ -1883,8 +1900,15 @@ describe("InitService scaffold", () => {
       expect(manager!.label).toBe("Beads");
       expect(manager!.templateArgs.LIST_TASKS_COMMAND).toBe("bd ready --json");
       expect(manager!.templateArgs.VIEW_TASK_COMMAND).toContain("bd show");
-      expect(manager!.templateArgs.CLOSE_TASK_COMMAND).toContain("bd close");
-      expect(manager!.templateArgs.CLOSE_TASK_COMMAND).toContain("--reason=");
+      expect(manager!.templateArgs.CLOSE_TASK_INSTRUCTION).toContain(
+        "bd close",
+      );
+      expect(manager!.templateArgs.CLOSE_TASK_INSTRUCTION).toContain(
+        "--reason=",
+      );
+      expect(manager!.templateArgs.MERGE_CLOSE_INSTRUCTION).toContain(
+        "bd close",
+      );
       expect(manager!.templateArgs.ISSUE_TRACKER_TOOLS).toContain("beads");
       expect(manager!.templateArgs.ISSUE_TRACKER_TOOLS).toContain("libicu72");
       expect(manager!.templateArgs.ISSUE_TRACKER_TOOLS).toContain(
@@ -1915,11 +1939,14 @@ describe("InitService scaffold", () => {
       expect(manager!.templateArgs.VIEW_TASK_COMMAND).toContain(
         "SETUP_ISSUE_TRACKER.md",
       );
-      expect(manager!.templateArgs.CLOSE_TASK_COMMAND).toContain(
+      expect(manager!.templateArgs.CLOSE_TASK_INSTRUCTION).toContain(
         "close command",
       );
-      expect(manager!.templateArgs.CLOSE_TASK_COMMAND).toContain(
+      expect(manager!.templateArgs.CLOSE_TASK_INSTRUCTION).toContain(
         "SETUP_ISSUE_TRACKER.md",
+      );
+      expect(manager!.templateArgs.MERGE_CLOSE_INSTRUCTION).toContain(
+        "close command",
       );
       // Dockerfile install block is a TODO comment pointing at the doc.
       expect(manager!.templateArgs.ISSUE_TRACKER_TOOLS).toContain("TODO");
@@ -1972,7 +1999,7 @@ describe("InitService scaffold", () => {
   });
 
   describe("Issue tracker scaffold", () => {
-    it("simple-loop with github-issues produces prompt with gh issue commands (richer version)", async () => {
+    it("simple-loop with github-issues keeps issue mutation out of the prompt (ADR 0023)", async () => {
       const dir = await makeDir();
       await runScaffold(dir, {
         templateName: "simple-loop",
@@ -1983,12 +2010,20 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "prompt.md"),
         "utf-8",
       );
+      // Read-side gh commands stay; the close/comment command is gone.
       expect(prompt).toContain("gh issue list");
       expect(prompt).toContain("labels");
       expect(prompt).toContain("comments");
-      expect(prompt).toContain("gh issue close");
+      expect(prompt).not.toContain("gh issue close");
+      expect(prompt).not.toContain("gh issue comment");
+      // The explicit do-not-mutate instruction is present instead.
+      expect(prompt).toContain("do NOT close or comment on the issue");
+      expect(prompt).toContain("Never mutate the issue");
+      // The banned completion signature never reaches generated prompts.
+      expect(prompt).not.toContain("Completed by Sandcastle");
       expect(prompt).not.toContain("{{LIST_TASKS_COMMAND}}");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).not.toContain("{{CLOSE_TASK_INSTRUCTION}}");
+      expect(prompt).not.toContain("{{ISSUE_MUTATION_RULES}}");
     });
 
     it("simple-loop with beads produces prompt with bd commands", async () => {
@@ -2006,8 +2041,48 @@ describe("InitService scaffold", () => {
       expect(prompt).toContain("bd close");
       expect(prompt).not.toContain("gh issue list");
       expect(prompt).not.toContain("gh issue close");
+      expect(prompt).not.toContain("Completed by Sandcastle");
       expect(prompt).not.toContain("{{LIST_TASKS_COMMAND}}");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).not.toContain("{{CLOSE_TASK_INSTRUCTION}}");
+      expect(prompt).not.toContain("{{ISSUE_MUTATION_RULES}}");
+    });
+
+    it("generated prompts carry no banned 'RALPH' terminology or completion signature", async () => {
+      // CONTEXT.md bans "RALPH" and the "Completed by Sandcastle" signature —
+      // neither may reach generated prompt files for any tracker.
+      const cases: Array<{ template: string; files: string[] }> = [
+        { template: "simple-loop", files: ["prompt.md"] },
+        { template: "sequential-reviewer", files: ["implement-prompt.md"] },
+        {
+          template: "parallel-planner",
+          files: ["implement-prompt.md", "merge-prompt.md"],
+        },
+        {
+          template: "parallel-planner-with-review",
+          files: ["implement-prompt.md", "merge-prompt.md"],
+        },
+      ];
+      for (const tracker of ["github-issues", "beads", "custom"]) {
+        for (const { template, files } of cases) {
+          const dir = await makeDir();
+          await runScaffold(dir, {
+            templateName: template,
+            issueTracker: getIssueTracker(tracker),
+          });
+          for (const file of files) {
+            const prompt = await readFile(
+              join(dir, ".sandcastle", file),
+              "utf-8",
+            );
+            expect(prompt, `${tracker}/${template}/${file}`).not.toContain(
+              "RALPH",
+            );
+            expect(prompt, `${tracker}/${template}/${file}`).not.toContain(
+              "Completed by Sandcastle",
+            );
+          }
+        }
+      }
     });
 
     it("simple-loop with beads skips --label Sandcastle (no label to strip)", async () => {
@@ -2117,7 +2192,9 @@ describe("InitService scaffold", () => {
       expect(setup).toContain("exit 1");
       // The markers the agent will actually find in the scaffolded files.
       expect(setup).toContain(customManager!.templateArgs.VIEW_TASK_COMMAND);
-      expect(setup).toContain(customManager!.templateArgs.CLOSE_TASK_COMMAND);
+      // The close marker is embedded inside the instruction args the
+      // scaffolded prompts carry.
+      expect(setup).toContain("close command — see");
     });
 
     it("custom SETUP doc references the chosen provider's build-image command", async () => {
@@ -2200,7 +2277,7 @@ describe("InitService scaffold", () => {
 
     // --- sequential-reviewer ---
 
-    it("sequential-reviewer with github-issues produces implement-prompt with gh issue commands", async () => {
+    it("sequential-reviewer with github-issues keeps issue mutation out of the implement-prompt (ADR 0023)", async () => {
       const dir = await makeDir();
       await runScaffold(dir, {
         templateName: "sequential-reviewer",
@@ -2214,9 +2291,13 @@ describe("InitService scaffold", () => {
       expect(prompt).toContain("gh issue list");
       expect(prompt).toContain("labels");
       expect(prompt).toContain("comments");
-      expect(prompt).toContain("gh issue close");
+      expect(prompt).not.toContain("gh issue close");
+      expect(prompt).not.toContain("gh issue comment");
+      expect(prompt).toContain("do NOT close or comment on the issue");
+      expect(prompt).not.toContain("Completed by Sandcastle");
       expect(prompt).not.toContain("{{LIST_TASKS_COMMAND}}");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).not.toContain("{{CLOSE_TASK_INSTRUCTION}}");
+      expect(prompt).not.toContain("{{ISSUE_MUTATION_RULES}}");
     });
 
     it("sequential-reviewer with beads produces implement-prompt with bd commands", async () => {
@@ -2234,8 +2315,10 @@ describe("InitService scaffold", () => {
       expect(prompt).toContain("bd close");
       expect(prompt).not.toContain("gh issue list");
       expect(prompt).not.toContain("gh issue close");
+      expect(prompt).not.toContain("Completed by Sandcastle");
       expect(prompt).not.toContain("{{LIST_TASKS_COMMAND}}");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).not.toContain("{{CLOSE_TASK_INSTRUCTION}}");
+      expect(prompt).not.toContain("{{ISSUE_MUTATION_RULES}}");
     });
 
     it("sequential-reviewer implement-prompt uses backlog-agnostic language", async () => {
@@ -2397,7 +2480,7 @@ describe("InitService scaffold", () => {
       expect(prompt).not.toContain("{{VIEW_TASK_COMMAND}}");
     });
 
-    it("parallel-planner with github-issues produces merge-prompt with gh issue close", async () => {
+    it("parallel-planner with github-issues keeps issue mutation out of the merge-prompt (ADR 0023)", async () => {
       const dir = await makeDir();
       await runScaffold(dir, {
         templateName: "parallel-planner",
@@ -2408,8 +2491,13 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "merge-prompt.md"),
         "utf-8",
       );
-      expect(prompt).toContain("gh issue close");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      // No close/comment command — Sandcastle reports and closes each issue
+      // after its merged work is verified and landed.
+      expect(prompt).not.toContain("gh issue close");
+      expect(prompt).not.toContain("gh issue comment");
+      expect(prompt).toContain("Do not close or comment on any issue");
+      expect(prompt).not.toContain("Completed by Sandcastle");
+      expect(prompt).not.toContain("{{MERGE_CLOSE_INSTRUCTION}}");
     });
 
     it("parallel-planner with beads produces merge-prompt with bd close", async () => {
@@ -2425,10 +2513,11 @@ describe("InitService scaffold", () => {
       );
       expect(prompt).toContain("bd close");
       expect(prompt).not.toContain("gh issue");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).not.toContain("Completed by Sandcastle");
+      expect(prompt).not.toContain("{{MERGE_CLOSE_INSTRUCTION}}");
     });
 
-    it("parallel-planner implement-prompt does not contain close-issue instruction", async () => {
+    it("parallel-planner implement-prompt carries no close command, only the do-not-close rule", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "parallel-planner" });
 
@@ -2436,8 +2525,35 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "implement-prompt.md"),
         "utf-8",
       );
+      expect(prompt).not.toContain("gh issue close");
       expect(prompt).not.toContain("close the issue when done");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      // GitHub Issues (the default tracker): explicit do-not-close instruction.
+      expect(prompt).toContain("Do NOT close or comment on the issue");
+      expect(prompt).not.toContain("{{INCOMPLETE_TASK_INSTRUCTION}}");
+    });
+
+    it("parallel-planner main.mts bounds concurrency instead of launching every issue at once", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "parallel-planner" });
+
+      const main = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      // The worker pool caps in-flight implementers at MAX_PARALLEL — the
+      // unbounded Promise.allSettled(issues.map(…)) call is gone (the name
+      // still appears in the mapSettled doc comment, so assert the call).
+      expect(main).toContain("mapSettled(issues, MAX_PARALLEL");
+      expect(main).toContain("const MAX_PARALLEL");
+      expect(main).not.toContain("await Promise.allSettled(");
+      // The configured limit is re-read from settings.json each run so
+      // `sandcastle configure` (parallelism 1–4) takes effect; the env var
+      // overrides it, and 2 is the fallback.
+      expect(main).toContain(".sandcastle/settings.json");
+      expect(main).toContain("parallelism");
+      expect(main).toContain("SANDCASTLE_MAX_PARALLEL");
+      expect(main).toContain("return 2;");
+      expect(main).toContain("Math.min(Math.max(n, 1), 4)");
     });
 
     it("parallel-planner implement-prompt uses backlog-agnostic language", async () => {
@@ -2523,7 +2639,28 @@ describe("InitService scaffold", () => {
       expect(main).not.toContain("extractPlanIssues");
     });
 
-    it("parallel-planner-with-review implement-prompt does not contain close-issue instruction", async () => {
+    it("parallel-planner-with-review main.mts bounds concurrency instead of launching every pipeline at once", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        templateName: "parallel-planner-with-review",
+      });
+
+      const main = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      // Same bounded worker pool as parallel-planner: at most MAX_PARALLEL
+      // implement→review pipelines in flight (the name still appears in the
+      // mapSettled doc comment, so assert the call).
+      expect(main).toContain("mapSettled(issues, MAX_PARALLEL");
+      expect(main).toContain("const MAX_PARALLEL");
+      expect(main).not.toContain("await Promise.allSettled(");
+      expect(main).toContain(".sandcastle/settings.json");
+      expect(main).toContain("SANDCASTLE_MAX_PARALLEL");
+      expect(main).toContain("return 2;");
+    });
+
+    it("parallel-planner-with-review implement-prompt carries no close command, only the do-not-close rule", async () => {
       const dir = await makeDir();
       await runScaffold(dir, {
         templateName: "parallel-planner-with-review",
@@ -2533,8 +2670,10 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "implement-prompt.md"),
         "utf-8",
       );
+      expect(prompt).not.toContain("gh issue close");
       expect(prompt).not.toContain("close the issue when done");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).toContain("Do NOT close or comment on the issue");
+      expect(prompt).not.toContain("{{INCOMPLETE_TASK_INSTRUCTION}}");
     });
 
     it("parallel-planner-with-review implement-prompt uses TASK_ID placeholder", async () => {
@@ -2582,7 +2721,7 @@ describe("InitService scaffold", () => {
       expect(prompt).not.toContain("{{VIEW_TASK_COMMAND}}");
     });
 
-    it("parallel-planner-with-review with github-issues produces merge-prompt with gh issue close", async () => {
+    it("parallel-planner-with-review with github-issues keeps issue mutation out of the merge-prompt (ADR 0023)", async () => {
       const dir = await makeDir();
       await runScaffold(dir, {
         templateName: "parallel-planner-with-review",
@@ -2593,8 +2732,11 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "merge-prompt.md"),
         "utf-8",
       );
-      expect(prompt).toContain("gh issue close");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).not.toContain("gh issue close");
+      expect(prompt).not.toContain("gh issue comment");
+      expect(prompt).toContain("Do not close or comment on any issue");
+      expect(prompt).not.toContain("Completed by Sandcastle");
+      expect(prompt).not.toContain("{{MERGE_CLOSE_INSTRUCTION}}");
     });
 
     it("parallel-planner-with-review with beads produces merge-prompt with bd close", async () => {
@@ -2610,7 +2752,8 @@ describe("InitService scaffold", () => {
       );
       expect(prompt).toContain("bd close");
       expect(prompt).not.toContain("gh issue");
-      expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
+      expect(prompt).not.toContain("Completed by Sandcastle");
+      expect(prompt).not.toContain("{{MERGE_CLOSE_INSTRUCTION}}");
     });
 
     it("parallel-planner-with-review implement-prompt uses backlog-agnostic language", async () => {
@@ -3035,7 +3178,9 @@ describe("InitService scaffold", () => {
         expect(mainTs).toContain(
           'import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox"',
         );
-        expect(mainTs).toContain("issues.map");
+        // Bounded concurrency applies on the host too — the worker pool
+        // survives provider rewriting.
+        expect(mainTs).toContain("mapSettled(issues, MAX_PARALLEL");
 
         // Host dependency reuse stays; the container-only `npm install`
         // sandbox hook, its declaration, and its comments are stripped.
@@ -3050,7 +3195,7 @@ describe("InitService scaffold", () => {
         // The per-issue concurrency block binds an explicit branch from the
         // plan — never a shared head or merge-to-head worktree.
         const implementerBlock = mainTs.slice(
-          mainTs.indexOf("issues.map"),
+          mainTs.indexOf("mapSettled(issues"),
           mainTs.indexOf("settled.entries()"),
         );
         expect(implementerBlock).toContain("issue.branch");
@@ -3126,7 +3271,7 @@ describe("InitService scaffold", () => {
       },
     );
 
-    it("selecting host omits agent API-key env entries but keeps tracker env", async () => {
+    it("selecting host omits agent API-key env entries and GitHub's GH_TOKEN", async () => {
       const dir = await makeDir();
       await runScaffold(dir, {
         sandboxProvider: hostProvider,
@@ -3142,7 +3287,24 @@ describe("InitService scaffold", () => {
       expect(envExample).not.toContain("ANTHROPIC_API_KEY");
       expect(envExample).not.toContain("OPENAI_KEY");
       expect(envExample).toContain("No agent API key is required");
-      // Project-required env (the issue tracker's) is still scaffolded.
+      // Host + GitHub Issues: the `gh` CLI reuses `gh auth login` on this
+      // machine, so no token is scaffolded (ADR 0021).
+      expect(envExample).not.toContain("GH_TOKEN");
+    });
+
+    it("selecting docker keeps GH_TOKEN in .env.example for github-issues", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: dockerProvider,
+        issueTracker: getIssueTracker("github-issues"),
+      });
+
+      const envExample = await readFile(
+        join(dir, ".sandcastle", ".env.example"),
+        "utf-8",
+      );
+      // The container path still needs the token — gh inside the image has
+      // no host login to reuse.
       expect(envExample).toContain("GH_TOKEN=");
     });
 

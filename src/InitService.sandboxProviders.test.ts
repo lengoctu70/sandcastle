@@ -7,6 +7,18 @@ describe("Sandbox provider registry", () => {
     expect(providers.map((p) => p.name)).toEqual(["host", "docker", "podman"]);
   });
 
+  it("lists host first and marks it recommended for the interactive picker", () => {
+    // ADR 0021: the subscription-reusing host path leads the picker and
+    // carries the "(khuyến nghị)" marker + initial value.
+    const providers = listSandboxProviders();
+    expect(providers[0]!.name).toBe("host");
+    expect(providers[0]!.recommended).toBe(true);
+    // Exactly one recommended entry — the marker is unambiguous.
+    expect(providers.filter((p) => p.recommended === true)).toHaveLength(1);
+    // Container paths are still offered, just not marked.
+    expect(providers.slice(1).every((p) => p.recommended !== true)).toBe(true);
+  });
+
   it("getSandboxProvider returns a host entry with no image capability", () => {
     const provider = getSandboxProvider("host");
     expect(provider).toBeDefined();

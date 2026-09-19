@@ -390,6 +390,12 @@ type AgentFactory = (
  * Registry `factoryImport` name → provider factory. Mirrors the generated-code
  * contract in `InitService`'s template rewriting: the persisted `settings.effort`
  * reaches the factory under the registry entry's `effortOption` field name.
+ *
+ * Kept deliberately separate from `AGENT_REGISTRY` (scaffold metadata —
+ * dockerfile/env/template strings) and `DISCOVERY_ADAPTERS` (live host-CLI
+ * probes): each facet lives behind a different module boundary, and folding
+ * them into one registry would pull every provider implementation into
+ * `InitService`'s import graph for a ~15-line saving.
  */
 const AGENT_FACTORIES: Record<string, AgentFactory> = {
   claudeCode: (model, options) =>
@@ -446,19 +452,30 @@ const resolveSandboxProvider = (settings: ProjectSettings): SandboxProvider => {
 export const DEFAULT_COMPLETION_SIGNAL = "<promise>COMPLETE</promise>";
 
 /**
- * The implementation prompt for one selected issue. Built at run time rather
- * than read from a scaffolded template: the checked-in templates carry the
- * legacy "agent picks and closes issues" contract (`{{CLOSE_TASK_COMMAND}}`
- * etc.), while the run workflow must keep issue identity immutable and issue
- * closure out of the agent's reach. Inline prompts also bypass `` !`…` ``
- * shell expansion and `{{…}}` substitution, so issue bodies are passed to the
- * agent verbatim.
+ * The task context every run-phase prompt shares: the immutable selected
+ * issue, the source branch its work lives on, the target branch Sandcastle
+ * lands it on, and the project's verification commands. Bundled once per run
+ * (in {@link runIssueWorkflow}) so the three prompt builders stay in lockstep
+ * instead of repeating the same four parameters.
  */
-export const buildImplementationPrompt = (params: {
+export interface WorkflowPromptContext {
   readonly issue: GithubIssue;
   readonly sourceBranch: string;
   readonly targetBranch: string;
   readonly verificationCommands: readonly string[];
+}
+
+/**
+ * The implementation prompt for one selected issue. Built at run time rather
+ * than read from a scaffolded template: the checked-in templates carry a
+ * close-command substitution slot (`{{CLOSE_TASK_INSTRUCTION}}` and friends)
+ * whose value depends on the configured tracker, while the run workflow is
+ * GitHub-only and must keep issue identity immutable and issue closure out
+ * of the agent's reach. Inline prompts also bypass `` !`…` `` shell expansion
+ * and `{{…}}` substitution, so issue bodies are passed to the agent verbatim.
+ */
+export const buildImplementationPrompt = (params: {
+  readonly context: WorkflowPromptContext;
   /**
    * Set when `sandcastle retry` continues a run that stopped during
    * implementation: the recorded failure of the previous attempt. The
@@ -467,13 +484,9 @@ export const buildImplementationPrompt = (params: {
    */
   readonly resumeError?: string;
 }): string => {
-  const {
-    issue,
-    sourceBranch,
-    targetBranch,
-    verificationCommands,
-    resumeError,
-  } = params;
+  const { issue, sourceBranch, targetBranch, verificationCommands } =
+    params.context;
+  const { resumeError } = params;
   const verificationBlock =
     verificationCommands.length > 0
       ? `\n## Verification\n\nAfter you finish, the following project commands will be run to check your work. Make sure they pass:\n\n${verificationCommands.map((c) => `- \`${c}\``).join("\n")}\n`
@@ -509,25 +522,15 @@ When the work is fully implemented and committed, output exactly: ${DEFAULT_COMP
  * where the prompt must re-establish the task context itself.
  */
 export const buildVerificationRepairPrompt = (params: {
-  readonly issue: GithubIssue;
-  readonly sourceBranch: string;
-  readonly targetBranch: string;
-  readonly verificationCommands: readonly string[];
+  readonly context: WorkflowPromptContext;
   readonly failure: VerificationCommandResult;
   readonly attempt: number;
   readonly maxAttempts: number;
   readonly continuingSession: boolean;
 }): string => {
-  const {
-    issue,
-    sourceBranch,
-    targetBranch,
-    verificationCommands,
-    failure,
-    attempt,
-    maxAttempts,
-    continuingSession,
-  } = params;
+  const { issue, sourceBranch, targetBranch, verificationCommands } =
+    params.context;
+  const { failure, attempt, maxAttempts, continuingSession } = params;
   return `# Verification repair — attempt ${attempt}/${maxAttempts}
 
 ${
@@ -575,23 +578,14 @@ When the repair is committed, output exactly: ${DEFAULT_COMPLETION_SIGNAL}
  * on the integrated tree.
  */
 export const buildMergeConflictRepairPrompt = (params: {
-  readonly issue: GithubIssue;
-  readonly sourceBranch: string;
-  readonly targetBranch: string;
+  readonly context: WorkflowPromptContext;
   readonly integrationBranch: string;
   readonly mergeOutput: string;
-  readonly verificationCommands: readonly string[];
   readonly continuingSession: boolean;
 }): string => {
-  const {
-    issue,
-    sourceBranch,
-    targetBranch,
-    integrationBranch,
-    mergeOutput,
-    verificationCommands,
-    continuingSession,
-  } = params;
+  const { issue, sourceBranch, targetBranch, verificationCommands } =
+    params.context;
+  const { integrationBranch, mergeOutput, continuingSession } = params;
   return `# Merge conflict repair
 
 ${
@@ -1119,6 +1113,16 @@ export const runIssueWorkflow = async (
   const sourceBranch =
     resume?.sourceBranch ?? `sandcastle/issue-${issue.number}`;
 
+  // The shared prompt context — bundled once so every agent invocation this
+  // run (implementation + both repair paths) speaks of the same issue,
+  // branches, and verification contract.
+  const promptContext: WorkflowPromptContext = {
+    issue,
+    sourceBranch,
+    targetBranch,
+    verificationCommands: settings.verificationCommands,
+  };
+
   // ---- Failure path — one closure used by every phase after selection -------
 
   let phase: WorkflowRunPhase = "implementation";
@@ -1238,13 +1242,10 @@ export const runIssueWorkflow = async (
       agent,
       sandbox,
       prompt: buildMergeConflictRepairPrompt({
-        issue,
-        sourceBranch,
-        targetBranch,
+        context: promptContext,
         integrationBranch,
         mergeOutput:
           mergeError instanceof Error ? mergeError.message : String(mergeError),
-        verificationCommands: settings.verificationCommands,
         continuingSession: resumeSession !== undefined,
       }),
       name: `issue-${issue.number}-integrate`,
@@ -1488,10 +1489,7 @@ export const runIssueWorkflow = async (
         agent,
         sandbox,
         prompt: buildImplementationPrompt({
-          issue,
-          sourceBranch,
-          targetBranch,
-          verificationCommands: settings.verificationCommands,
+          context: promptContext,
           ...(resume !== undefined ? { resumeError: resume.error } : {}),
         }),
         name: `issue-${issue.number}`,
@@ -1560,10 +1558,7 @@ export const runIssueWorkflow = async (
             agent,
             sandbox,
             prompt: buildVerificationRepairPrompt({
-              issue,
-              sourceBranch,
-              targetBranch,
-              verificationCommands: settings.verificationCommands,
+              context: promptContext,
               failure: failed,
               attempt: attempts.verificationRepair,
               maxAttempts: MAX_VERIFICATION_REPAIR_ATTEMPTS,
