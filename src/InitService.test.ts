@@ -355,6 +355,31 @@ describe("InitService scaffold", () => {
     expect(mainTs).not.toContain("effort");
   });
 
+  it("injects the selected variant into the generated opencode() call", async () => {
+    const dir = await makeDir();
+    // OpenCode's reasoning-effort seam is the model variant — the discovered
+    // value is emitted as `{ variant: "…" }` so `opencode run --variant`
+    // receives it (OpenCodeOptions.variant).
+    await runScaffold(dir, {
+      agent: opencodeAgent,
+      model: "openai/gpt-5.6-sol",
+      settings: { effort: "high", modelSource: "discovered" },
+    });
+
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain(
+      'opencode("openai/gpt-5.6-sol", { variant: "high" })',
+    );
+    const settings = JSON.parse(
+      await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.effort).toBe("high");
+    expect(settings.modelSource).toBe("discovered");
+  });
+
   it("does not inject effort into factories that do not accept one", async () => {
     const dir = await makeDir();
     // `pi` declares no effortOption — an effort override stays in

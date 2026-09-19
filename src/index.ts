@@ -135,6 +135,7 @@ export type {
 // seam above. `sandcastle init` uses it to verify host-mode agents.
 export { DiscoveryError, DiscoveryDataError } from "./discovery/contract.js";
 export { codexDiscoveryAdapter } from "./discovery/codex.js";
+export { opencodeDiscoveryAdapter } from "./discovery/opencode.js";
 export {
   listDiscoveryAdapters,
   getDiscoveryAdapter,

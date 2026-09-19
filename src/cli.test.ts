@@ -667,4 +667,153 @@ if (key === "--version") {
       expect(await readdir(hostDir)).not.toContain(".sandcastle");
     }
   });
+
+  // ---------------------------------------------------------------------
+  // Same discovery seam for OpenCode: `--version` is a bare number so
+  // identity comes from `--help`; auth readiness comes from `auth list`;
+  // the verbose catalog carries `variants` used as effort choices.
+  // ---------------------------------------------------------------------
+
+  /**
+   * Write a fake `opencode` executable (a node script) into `dir`. `auth`
+   * toggles `opencode auth list` between one stored credential and an empty
+   * list. The catalog is a two-model verbose document: one variant-free
+   * `opencode` model first (the non-interactive default pick), one `openai`
+   * model with variants.
+   */
+  const writeFakeOpenCode = async (dir: string, auth: boolean) => {
+    const shim = join(dir, "opencode");
+    const authLines = auth
+      ? `console.log("●  OpenAI oauth"); console.log("└  1 credential"); process.exit(0);`
+      : `console.log("└  0 credentials"); process.exit(0);`;
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const key = process.argv.slice(2).join(" ");
+if (key === "--version") {
+  console.log("1.18.31");
+  process.exit(0);
+} else if (key === "--help") {
+  console.log([
+    "Commands:",
+    "  opencode run [message..]     run opencode with a message",
+    "  opencode models [provider]   list all available models",
+    "  opencode providers           manage AI providers and credentials",
+    "  opencode serve               starts a headless opencode server",
+  ].join("\\n"));
+  process.exit(0);
+} else if (key === "auth list") {
+  ${authLines}
+} else if (key === "models --verbose") {
+  console.log("opencode/big-pickle");
+  console.log(JSON.stringify({
+    id: "big-pickle", providerID: "opencode", name: "Big Pickle",
+    status: "active", variants: {},
+  }, null, 2));
+  console.log("openai/gpt-5.6-sol");
+  console.log(JSON.stringify({
+    id: "gpt-5.6-sol", providerID: "openai", name: "GPT-5.6 Sol",
+    status: "active",
+    variants: { none: {}, low: {}, medium: {}, high: {}, xhigh: {} },
+  }, null, 2));
+  process.exit(0);
+} else {
+  process.exit(1);
+}
+`,
+    );
+    await chmod(shim, 0o755);
+    return shim;
+  };
+
+  it("init --sandbox host --agent opencode discovers providers and persists model + variant as effort", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-opencode-"));
+    await writeFakeOpenCode(shimDir, true);
+
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent opencode --model openai/gpt-5.6-sol --effort high --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "opencode",
+      model: "openai/gpt-5.6-sol",
+      effort: "high",
+      modelSource: "discovered",
+      sandbox: "host",
+    });
+
+    // The variant reaches the generated opencode() call — which the factory
+    // emits as `opencode run --variant high`.
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain(
+      'opencode("openai/gpt-5.6-sol", { variant: "high" })',
+    );
+    expect(main).toContain("noSandbox()");
+  });
+
+  it("init --sandbox host --agent opencode persists no effort for a variant-free model", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-opencode-"));
+    await writeFakeOpenCode(shimDir, true);
+
+    // Non-interactive default: the catalog's first entry (big-pickle) has
+    // `variants: {}` — no effort is invented and none is persisted.
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent opencode --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "opencode",
+      model: "opencode/big-pickle",
+      modelSource: "discovered",
+    });
+    expect(settings.effort).toBeUndefined();
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('opencode("opencode/big-pickle")');
+    expect(main).not.toContain("variant");
+  });
+
+  it("init --sandbox host --agent opencode fails with login guidance when unauthenticated", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-opencode-"));
+    await writeFakeOpenCode(shimDir, false);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent opencode --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("opencode auth login");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
 });

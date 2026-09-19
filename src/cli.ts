@@ -338,11 +338,19 @@ const resolveDiscoveredSelection = (params: {
         clack.select({
           message: `Chọn model cho ${agentLabel}:`,
           initialValue: report.recommendedModel,
-          options: catalog.map((m) => ({
-            value: m.id,
-            label: m.displayName,
-            ...(m.description !== undefined ? { hint: m.description } : {}),
-          })),
+          options: catalog.map((m) => {
+            // Multi-provider agents (e.g. OpenCode) surface the model
+            // provider in the hint so the picker reads grouped by provider —
+            // the catalog already arrives in provider order.
+            const hint = [m.provider, m.description]
+              .filter((s): s is string => s !== undefined)
+              .join(" — ");
+            return {
+              value: m.id,
+              label: m.displayName,
+              ...(hint.length > 0 ? { hint } : {}),
+            };
+          }),
         }),
       );
       if (clack.isCancel(selected)) {

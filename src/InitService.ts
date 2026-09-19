@@ -241,7 +241,8 @@ export interface AgentEntry {
   readonly setupCommand: string;
   /**
    * Name of the factory-options field that receives the reasoning-effort
-   * value — `"effort"` for `codex("gpt-5.6-sol", { effort: "xhigh" })`.
+   * value — `"effort"` for `codex("gpt-5.6-sol", { effort: "xhigh" })`,
+   * `"variant"` for `opencode("openai/gpt-5.6-sol", { variant: "high" })`.
    * When set and init resolved an effort (flag or discovery), the generated
    * `main` passes it to the factory so the persisted `settings.json` value
    * actually reaches the agent CLI. Agents without an effort option leave it
@@ -504,6 +505,9 @@ CURSOR_API_KEY=`,
     label: "OpenCode",
     defaultModel: "opencode/big-pickle",
     factoryImport: "opencode",
+    // OpenCode's reasoning effort is the model *variant* — the generated call
+    // is `opencode("provider/model", { variant: "high" })` → `--variant high`.
+    effortOption: "variant",
     dockerfileTemplate: OPENCODE_DOCKERFILE,
     envExample: `# OpenCode API key
 OPENCODE_API_KEY=`,
