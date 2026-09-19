@@ -228,14 +228,22 @@ const runDiscovery = (
 const resolveDiscoveredSelection = (params: {
   readonly adapter: AgentDiscoveryAdapter;
   readonly agentLabel: string;
+  /** Registry default used when the agent has no model catalog to pick from. */
+  readonly defaultModel: string;
   readonly modelFlag: Option.Option<string>;
   readonly effortFlag: Option.Option<string>;
   readonly isInteractive: boolean;
 }): Effect.Effect<DiscoveredSelection, InitError, Display> =>
   Effect.gen(function* () {
     const d = yield* Display;
-    const { adapter, agentLabel, modelFlag, effortFlag, isInteractive } =
-      params;
+    const {
+      adapter,
+      agentLabel,
+      defaultModel,
+      modelFlag,
+      effortFlag,
+      isInteractive,
+    } = params;
 
     let report = yield* runDiscovery(adapter, agentLabel);
 
@@ -319,6 +327,26 @@ const resolveDiscoveredSelection = (params: {
       `${agentLabel} ${report.version ?? ""} — đã xác minh và đăng nhập`.trim(),
       "success",
     );
+
+    if (catalog.length === 0) {
+      // The agent is verified and signed in, but its CLI exposes no model
+      // catalog (e.g. Claude Code, Copilot). The model can never be verified
+      // against a live list, so selection stays on the static path — the
+      // --model flag or the registry default — and is persisted as
+      // "manual-unverified" rather than "discovered" (ADR 0021).
+      if (report.guidance !== undefined) {
+        yield* d.status(report.guidance, "warn");
+      }
+      const model =
+        modelFlag._tag === "Some" && modelFlag.value.trim().length > 0
+          ? modelFlag.value.trim()
+          : defaultModel;
+      const effort =
+        effortFlag._tag === "Some" && effortFlag.value.trim().length > 0
+          ? effortFlag.value.trim()
+          : undefined;
+      return { model, effort, modelSource: "manual-unverified" };
+    }
 
     let model: string;
     if (modelFlag._tag === "Some") {
@@ -599,9 +627,11 @@ const initCommand = Command.make(
       // Resolve model + effort. In host mode with a discovery adapter, the
       // agent's live catalog is the source of truth (ADR 0021) — the agent's
       // executable is fingerprinted, its login verified, and the chosen
-      // model/effort persisted as `modelSource: "discovered"`. Everything
-      // else keeps the static registry default, marked "manual-unverified"
-      // since it was never checked against the agent.
+      // model/effort persisted as `modelSource: "discovered"`. Agents whose
+      // CLI exposes no catalog report `ready` with an empty model list and
+      // keep the flag-or-default selection, marked "manual-unverified".
+      // Everything else keeps the static registry default, marked
+      // "manual-unverified" since it was never checked against the agent.
       let selectedModel: string;
       let selectedEffort: string | undefined;
       let modelSource: ModelSource = "manual-unverified";
@@ -612,6 +642,7 @@ const initCommand = Command.make(
         const selection = yield* resolveDiscoveredSelection({
           adapter: discoveryAdapter,
           agentLabel: selectedAgent.label,
+          defaultModel: selectedAgent.defaultModel,
           modelFlag,
           effortFlag,
           isInteractive,

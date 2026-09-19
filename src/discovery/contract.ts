@@ -143,8 +143,12 @@ export interface AgentDiscoveryReport {
   /** The auth status line reported by the CLI (e.g. `"Logged in using ChatGPT"`). */
   readonly authDetail?: string;
   /**
-   * The live model catalog. Populated whenever the catalog could be read —
-   * always non-empty on `"ready"` reports.
+   * The live model catalog. Populated whenever the catalog could be read.
+   * Agents whose CLI exposes no model-list command (e.g. Claude Code,
+   * Copilot) report `"ready"` with an empty catalog — identity and auth were
+   * still verified; the init picker then keeps the `--model` flag or registry
+   * default and marks the selection `manual-unverified` rather than
+   * `"discovered"`.
    */
   readonly models: readonly DiscoveredModel[];
   /** The model the catalog itself recommends (its default/flagship entry). */

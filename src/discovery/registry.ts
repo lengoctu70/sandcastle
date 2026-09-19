@@ -3,10 +3,13 @@ import type {
   AgentDiscoveryReport,
   DiscoveryExec,
 } from "./contract.js";
+import { claudeCodeDiscoveryAdapter } from "./claude-code.js";
 import { codexDiscoveryAdapter } from "./codex.js";
 import { piDiscoveryAdapter } from "./pi.js";
 import { opencodeDiscoveryAdapter } from "./opencode.js";
 import { devinDiscoveryAdapter } from "./devin.js";
+import { cursorDiscoveryAdapter } from "./cursor.js";
+import { copilotDiscoveryAdapter } from "./copilot.js";
 import { nodeDiscoveryExec } from "./nodeExec.js";
 
 /**
@@ -19,10 +22,13 @@ import { nodeDiscoveryExec } from "./nodeExec.js";
  * static path (ticket #14 renders the full per-agent state list).
  */
 const DISCOVERY_ADAPTERS: readonly AgentDiscoveryAdapter[] = [
+  claudeCodeDiscoveryAdapter,
   codexDiscoveryAdapter,
   piDiscoveryAdapter,
   opencodeDiscoveryAdapter,
   devinDiscoveryAdapter,
+  cursorDiscoveryAdapter,
+  copilotDiscoveryAdapter,
 ];
 
 /** All registered discovery adapters, in display order. */

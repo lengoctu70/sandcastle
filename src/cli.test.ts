@@ -328,15 +328,19 @@ describe("sandcastle CLI", () => {
   });
 
   it("init --sandbox host scaffolds host mode with the warning and no image", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
     await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    // Host-mode init now fingerprints `claude` — provide a fake executable.
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-claude-"));
+    await writeFakeClaude(shimDir, true);
 
     // No --build-image flag: host mode must not prompt for one even
     // non-interactively — there is no image to build.
-    const { stdout } = await runCli(
-      "init --agent claude-code --template blank --sandbox host --issue-tracker beads",
-      hostDir,
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent claude-code --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
     );
 
     // The Vietnamese trust warning is shown before the choice is saved —
@@ -368,13 +372,16 @@ describe("sandcastle CLI", () => {
   });
 
   it("init --sandbox host --template simple-loop scaffolds a runnable host worktree workflow", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
     await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-claude-"));
+    await writeFakeClaude(shimDir, true);
 
-    const { stdout } = await runCli(
-      "init --agent claude-code --template simple-loop --sandbox host --issue-tracker beads",
-      hostDir,
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent claude-code --template simple-loop --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
     );
 
     // Host-mode trust warning + Vietnamese completion, no image instructions.
@@ -409,15 +416,18 @@ describe("sandcastle CLI", () => {
   it.each(["parallel-planner", "parallel-planner-with-review"])(
     "init --sandbox host --template %s scaffolds a branch-isolated host workflow",
     async (template) => {
+      if (process.platform === "win32") return; // POSIX shim only
       const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
       await initRepo(hostDir);
       await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-claude-"));
+      await writeFakeClaude(shimDir, true);
 
       // --install-template-deps false declines the zod offer (parallel
       // templates declare a zod dependency for the planner's <plan> schema).
-      const { stdout } = await runCli(
-        `init --agent claude-code --template ${template} --sandbox host --issue-tracker beads --install-template-deps false`,
-        hostDir,
+      const { stdout } = await execAsync(
+        `node ${cliPath} init --agent claude-code --template ${template} --sandbox host --issue-tracker beads --install-template-deps false`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
       );
 
       expect(stdout).toContain("Khởi tạo xong");
@@ -439,6 +449,62 @@ describe("sandcastle CLI", () => {
       expect(main).not.toContain("sandcastle:sandbox-");
     },
   );
+
+  it("init --sandbox host --agent claude-code persists the flag model as manual-unverified (no catalog)", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-claude-"));
+    await writeFakeClaude(shimDir, true);
+
+    // Claude Code is verified and logged in, but its CLI exposes no model
+    // catalog — the --model flag is accepted without catalog validation and
+    // the selection is honestly marked unverified rather than "discovered".
+    const { stdout } = await execAsync(
+      `node ${cliPath} init --agent claude-code --model claude-sonnet-4-6 --template blank --sandbox host --issue-tracker beads`,
+      { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+    );
+
+    expect(stdout).toContain("Khởi tạo xong");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "claude-code",
+      model: "claude-sonnet-4-6",
+      modelSource: "manual-unverified",
+      sandbox: "host",
+    });
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('claudeCode("claude-sonnet-4-6")');
+    expect(main).toContain("noSandbox()");
+  });
+
+  it("init --sandbox host --agent claude-code fails with login guidance when unauthenticated", async () => {
+    if (process.platform === "win32") return; // POSIX shim only
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-claude-"));
+    await writeFakeClaude(shimDir, false);
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      // Login guidance names the host login command, not an API key.
+      expect(output).toContain("claude auth login");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
 
   // ---------------------------------------------------------------------
   // Host-mode agent discovery (ADR 0021): `init --agent codex --sandbox host`
@@ -516,6 +582,35 @@ if (key === "--version") {
   /** PATH containing the shim dir plus node's own dir (for /usr/bin/env node). */
   const shimmedPath = (shimDir: string) =>
     `${shimDir}:${dirname(process.execPath)}:${process.env.PATH}`;
+
+  /**
+   * Write a fake `claude` executable into `dir` answering the two probes the
+   * Claude Code adapter runs: `--version` (product fingerprint) and
+   * `auth status` (JSON `loggedIn`). Host-mode init for claude-code now runs
+   * discovery, so tests must never touch the machine's real `claude`.
+   */
+  const writeFakeClaude = async (dir: string, auth: boolean) => {
+    const shim = join(dir, "claude");
+    const authLine = auth
+      ? `console.log(JSON.stringify({ loggedIn: true, authMethod: "oauth" })); process.exit(0);`
+      : `console.log(JSON.stringify({ loggedIn: false, authMethod: "none" })); process.exit(1);`;
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const key = process.argv.slice(2).join(" ");
+if (key === "--version") {
+  console.log("2.1.263 (Claude Code)");
+  process.exit(0);
+} else if (key === "auth status") {
+  ${authLine}
+} else {
+  process.exit(1);
+}
+`,
+    );
+    await chmod(shim, 0o755);
+    return shim;
+  };
 
   it("init --sandbox host --agent codex discovers and persists the recommended model and effort", async () => {
     if (process.platform === "win32") return; // POSIX shim only

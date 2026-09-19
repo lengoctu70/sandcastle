@@ -95,12 +95,27 @@ describe("discovery registry", () => {
     expect(opencode?.loginGuidance).toContain("opencode auth login");
   });
 
+  it("registers the Claude Code, Cursor, and Copilot adapters", () => {
+    expect(getDiscoveryAdapter("claude-code")?.executable).toBe("claude");
+    // Cursor runs the `agent` executable — the collision-prone name.
+    expect(getDiscoveryAdapter("cursor")?.executable).toBe("agent");
+    expect(getDiscoveryAdapter("copilot")?.executable).toBe("copilot");
+    expect(listDiscoveryAdapters().map((a) => a.agent)).toEqual([
+      "claude-code",
+      "codex",
+      "pi",
+      "opencode",
+      "devin",
+      "cursor",
+      "copilot",
+    ]);
+  });
+
   it("returns undefined for agents without an adapter", async () => {
-    expect(getDiscoveryAdapter("claude-code")).toBeUndefined();
-    // Claude, Cursor & friends are later tickets — they resolve to
-    // `undefined` so init keeps them on the static path for now.
-    expect(await discoverAgent("claude-code", READY_EXEC)).toBeUndefined();
-    expect(await discoverAgent("cursor", READY_EXEC)).toBeUndefined();
+    // Every scaffold agent has a discovery adapter now — only truly
+    // unknown names resolve to `undefined`.
+    expect(getDiscoveryAdapter("nonexistent")).toBeUndefined();
+    expect(await discoverAgent("nonexistent", READY_EXEC)).toBeUndefined();
   });
 
   it("discovers a ready codex through the injected boundary", async () => {
@@ -112,7 +127,22 @@ describe("discovery registry", () => {
   it("discovers every registered agent in parallel", async () => {
     const reports = await discoverAgents(READY_EXEC);
     expect(reports).toHaveLength(listDiscoveryAdapters().length);
-    expect(reports[0]?.agent).toBe("codex");
+    expect(reports.map((r) => r.agent)).toEqual([
+      "claude-code",
+      "codex",
+      "pi",
+      "opencode",
+      "devin",
+      "cursor",
+      "copilot",
+    ]);
+    // The fake boundary only knows codex; every other adapter still reports
+    // its own state (wrong-product here — the exec answers but not as the
+    // expected product) instead of throwing.
+    expect(reports.find((r) => r.agent === "codex")?.state).toBe("ready");
+    expect(reports.find((r) => r.agent === "cursor")?.state).toBe(
+      "wrong-product",
+    );
   });
 
   it("converts a throwing boundary into an error report instead of rejecting", async () => {
