@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -241,6 +241,33 @@ describe("sandcastle CLI", () => {
     const entries = await readdir(join(hostDir, ".sandcastle"));
     expect(entries).toContain("Dockerfile");
     expect(entries).toContain("prompt.md");
+  });
+
+  it("init writes a reloadable .sandcastle/settings.json with the chosen options", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    const { stdout } = await runCli(
+      "init --agent claude-code --model claude-opus-4-8 --template simple-loop --sandbox podman --issue-tracker beads --build-image false",
+      hostDir,
+    );
+
+    expect(stdout).toContain("Init complete");
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      version: 1,
+      agent: "claude-code",
+      model: "claude-opus-4-8",
+      modelSource: "manual-unverified",
+      workflow: "simple-loop",
+      sandbox: "podman",
+      issueTracker: "beads",
+      verificationCommands: [],
+      parallelism: 1,
+    });
   });
 
   it("init without --agent fails fast with a clear non-interactive error message", async () => {
