@@ -258,7 +258,7 @@ describe("InitService scaffold", () => {
     await expect(access(join(configDir, "main.mts"))).resolves.toBeUndefined();
   });
 
-  it("blank template main.mts imports from @ai-hero/sandcastle", async () => {
+  it("blank template main.mts imports from @lengoctu70/sandcastle", async () => {
     const dir = await makeDir();
     await runScaffold(dir, { templateName: "blank" });
 
@@ -266,7 +266,7 @@ describe("InitService scaffold", () => {
       join(dir, ".sandcastle", "main.mts"),
       "utf-8",
     );
-    expect(mainTs).toContain('"@ai-hero/sandcastle"');
+    expect(mainTs).toContain('"@lengoctu70/sandcastle"');
   });
 
   it("blank template main.mts calls run()", async () => {
@@ -336,7 +336,7 @@ describe("InitService scaffold", () => {
     await expect(access(join(configDir, "prompt.md"))).resolves.toBeUndefined();
   });
 
-  it("simple-loop main.mts imports from @ai-hero/sandcastle", async () => {
+  it("simple-loop main.mts imports from @lengoctu70/sandcastle", async () => {
     const dir = await makeDir();
     await runScaffold(dir, { templateName: "simple-loop" });
 
@@ -344,7 +344,7 @@ describe("InitService scaffold", () => {
       join(dir, ".sandcastle", "main.mts"),
       "utf-8",
     );
-    expect(mainTs).toContain('"@ai-hero/sandcastle"');
+    expect(mainTs).toContain('"@lengoctu70/sandcastle"');
   });
 
   it("simple-loop main.mts contains sandcastle.run() with expected options", async () => {
@@ -397,7 +397,7 @@ describe("InitService scaffold", () => {
       ).resolves.toBeUndefined();
     });
 
-    it("main.mts imports from @ai-hero/sandcastle", async () => {
+    it("main.mts imports from @lengoctu70/sandcastle", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "sequential-reviewer" });
 
@@ -405,7 +405,7 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      expect(mainTs).toContain('"@ai-hero/sandcastle"');
+      expect(mainTs).toContain('"@lengoctu70/sandcastle"');
     });
 
     it("main.mts uses createSandbox so implementer and reviewer share a sandbox", async () => {
@@ -1088,7 +1088,7 @@ describe("InitService scaffold", () => {
       expect(mainTs).toContain("sandcastle");
     });
 
-    it("main.mts imports from @ai-hero/sandcastle", async () => {
+    it("main.mts imports from @lengoctu70/sandcastle", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "parallel-planner" });
 
@@ -1096,7 +1096,7 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      expect(mainTs).toContain('"@ai-hero/sandcastle"');
+      expect(mainTs).toContain('"@lengoctu70/sandcastle"');
     });
 
     it("main.mts references the specified model for all factory calls", async () => {
@@ -1191,7 +1191,7 @@ describe("InitService scaffold", () => {
       ).resolves.toBeUndefined();
     });
 
-    it("main.mts imports from @ai-hero/sandcastle", async () => {
+    it("main.mts imports from @lengoctu70/sandcastle", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "parallel-planner-with-review" });
 
@@ -1199,7 +1199,7 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      expect(mainTs).toContain('"@ai-hero/sandcastle"');
+      expect(mainTs).toContain('"@lengoctu70/sandcastle"');
     });
 
     it("main.mts uses createSandbox for shared sandbox per branch", async () => {
@@ -2283,7 +2283,7 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      expect(mainContent).toContain("@ai-hero/sandcastle");
+      expect(mainContent).toContain("@lengoctu70/sandcastle");
     });
 
     it("scaffolds main.mts when package.json has type: commonjs", async () => {
@@ -2328,7 +2328,7 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "main.ts"),
         "utf-8",
       );
-      expect(mainContent).toContain("@ai-hero/sandcastle");
+      expect(mainContent).toContain("@lengoctu70/sandcastle");
       expect(mainContent).toContain('claudeCode("claude-opus-4-8")');
     });
 
@@ -2434,7 +2434,7 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(mainTs).toContain(
-        'import { podman } from "@ai-hero/sandcastle/sandboxes/podman"',
+        'import { podman } from "@lengoctu70/sandcastle/sandboxes/podman"',
       );
       expect(mainTs).toContain("sandbox: podman()");
       expect(mainTs).not.toContain("docker");
@@ -2465,10 +2465,10 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(mainTs).toContain(
-        'import { run, claudeCode } from "@ai-hero/sandcastle"',
+        'import { run, claudeCode } from "@lengoctu70/sandcastle"',
       );
       expect(mainTs).toContain(
-        'import { docker } from "@ai-hero/sandcastle/sandboxes/docker"',
+        'import { docker } from "@lengoctu70/sandcastle/sandboxes/docker"',
       );
       expect(mainTs).toContain("sandbox: docker()");
     });
@@ -2502,7 +2502,7 @@ describe("InitService scaffold", () => {
       // factory identifier is `noSandbox` — a single word replace would
       // produce `sandboxes/noSandbox`.
       expect(mainTs).toContain(
-        'import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox"',
+        'import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox"',
       );
       expect(mainTs).toContain("sandbox: noSandbox()");
       expect(mainTs).not.toContain("docker");
@@ -2589,7 +2589,7 @@ describe("InitService scaffold", () => {
           "utf-8",
         );
         expect(mainTs).toContain(
-          'import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox"',
+          'import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox"',
         );
         expect(mainTs).toContain("issues.map");
 
@@ -2763,7 +2763,7 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(mainTs).toContain(
-        'import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox"',
+        'import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox"',
       );
       expect(mainTs).toContain("sandbox: noSandbox()");
       // The no-sandbox runtime default is `head`; host mode must work in a

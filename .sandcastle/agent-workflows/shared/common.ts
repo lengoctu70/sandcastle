@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync, execSync } from "node:child_process";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
-import * as sandcastle from "@ai-hero/sandcastle";
+import * as sandcastle from "@lengoctu70/sandcastle";
 
 export const outputDir = (): string => process.env.OUTPUT_DIR ?? "/tmp";
 

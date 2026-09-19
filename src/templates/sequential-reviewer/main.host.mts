@@ -21,8 +21,8 @@
 // Or add to package.json:
 //   "scripts": { "sandcastle": "npx tsx .sandcastle/main.mts" }
 
-import * as sandcastle from "@ai-hero/sandcastle";
-import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
+import * as sandcastle from "@lengoctu70/sandcastle";
+import { noSandbox } from "@lengoctu70/sandcastle/sandboxes/no-sandbox";
 
 // ---------------------------------------------------------------------------
 // Configuration
