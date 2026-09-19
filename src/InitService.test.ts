@@ -2620,5 +2620,184 @@ describe("InitService scaffold", () => {
       );
       expect(setup).toContain("sandcastle docker build-image");
     });
+
+    // --- Host mode sequential workflows (ADR 0021) ---
+    //
+    // simple-loop and sequential-reviewer ship provider-native
+    // `main.host.mts` variants: the container-only `npm install` sandbox hook
+    // and container-oriented comments cannot be produced by rewriting the
+    // shared main.mts, so the variant replaces it wholesale when the host
+    // provider is selected.
+
+    it("host simple-loop runs noSandbox in a worktree with explicit merge-to-head", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        templateName: "simple-loop",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain(
+        'import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox"',
+      );
+      expect(mainTs).toContain("sandbox: noSandbox()");
+      // The no-sandbox runtime default is `head`; host mode must work in a
+      // separate worktree instead of editing the user's checkout directly.
+      expect(mainTs).toContain('branchStrategy: { type: "merge-to-head" }');
+      // Host dependency reuse is retained — host node_modules is copied into
+      // the worktree, so the workflow needs no install step at all.
+      expect(mainTs).toContain('copyToWorktree: ["node_modules"]');
+    });
+
+    it("host simple-loop drops the container-only install hook and image references", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        templateName: "simple-loop",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      const { readdir, access } = await import("node:fs/promises");
+      // The docker template's `hooks.sandbox.onSandboxReady: npm install`
+      // exists to fix up container binaries — meaningless on the host.
+      expect(mainTs).not.toContain("onSandboxReady");
+      expect(mainTs).not.toContain("npm install");
+      expect(mainTs).not.toContain("docker");
+      expect(mainTs).not.toContain("podman");
+      expect(mainTs).not.toContain("isolated container");
+      expect(mainTs).not.toContain("image");
+      // No image files or leftover variant sources in the scaffold.
+      const entries = await readdir(join(dir, ".sandcastle"));
+      expect(entries).not.toContain("Dockerfile");
+      expect(entries).not.toContain("Containerfile");
+      expect(entries).not.toContain("main.host.mts");
+      await expect(
+        access(join(dir, ".sandcastle", "prompt.md")),
+      ).resolves.toBeUndefined();
+    });
+
+    it("host sequential-reviewer shares one host worktree for implement and review", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        templateName: "sequential-reviewer",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("sandboxes/no-sandbox");
+      const createCall = mainTs.slice(
+        mainTs.indexOf("createSandbox({"),
+        mainTs.indexOf("});", mainTs.indexOf("createSandbox({")),
+      );
+      expect(createCall).toContain("sandbox: noSandbox()");
+      // The explicit branch is the shared task worktree — implementation and
+      // review run in it back-to-back, so there is deliberately no
+      // merge-to-head (incompatible with the reviewer handoff).
+      expect(createCall).toContain("branch");
+      expect(createCall).toContain("copyToWorktree");
+      expect(mainTs).not.toContain("merge-to-head");
+      // Both phases run on the same sandbox handle = same host worktree.
+      expect(mainTs.match(/sandbox\.run\(\{/g)).toHaveLength(2);
+      expect(mainTs).toContain('name: "implementer"');
+      expect(mainTs).toContain('name: "reviewer"');
+      expect(mainTs).toContain("sandbox.close");
+    });
+
+    it("host sequential-reviewer drops the container-only install hook", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: hostProvider,
+        templateName: "sequential-reviewer",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).not.toContain("onSandboxReady");
+      expect(mainTs).not.toContain("npm install");
+      expect(mainTs).not.toContain("docker");
+      expect(mainTs).not.toContain("podman");
+      const { readdir } = await import("node:fs/promises");
+      const entries = await readdir(join(dir, ".sandcastle"));
+      expect(entries).not.toContain("main.host.mts");
+      // Reviewer prompts and the standards file still ship.
+      expect(entries).toContain("implement-prompt.md");
+      expect(entries).toContain("review-prompt.md");
+      expect(entries).toContain("CODING_STANDARDS.md");
+    });
+
+    it("host sequential templates still write settings.json with the workflow + sandbox", async () => {
+      for (const template of ["simple-loop", "sequential-reviewer"]) {
+        const dir = await makeDir();
+        await runScaffold(dir, {
+          sandboxProvider: hostProvider,
+          templateName: template,
+        });
+
+        const settings = JSON.parse(
+          await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+        );
+        expect(settings.sandbox).toBe("host");
+        expect(settings.workflow).toBe(template);
+      }
+    });
+
+    // --- Container-provider regression: docker/podman output is unchanged ---
+
+    it("docker sequential mains are byte-identical to their templates", async () => {
+      // With the template's own agent/model there is nothing to rewrite, so
+      // the scaffolded main must equal the template file byte for byte.
+      for (const template of ["simple-loop", "sequential-reviewer"]) {
+        const dir = await makeDir();
+        await runScaffold(dir, {
+          sandboxProvider: dockerProvider,
+          templateName: template,
+          model: "claude-sonnet-4-6",
+        });
+
+        const generated = await readFile(
+          join(dir, ".sandcastle", "main.mts"),
+          "utf-8",
+        );
+        const source = await readFile(
+          join(import.meta.dirname, "templates", template, "main.mts"),
+          "utf-8",
+        );
+        expect(generated).toBe(source);
+      }
+    });
+
+    it("podman sequential mains equal the docker output with the provider swapped", async () => {
+      for (const template of ["simple-loop", "sequential-reviewer"]) {
+        const dir = await makeDir();
+        await runScaffold(dir, {
+          sandboxProvider: podmanProvider,
+          templateName: template,
+          model: "claude-sonnet-4-6",
+        });
+
+        const generated = await readFile(
+          join(dir, ".sandcastle", "main.mts"),
+          "utf-8",
+        );
+        const source = await readFile(
+          join(import.meta.dirname, "templates", template, "main.mts"),
+          "utf-8",
+        );
+        // The long-standing provider rewrite is a whole-word docker→podman
+        // swap; the host-variant seam must not alter it.
+        expect(generated).toBe(source.replace(/\bdocker\b/g, "podman"));
+      }
+    });
   });
 });

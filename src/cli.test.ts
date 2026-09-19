@@ -359,4 +359,43 @@ describe("sandcastle CLI", () => {
     );
     expect(settings.sandbox).toBe("host");
   });
+
+  it("init --sandbox host --template simple-loop scaffolds a runnable host worktree workflow", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    const { stdout } = await runCli(
+      "init --agent claude-code --template simple-loop --sandbox host --issue-tracker beads",
+      hostDir,
+    );
+
+    // Host-mode trust warning + Vietnamese completion, no image instructions.
+    expect(stdout).toContain("Cảnh báo chế độ host");
+    expect(stdout).toContain("Khởi tạo xong");
+    expect(stdout).not.toContain("build-image");
+
+    // The generated main runs the agent on the host in a separate worktree
+    // with explicit merge-to-head, and carries no container-only setup.
+    const entries = await readdir(join(hostDir, ".sandcastle"));
+    expect(entries).not.toContain("Dockerfile");
+    expect(entries).not.toContain("Containerfile");
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain("sandboxes/no-sandbox");
+    expect(main).toContain("noSandbox()");
+    expect(main).toContain('branchStrategy: { type: "merge-to-head" }');
+    expect(main).toContain('copyToWorktree: ["node_modules"]');
+    expect(main).not.toContain("onSandboxReady");
+    expect(main).not.toContain("npm install");
+    expect(main).not.toContain("docker");
+
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.sandbox).toBe("host");
+    expect(settings.workflow).toBe("simple-loop");
+  });
 });

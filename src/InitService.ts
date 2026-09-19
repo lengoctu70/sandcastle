@@ -828,6 +828,11 @@ const hostNextStepsLines = (
         `${step++}. Tùy chỉnh .sandcastle/CODING_STANDARDS.md theo chuẩn của dự án — reviewer agent đọc tệp này khi review`,
       );
     }
+    // The sequential templates reuse host dependencies in each worktree via
+    // copyToWorktree — there is no image and no in-sandbox install step.
+    lines.push(
+      `${step++}. Host mode chạy agent trong một git worktree riêng và tái sử dụng dependencies của host qua \`copyToWorktree\` (ví dụ node_modules) — không cần bước cài đặt nào trong worktree`,
+    );
   }
   lines.push(
     `${step++}. Thêm "sandcastle": "npx tsx .sandcastle/${mainFilename}" vào package.json scripts`,
@@ -870,32 +875,63 @@ const COMPILED_FILE_EXTENSIONS = [
   ".d.mts.map",
 ];
 
+/**
+ * Provider-specific main variants — `main.<provider>.mts` (e.g.
+ * `main.host.mts`). A template ships one when the shared `main.mts` cannot
+ * produce good output for that provider through rewriting alone: host mode's
+ * sequential workflows, for example, drop the container-only `npm install`
+ * sandbox hook and describe worktrees rather than containers. Variants are
+ * authored provider-native (they call `noSandbox()` directly instead of the
+ * `docker()` placeholder) and are never emitted under their own filename.
+ */
+const PROVIDER_MAIN_VARIANT_RE = /^main\.[^.]+\.mts$/;
+
+/**
+ * Copy a template directory into the scaffold. Returns the name of the file
+ * used as the main source — `main.<provider>.mts` when the template ships a
+ * variant for the selected sandbox provider, else `main.mts` — so
+ * {@link rewriteMainTs} knows whether the provider placeholder rewrite
+ * applies.
+ */
 const copyTemplateFiles = (
   templateDir: string,
   destDir: string,
   mainFilename: string,
-): Effect.Effect<void, Error, FileSystem.FileSystem> =>
+  sandboxProviderName: string,
+): Effect.Effect<string, Error, FileSystem.FileSystem> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const files = yield* fs
       .readDirectory(templateDir)
       .pipe(Effect.mapError((e) => new Error(e.message)));
+    const providerVariant = `main.${sandboxProviderName}.mts`;
+    const mainSource = files.includes(providerVariant)
+      ? providerVariant
+      : "main.mts";
     yield* Effect.all(
       files
         .filter(
           (f) =>
             f !== "template.json" &&
             f !== ".env.example" &&
-            !COMPILED_FILE_EXTENSIONS.some((ext) => f.endsWith(ext)),
+            !COMPILED_FILE_EXTENSIONS.some((ext) => f.endsWith(ext)) &&
+            // Provider variants are codegen inputs, not scaffold output:
+            // only the selected provider's variant ships, always renamed to
+            // the canonical main filename. The shared main.mts is skipped
+            // whenever a variant won.
+            (PROVIDER_MAIN_VARIANT_RE.test(f)
+              ? f === mainSource
+              : f !== "main.mts" || mainSource === "main.mts"),
         )
         .map((f) => {
-          const destName = f === "main.mts" ? mainFilename : f;
+          const destName = f === mainSource ? mainFilename : f;
           return fs
             .copyFile(join(templateDir, f), join(destDir, destName))
             .pipe(Effect.mapError((e) => new Error(e.message)));
         }),
       { concurrency: "unbounded" },
     );
+    return mainSource;
   });
 
 const escapeRegExp = (s: string): string =>
@@ -972,6 +1008,12 @@ const injectRunBranchStrategy = (
  * Templates use `claudeCode` as the default agent factory and `docker` as the
  * default sandbox provider. When a different agent, model, or sandbox provider
  * is selected, this function rewrites the imports and factory calls.
+ *
+ * `providerVariant` is true when the file came from a `main.<provider>.mts`
+ * variant rather than the shared `main.mts`. Variants are authored
+ * provider-native, so the `docker` placeholder rewrite is skipped for them —
+ * running it would also corrupt variant comments that legitimately mention
+ * Docker (word-boundary replace cannot tell code from prose).
  */
 const rewriteMainTs = (
   configDir: string,
@@ -979,6 +1021,7 @@ const rewriteMainTs = (
   model: string,
   sandboxProvider: SandboxProviderEntry,
   mainFilename: string,
+  providerVariant: boolean,
 ): Effect.Effect<void, Error, FileSystem.FileSystem> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1020,14 +1063,18 @@ const rewriteMainTs = (
     // from its subpath (`no-sandbox`), and a single word-boundary replace
     // would wrongly produce `sandboxes/noSandbox`. For docker/podman this is
     // equivalent to the old one-pass replace (both fields equal the name).
-    content = content.replace(
-      /sandboxes\/docker\b/g,
-      `sandboxes/${sandboxProvider.codegen.importSubpath}`,
-    );
-    content = content.replace(
-      /\bdocker\b/g,
-      sandboxProvider.codegen.factoryImport,
-    );
+    // Provider-variant mains (main.<provider>.mts) are already provider-native
+    // and skip this rewrite entirely.
+    if (!providerVariant) {
+      content = content.replace(
+        /sandboxes\/docker\b/g,
+        `sandboxes/${sandboxProvider.codegen.importSubpath}`,
+      );
+      content = content.replace(
+        /\bdocker\b/g,
+        sandboxProvider.codegen.factoryImport,
+      );
+    }
 
     // Host mode pins an explicit branch strategy into every generated `run()`
     // call that doesn't declare one — the no-sandbox runtime default is
@@ -1320,28 +1367,35 @@ export const scaffold = (
     }
     const envExampleContent = envExampleParts.join("\n") + "\n";
 
-    yield* Effect.all(
-      [
+    const { mainSource } = yield* Effect.all(
+      {
         // Providers without an image (host mode) have no containerfileName —
         // no Dockerfile/Containerfile is written at all.
         ...(sandboxProvider.containerfileName !== undefined
-          ? [
-              fs
+          ? {
+              containerfile: fs
                 .writeFileString(
                   join(configDir, sandboxProvider.containerfileName),
                   agent.dockerfileTemplate,
                 )
                 .pipe(Effect.mapError((e) => new Error(e.message))),
-            ]
-          : []),
-        fs
+            }
+          : {}),
+        gitignore: fs
           .writeFileString(join(configDir, ".gitignore"), GITIGNORE)
           .pipe(Effect.mapError((e) => new Error(e.message))),
-        fs
+        envExample: fs
           .writeFileString(join(configDir, ".env.example"), envExampleContent)
           .pipe(Effect.mapError((e) => new Error(e.message))),
-        copyTemplateFiles(templateDir, configDir, mainFilename),
-      ],
+        // Returns which template file backed the scaffolded main — needed
+        // below to decide whether the docker() placeholder rewrite applies.
+        mainSource: copyTemplateFiles(
+          templateDir,
+          configDir,
+          mainFilename,
+          sandboxProvider.name,
+        ),
+      },
       { concurrency: "unbounded" },
     );
 
@@ -1370,13 +1424,16 @@ export const scaffold = (
       }),
     );
 
-    // Rewrite main file with the selected agent factory, model, and sandbox provider
+    // Rewrite main file with the selected agent factory, model, and sandbox
+    // provider. A `main.<provider>.mts` variant is already provider-native, so
+    // it skips the docker() placeholder rewrite.
     yield* rewriteMainTs(
       configDir,
       agent,
       model,
       sandboxProvider,
       mainFilename,
+      mainSource !== "main.mts",
     );
 
     // Replace issue tracker template arguments in all text files (must run before label stripping)
