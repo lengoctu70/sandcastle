@@ -156,6 +156,22 @@ GOOGLE_API_KEY=`,
 
 And a Dockerfile constant alongside the existing ones. Use `CLAUDE_CODE_DOCKERFILE` as a structural reference — keep the `usermod` block, the `{{ISSUE_TRACKER_TOOLS}}` placeholder, the `USER agent` line, and the `ENTRYPOINT ["sleep", "infinity"]`. Only the install line should differ.
 
+## Agent discovery (host mode)
+
+`sandcastle init --sandbox host` verifies an agent is actually usable on this machine before scaffolding — executable fingerprint, login readiness, and the live model/effort catalog — via a per-agent `AgentDiscoveryAdapter` in [`src/discovery/`](../../src/discovery/). Adding discovery for an agent is additive:
+
+1. Create `src/discovery/<agent>.ts` exporting an `AgentDiscoveryAdapter` (see `codex.ts` for the reference implementation). Every CLI call goes through the injected `DiscoveryExec` boundary — never spawn directly, and `discover()` must never reject (report failures via `state`).
+2. Register it with ONE line in `src/discovery/registry.ts` (`DISCOVERY_ADAPTERS`).
+
+Contract notes:
+
+- Fingerprint by **observed output**, not PATH presence — e.g. Codex requires `codex-cli` in `--version`; a same-named executable reporting a different product becomes `state: "wrong-product"`.
+- Prefer the CLI's own catalog protocol (Codex uses app-server `model/list` over stdio JSON-RPC) over any hard-coded model registry; tolerate unknown fields, and treat malformed _required_ data as `DiscoveryDataError` (terminal — never masked by a fallback).
+- `guidance`/`detail` strings are Vietnamese (ADR 0026); keep them actionable (install/login commands).
+- Tests use a fake executable on PATH or the injected boundary plus captured fixtures — never a real CLI or subscription.
+
+Agents without an adapter stay on the static picker until their adapter lands.
+
 ## Implementation checklist
 
 For a new agent provider `foo`:

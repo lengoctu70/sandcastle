@@ -323,6 +323,56 @@ describe("InitService scaffold", () => {
     expect(mainTs).toContain('claudeCode("claude-opus-4-8")');
   });
 
+  it("injects the selected effort into the generated codex() call", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, {
+      agent: codexAgent,
+      model: "gpt-5.6-sol",
+      settings: { effort: "xhigh" },
+    });
+
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain('codex("gpt-5.6-sol", { effort: "xhigh" })');
+    // And the same effort is persisted to settings.json.
+    const settings = JSON.parse(
+      await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.effort).toBe("xhigh");
+  });
+
+  it("leaves the single-argument factory call when no effort is selected", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, { agent: codexAgent, model: "gpt-5.6-sol" });
+
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain('codex("gpt-5.6-sol")');
+    expect(mainTs).not.toContain("effort");
+  });
+
+  it("does not inject effort into factories that do not accept one", async () => {
+    const dir = await makeDir();
+    // `pi` declares no effortOption — an effort override stays in
+    // settings.json but must not appear in the generated factory call.
+    await runScaffold(dir, {
+      agent: piAgent,
+      model: "claude-sonnet-4-6",
+      settings: { effort: "high" },
+    });
+
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain('pi("claude-sonnet-4-6")');
+    expect(mainTs).not.toContain("effort");
+  });
+
   // --- Template-specific tests ---
 
   it("simple-loop template produces main.mts and prompt.md", async () => {

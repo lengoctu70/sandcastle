@@ -748,7 +748,14 @@ const parseCodexStreamLine = (line: string): ParsedStreamEvent[] => {
 
 /** Options for the codex agent provider. */
 export interface CodexOptions {
-  readonly effort?: "low" | "medium" | "high" | "xhigh";
+  /**
+   * Reasoning effort, passed to Codex as `-c model_reasoning_effort="<value>"`.
+   * Free-form because the valid set is model-dependent and read live from
+   * Codex's own catalog at init (`sandcastle init` validates against the
+   * discovered `supportedReasoningEfforts`) — observed values include
+   * `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+   */
+  readonly effort?: string;
   /** Environment variables injected by this agent provider. */
   readonly env?: Record<string, string>;
   /** When false, session capture is disabled. Default: true. */

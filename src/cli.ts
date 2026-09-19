@@ -33,6 +33,13 @@ import type {
   IssueTrackerEntry,
   SandboxProviderEntry,
 } from "./InitService.js";
+import { discoverAgent, getDiscoveryAdapter } from "./discovery/registry.js";
+import { nodeDiscoveryExec } from "./discovery/nodeExec.js";
+import type {
+  AgentDiscoveryAdapter,
+  AgentDiscoveryReport,
+} from "./discovery/contract.js";
+import type { ModelSource } from "./ProjectSettings.js";
 import { ConfigDirError, InitError } from "./errors.js";
 import { VERSION } from "./version.js";
 
@@ -113,6 +120,13 @@ const initModelOption = Options.text("model").pipe(
   Options.optional,
 );
 
+const initEffortOption = Options.text("effort").pipe(
+  Options.withDescription(
+    "Reasoning effort for the model (e.g. low, medium, high). In host mode it is validated against the model's discovered effort choices",
+  ),
+  Options.optional,
+);
+
 const sandboxOption = Options.text("sandbox").pipe(
   Options.withDescription(
     "Sandbox provider to use (e.g. host, docker, podman)",
@@ -166,6 +180,226 @@ const choiceToTriBool = (
 ): Option.Option<boolean> =>
   opt._tag === "Some" ? Option.some(opt.value === "true") : Option.none();
 
+/** The model/effort selection init resolved through agent discovery. */
+interface DiscoveredSelection {
+  readonly model: string;
+  readonly effort?: string;
+  readonly modelSource: ModelSource;
+}
+
+const discoveryCancelledMessage =
+  "Đã dừng khởi tạo — chưa có tệp nào được tạo.";
+
+/**
+ * Run one adapter's discovery through the real process boundary, showing a
+ * spinner while the CLI probes run. Never fails — adapters report every
+ * outcome via `report.state`.
+ */
+const runDiscovery = (
+  adapter: AgentDiscoveryAdapter,
+  agentLabel: string,
+): Effect.Effect<AgentDiscoveryReport, never, Display> =>
+  Effect.gen(function* () {
+    const d = yield* Display;
+    return yield* d.spinner(
+      `Đang kiểm tra ${agentLabel} trên máy này…`,
+      Effect.promise(() => discoverAgent(adapter.agent, nodeDiscoveryExec)),
+    );
+  }).pipe(
+    Effect.map(
+      (report) =>
+        report ??
+        ({
+          agent: adapter.agent,
+          executable: adapter.executable,
+          state: "error",
+          models: [],
+          detail: "Không có adapter nào đăng ký cho agent này.",
+        } satisfies AgentDiscoveryReport),
+    ),
+  );
+
+/**
+ * Resolve the model and effort for a host-mode agent through live discovery
+ * (ADR 0021). Non-interactive runs fail with the report's Vietnamese guidance
+ * on any non-ready state; interactive runs offer retry / manual-unverified
+ * entry / safe stop before anything is scaffolded.
+ */
+const resolveDiscoveredSelection = (params: {
+  readonly adapter: AgentDiscoveryAdapter;
+  readonly agentLabel: string;
+  readonly modelFlag: Option.Option<string>;
+  readonly effortFlag: Option.Option<string>;
+  readonly isInteractive: boolean;
+}): Effect.Effect<DiscoveredSelection, InitError, Display> =>
+  Effect.gen(function* () {
+    const d = yield* Display;
+    const { adapter, agentLabel, modelFlag, effortFlag, isInteractive } =
+      params;
+
+    let report = yield* runDiscovery(adapter, agentLabel);
+
+    // Every state except "ready" needs either a flag answer or an
+    // interactive choice before init may continue.
+    while (report.state !== "ready") {
+      const reason =
+        report.guidance ??
+        report.detail ??
+        `Không khám phá được ${agentLabel}.`;
+      if (!isInteractive) {
+        return yield* Effect.fail(new InitError({ message: reason }));
+      }
+      yield* d.status(reason, "warn");
+      const action = yield* Effect.promise(() =>
+        clack.select({
+          message: "Bạn muốn tiếp tục thế nào?",
+          options: [
+            { value: "retry", label: "Thử lại" },
+            {
+              value: "manual",
+              label: "Nhập model thủ công (chưa xác minh)",
+            },
+            { value: "stop", label: "Dừng lại" },
+          ],
+        }),
+      );
+      if (clack.isCancel(action) || action === "stop") {
+        return yield* Effect.fail(
+          new InitError({ message: discoveryCancelledMessage }),
+        );
+      }
+      if (action === "retry") {
+        report = yield* runDiscovery(adapter, agentLabel);
+        continue;
+      }
+
+      // "manual" — an explicitly unverified entry (ADR 0021). A passed --model
+      // flag counts as the manual entry; otherwise prompt for it.
+      let model =
+        modelFlag._tag === "Some" ? modelFlag.value.trim() : undefined;
+      if (model === undefined || model.length === 0) {
+        const entered = yield* Effect.promise(() =>
+          clack.text({
+            message: `Nhập model cho ${agentLabel} (sẽ được đánh dấu chưa xác minh):`,
+            validate: (value) =>
+              value === undefined || value.trim().length === 0
+                ? "Model không được để trống."
+                : undefined,
+          }),
+        );
+        if (clack.isCancel(entered)) {
+          return yield* Effect.fail(
+            new InitError({ message: discoveryCancelledMessage }),
+          );
+        }
+        model = entered.trim();
+      }
+      let effort =
+        effortFlag._tag === "Some" ? effortFlag.value.trim() : undefined;
+      // An explicitly-empty --effort (" ") counts as absent — prompt for it.
+      if (effort === undefined || effort.length === 0) {
+        const entered = yield* Effect.promise(() =>
+          clack.text({
+            message: `Nhập effort cho ${model} (để trống nếu không dùng):`,
+          }),
+        );
+        if (clack.isCancel(entered)) {
+          return yield* Effect.fail(
+            new InitError({ message: discoveryCancelledMessage }),
+          );
+        }
+        effort = entered.trim().length > 0 ? entered.trim() : undefined;
+      }
+      return { model, effort, modelSource: "manual-unverified" };
+    }
+
+    // --- state === "ready": pick from the live catalog ---
+    const catalog = report.models;
+    yield* d.status(
+      `${agentLabel} ${report.version ?? ""} — đã xác minh và đăng nhập`.trim(),
+      "success",
+    );
+
+    let model: string;
+    if (modelFlag._tag === "Some") {
+      const requested = modelFlag.value.trim();
+      const found = catalog.some((m) => m.id === requested);
+      if (!found) {
+        const names = catalog.map((m) => m.id).join(", ");
+        return yield* Effect.fail(
+          new InitError({
+            message: `Model "${requested}" không có trong catalog của ${agentLabel}. Có sẵn: ${names}`,
+          }),
+        );
+      }
+      model = requested;
+    } else if (isInteractive) {
+      const selected = yield* Effect.promise(() =>
+        clack.select({
+          message: `Chọn model cho ${agentLabel}:`,
+          initialValue: report.recommendedModel,
+          options: catalog.map((m) => ({
+            value: m.id,
+            label: m.displayName,
+            ...(m.description !== undefined ? { hint: m.description } : {}),
+          })),
+        }),
+      );
+      if (clack.isCancel(selected)) {
+        return yield* Effect.fail(
+          new InitError({ message: discoveryCancelledMessage }),
+        );
+      }
+      model = selected as string;
+    } else {
+      model = report.recommendedModel ?? catalog[0]!.id;
+    }
+    const chosenModel = catalog.find((m) => m.id === model)!;
+
+    let effort: string | undefined;
+    if (effortFlag._tag === "Some" && effortFlag.value.trim().length > 0) {
+      const requested = effortFlag.value.trim();
+      const supported = chosenModel.effortChoices.some(
+        (e) => e.id === requested,
+      );
+      if (!supported) {
+        const values = chosenModel.effortChoices.map((e) => e.id).join(", ");
+        return yield* Effect.fail(
+          new InitError({
+            message:
+              `Effort "${requested}" không được model "${model}" hỗ trợ.` +
+              (values.length > 0 ? ` Có sẵn: ${values}` : ""),
+          }),
+        );
+      }
+      effort = requested;
+    } else if (chosenModel.effortChoices.length > 0) {
+      if (isInteractive) {
+        const selected = yield* Effect.promise(() =>
+          clack.select({
+            message: `Chọn effort cho ${model}:`,
+            initialValue: chosenModel.defaultEffort,
+            options: chosenModel.effortChoices.map((e) => ({
+              value: e.id,
+              label: e.id,
+              ...(e.description !== undefined ? { hint: e.description } : {}),
+            })),
+          }),
+        );
+        if (clack.isCancel(selected)) {
+          return yield* Effect.fail(
+            new InitError({ message: discoveryCancelledMessage }),
+          );
+        }
+        effort = selected as string;
+      } else {
+        effort = chosenModel.defaultEffort;
+      }
+    }
+
+    return { model, effort, modelSource: "discovered" };
+  });
+
 const initCommand = Command.make(
   "init",
   {
@@ -173,6 +407,7 @@ const initCommand = Command.make(
     template: templateOption,
     agent: agentOption,
     model: initModelOption,
+    effort: initEffortOption,
     sandbox: sandboxOption,
     issueTracker: issueTrackerOption,
     createLabel: createLabelOption,
@@ -184,6 +419,7 @@ const initCommand = Command.make(
     template,
     agent: agentFlag,
     model: modelFlag,
+    effort: effortFlag,
     sandbox: sandboxFlag,
     issueTracker: issueTrackerFlag,
     createLabel: createLabelFlag,
@@ -316,12 +552,6 @@ const initCommand = Command.make(
         selectedAgent = getAgent(selected as string)!;
       }
 
-      // Resolve model: CLI flag > agent default
-      const selectedModel =
-        modelFlag._tag === "Some"
-          ? modelFlag.value
-          : selectedAgent.defaultModel;
-
       // Resolve sandbox provider: CLI flag > interactive select (no default — user must choose)
       const sandboxProviders = listSandboxProviders();
       let selectedSandboxProvider: SandboxProviderEntry;
@@ -356,6 +586,40 @@ const initCommand = Command.make(
       // Shown for both flag and picker selection, interactive or not.
       if (selectedSandboxProvider.runsOnHost) {
         yield* d.status(HOST_MODE_WARNING, "warn");
+      }
+
+      // Resolve model + effort. In host mode with a discovery adapter, the
+      // agent's live catalog is the source of truth (ADR 0021) — the agent's
+      // executable is fingerprinted, its login verified, and the chosen
+      // model/effort persisted as `modelSource: "discovered"`. Everything
+      // else keeps the static registry default, marked "manual-unverified"
+      // since it was never checked against the agent.
+      let selectedModel: string;
+      let selectedEffort: string | undefined;
+      let modelSource: ModelSource = "manual-unverified";
+      const discoveryAdapter = selectedSandboxProvider.runsOnHost
+        ? getDiscoveryAdapter(selectedAgent.name)
+        : undefined;
+      if (discoveryAdapter !== undefined) {
+        const selection = yield* resolveDiscoveredSelection({
+          adapter: discoveryAdapter,
+          agentLabel: selectedAgent.label,
+          modelFlag,
+          effortFlag,
+          isInteractive,
+        });
+        selectedModel = selection.model;
+        selectedEffort = selection.effort;
+        modelSource = selection.modelSource;
+      } else {
+        selectedModel =
+          modelFlag._tag === "Some"
+            ? modelFlag.value
+            : selectedAgent.defaultModel;
+        selectedEffort =
+          effortFlag._tag === "Some" && effortFlag.value.trim().length > 0
+            ? effortFlag.value.trim()
+            : undefined;
       }
 
       // Resolve issue tracker: CLI flag > interactive select (already validated above)
@@ -447,6 +711,10 @@ const initCommand = Command.make(
           createLabel: shouldCreateLabel,
           issueTracker: selectedIssueTracker,
           sandboxProvider: selectedSandboxProvider,
+          settings: {
+            modelSource,
+            ...(selectedEffort !== undefined ? { effort: selectedEffort } : {}),
+          },
         }).pipe(
           Effect.mapError(
             (e) =>
