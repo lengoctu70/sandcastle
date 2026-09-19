@@ -30,6 +30,30 @@ const HOST_ENV_NOTE = `# Host mode — the agent reuses its existing CLI login o
 const SETUP_ISSUE_TRACKER_DOC = "SETUP_ISSUE_TRACKER.md";
 const SETUP_ISSUE_TRACKER_PATH = `.sandcastle/${SETUP_ISSUE_TRACKER_DOC}`;
 
+/**
+ * The parallel templates bracket their container-oriented setup block with
+ * `// sandcastle:sandbox-setup:start` / `// sandcastle:sandbox-setup:end`
+ * markers and tag every `hooks,` option referencing it with a
+ * `sandcastle:sandbox-hooks` block comment. At scaffold time the marked
+ * block is substituted wholesale: container providers restore the original
+ * text (so Docker/Podman output is unchanged), while host mode drops the
+ * sandbox-side `npm install` hook and keeps only host dependency reuse via
+ * `copyToWorktree` (ADR 0021).
+ */
+const CONTAINER_PARALLEL_SETUP = `// Hooks run inside the sandbox before the agent starts each iteration.
+// npm install ensures the sandbox always has fresh dependencies.
+const hooks = {
+  sandbox: { onSandboxReady: [{ command: "npm install" }] },
+};
+
+// Copy node_modules from the host into the worktree before each sandbox
+// starts. Avoids a full npm install from scratch; the hook above handles
+// platform-specific binaries and any packages added since the last copy.
+const copyToWorktree = ["node_modules"];`;
+
+const HOST_PARALLEL_SETUP = `// Reuse host dependencies in each implementer's branch worktree.
+const copyToWorktree = ["node_modules"];`;
+
 export interface TemplateMetadata {
   name: string;
   description: string;
@@ -799,6 +823,7 @@ const hostNextStepsLines = (
 ): string[] => {
   const hasReviewer = template.includes("review");
   const usesPlanSchema = getTemplateDependencies(template).includes("zod");
+  const isParallel = template.startsWith("parallel-");
   const lines = [
     "Các bước tiếp theo:",
     `1. Đảm bảo ${agent.label} đã được cài đặt và đăng nhập trên máy này — host mode dùng lại phiên đăng nhập CLI hiện có, không cần API key.`,
@@ -807,6 +832,14 @@ const hostNextStepsLines = (
   if (issueTracker.envExample) {
     lines.push(
       `${step++}. Đặt các biến môi trường cần thiết trong .sandcastle/.env (xem .sandcastle/.env.example)`,
+    );
+  }
+  if (isParallel) {
+    // Parallel workflows keep host dependency reuse (copyToWorktree) but
+    // carry no container install hook — point that out so the user knows
+    // what to adjust for a different dependency layout.
+    lines.push(
+      `${step++}. Template dùng \`copyToWorktree: ["node_modules"]\` để tái sử dụng dependencies của host trong worktree nhánh riêng của mỗi implementer — điều chỉnh nếu dự án dùng cách quản lý dependencies khác`,
     );
   }
   if (usesPlanSchema) {
@@ -1075,6 +1108,28 @@ const rewriteMainTs = (
         sandboxProvider.codegen.factoryImport,
       );
     }
+
+    // Resolve the parallel templates' sandbox-setup markers (see
+    // CONTAINER_PARALLEL_SETUP above). Container providers get the original
+    // block back verbatim; host mode keeps only host dependency reuse via
+    // copyToWorktree — the sandbox-side `npm install` hook and its
+    // container-oriented comments are container-only artifacts.
+    content = content.replace(
+      /\/\/ sandcastle:sandbox-setup:start[\s\S]*?\/\/ sandcastle:sandbox-setup:end/,
+      sandboxProvider.runsOnHost
+        ? HOST_PARALLEL_SETUP
+        : CONTAINER_PARALLEL_SETUP,
+    );
+    content = sandboxProvider.runsOnHost
+      ? // Host mode: drop each tagged `hooks,` line entirely — nothing
+        // references `hooks` once its declaration is gone.
+        content.replace(
+          /^[ \t]*\/\* sandcastle:sandbox-hooks \*\/ hooks,\r?\n/gm,
+          "",
+        )
+      : // Container providers: strip the tag, restoring the plain `hooks,`
+        // argument so generated output is unchanged.
+        content.replace(/\/\* sandcastle:sandbox-hooks \*\/ hooks,/g, "hooks,");
 
     // Host mode pins an explicit branch strategy into every generated `run()`
     // call that doesn't declare one — the no-sandbox runtime default is

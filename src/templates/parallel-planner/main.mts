@@ -38,6 +38,7 @@ const planSchema = z.object({
 // Raise this if your backlog is large; lower it for a quick smoke-test run.
 const MAX_ITERATIONS = 10;
 
+// sandcastle:sandbox-setup:start
 // Hooks run inside the sandbox before the agent starts each iteration.
 // npm install ensures the sandbox always has fresh dependencies.
 const hooks = {
@@ -48,6 +49,7 @@ const hooks = {
 // starts. Avoids a full npm install from scratch; the hook above handles
 // platform-specific binaries and any packages added since the last copy.
 const copyToWorktree = ["node_modules"];
+// sandcastle:sandbox-setup:end
 
 // ---------------------------------------------------------------------------
 // Main loop
@@ -66,7 +68,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // It outputs a <plan> JSON block — Output.object parses and validates it.
   // -------------------------------------------------------------------------
   const plan = await sandcastle.run({
-    hooks,
+    /* sandcastle:sandbox-hooks */ hooks,
     sandbox: docker(),
     name: "planner",
     // One iteration is enough: the planner just needs to read and reason,
@@ -108,7 +110,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   const settled = await Promise.allSettled(
     issues.map((issue) =>
       sandcastle.run({
-        hooks,
+        /* sandcastle:sandbox-hooks */ hooks,
         copyToWorktree,
         // Each agent starts on its own branch via branchStrategy on run().
         sandbox: docker(),
@@ -183,7 +185,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // uses to know which branches to merge and which issues to close.
   // -------------------------------------------------------------------------
   await sandcastle.run({
-    hooks,
+    /* sandcastle:sandbox-hooks */ hooks,
     sandbox: docker(),
     name: "merger",
     maxIterations: 1,

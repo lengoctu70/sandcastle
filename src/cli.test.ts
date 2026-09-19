@@ -398,4 +398,38 @@ describe("sandcastle CLI", () => {
     expect(settings.sandbox).toBe("host");
     expect(settings.workflow).toBe("simple-loop");
   });
+
+  it.each(["parallel-planner", "parallel-planner-with-review"])(
+    "init --sandbox host --template %s scaffolds a branch-isolated host workflow",
+    async (template) => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+      // --install-template-deps false declines the zod offer (parallel
+      // templates declare a zod dependency for the planner's <plan> schema).
+      const { stdout } = await runCli(
+        `init --agent claude-code --template ${template} --sandbox host --issue-tracker beads --install-template-deps false`,
+        hostDir,
+      );
+
+      expect(stdout).toContain("Khởi tạo xong");
+      const entries = await readdir(join(hostDir, ".sandcastle"));
+      expect(entries).not.toContain("Dockerfile");
+      expect(entries).not.toContain("Containerfile");
+
+      const main = await readFile(
+        join(hostDir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(main).toContain("sandboxes/no-sandbox");
+      expect(main).toContain("noSandbox()");
+      // Every concurrent implementer works on its own explicit branch; the
+      // container-only install hook never reaches host output.
+      expect(main).toContain("issue.branch");
+      expect(main).not.toContain("npm install");
+      expect(main).not.toContain("onSandboxReady");
+      expect(main).not.toContain("sandcastle:sandbox-");
+    },
+  );
 });
