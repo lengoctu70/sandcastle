@@ -76,6 +76,10 @@ _Avoid_: "base branch", "destination branch", "merge target"
 A pluggable implementation that builds commands and parses output for a specific **agent**, injected into `run()` via the `agent` option.
 _Avoid_: "agent adapter", "agent driver"
 
+**Model provider**:
+The service that supplies models inside an **agent** that can connect to more than one service, such as Pi or OpenCode. During **init**, models are grouped by model provider after the installed agent reports what the signed-in user can access.
+_Avoid_: "agent provider" (the Sandcastle integration for the agent), "AI tool"
+
 ### Execution
 
 **Agent invoker**:
@@ -159,6 +163,34 @@ _Avoid_: "container hook", "remote hook"
 **Init**:
 The CLI command that scaffolds the **config directory** in a **host** repo.
 _Avoid_: "create", "bootstrap", "new"
+
+**Configure**:
+The CLI command that changes the selected **agent**, model, or effort in an existing **config directory** without deleting its prompts or workflow files.
+_Avoid_: "re-init", "setup", "edit config"
+
+**Workflow run**:
+One invocation of the `sandcastle run` CLI command, operating on one selected GitHub Issue or a user-selected set of labeled issues. It may contain several agent iterations and retry attempts.
+_Avoid_: "iteration" (one agent invocation), "run" without qualification (ambiguous with the JavaScript `run()` function)
+
+**Retry**:
+The CLI command that continues a failed **task** from its preserved branch and worktree instead of selecting the issue again or starting its implementation from scratch. It reuses the previous **agent session** when the agent supports resumption.
+_Avoid_: "rerun" (suggests starting over), "resume" (reserved for an agent session)
+
+**Recovery state**:
+The durable record of a failed task's GitHub Issue number, branch, worktree, failure output, verification results, and optional agent session. It remains until retry succeeds or the user explicitly discards it.
+_Avoid_: "cache", "checkpoint" (does not necessarily capture process state), "failed run" (the record, not the event)
+
+**Verification command**:
+A project command that must pass before a task can land, such as `npm run typecheck` or `npm test`. Init detects candidate commands and asks the user to confirm them; a missing or skipped command is reported honestly rather than counted as passed.
+_Avoid_: "test" (too narrow), "check" (too vague)
+
+**Host mode**:
+An **init** choice that configures the **no-sandbox provider**, reuses an installed **agent** and its existing subscription login on the **host**, and runs unattended work in a separate **worktree** before merging successful changes back to the target branch. It does not isolate the agent from the host operating system.
+_Avoid_: "local mode" (ambiguous), "safe mode", "sandboxed host mode"
+
+**Completion report**:
+A Vietnamese GitHub Issue comment written after a completed **task** has passed verification and merged successfully, immediately before the issue is closed. It explains the outcome, user-visible change, project impact, verification, and remaining cautions, using a small diagram or diff when that makes the change easier to understand. A failed task receives a failure report and remains open.
+_Avoid_: "Completed by Sandcastle", "technical log", "release notes"
 
 **Config directory**:
 The `.sandcastle/` directory in a **host** repo containing sandbox configuration.

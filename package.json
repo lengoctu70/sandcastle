@@ -59,7 +59,7 @@
   "packageManager": "npm@10.9.2",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mattpocock/sandcastle"
+    "url": "https://github.com/lengoctu70/sandcastle"
   },
   "license": "MIT",
   "devDependencies": {

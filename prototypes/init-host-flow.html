@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prototype: Sandcastle host init</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0c1117; color: #e6edf3; }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 24px; }
+      main { max-width: 920px; margin: 0 auto; }
+      h1 { font: 700 26px/1.2 system-ui, sans-serif; margin: 0 0 8px; }
+      h2 { font: 650 17px/1.3 system-ui, sans-serif; margin: 0 0 12px; }
+      p { line-height: 1.55; color: #aebac7; }
+      .notice, .panel { border: 1px solid #2d3a49; border-radius: 12px; padding: 16px; background: #111923; margin: 16px 0; }
+      .notice { border-color: #805d16; background: #211b0d; color: #f0ca72; }
+      .scenarios, .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      button { font: inherit; color: #e6edf3; background: #1b2735; border: 1px solid #40536a; border-radius: 8px; padding: 10px 12px; cursor: pointer; }
+      button:hover, button.active { border-color: #58a6ff; background: #17345a; }
+      button.primary { background: #1f6f43; border-color: #36a269; }
+      button.danger { background: #502525; border-color: #a44d4d; }
+      button:disabled { opacity: .45; cursor: not-allowed; }
+      .steps { display: grid; gap: 10px; margin: 14px 0; }
+      .step { border-left: 3px solid #40536a; padding: 8px 12px; color: #8f9dab; }
+      .step.current { border-color: #58a6ff; color: #e6edf3; background: #142030; }
+      .step.done { border-color: #36a269; color: #b8e8cb; }
+      .option { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 12px; width: 100%; text-align: left; margin: 8px 0; }
+      .option small { display: block; color: #8f9dab; margin-top: 4px; }
+      .status { border-radius: 999px; padding: 4px 8px; font-size: 12px; white-space: nowrap; }
+      .ready { color: #9be9b6; background: #173c29; }
+      .warning { color: #f0ca72; background: #45350f; }
+      .missing { color: #ffabab; background: #492323; }
+      .result { white-space: pre-wrap; line-height: 1.55; background: #090d12; border-radius: 9px; padding: 14px; min-height: 90px; }
+      code { color: #9cdcfe; }
+      input { width: 100%; margin: 10px 0; padding: 10px; border-radius: 8px; border: 1px solid #40536a; background: #090d12; color: #e6edf3; font: inherit; }
+      .hidden { display: none; }
+      footer { color: #718096; font-size: 12px; margin-top: 22px; }
+      @media (max-width: 620px) { body { padding: 14px; } .option { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Prototype: <code>sandcastle init</code> trên máy</h1>
+      <p>Thử ba tình huống. Mọi nút chỉ thay đổi dữ liệu trong trang này.</p>
+
+      <div class="scenarios" id="scenarios"></div>
+      <section class="panel">
+        <h2 id="scenario-title"></h2>
+        <div class="steps" id="steps"></div>
+        <div id="screen"></div>
+      </section>
+      <section class="panel">
+        <h2>Điều vừa xảy ra</h2>
+        <div class="result" id="result">Chọn một hành động để bắt đầu.</div>
+      </section>
+      <footer>PROTOTYPE — trạng thái CLI là ảnh chụp minh họa từ máy thiết kế ngày 2026-09-19; không chứng minh việc triển khai production.</footer>
+    </main>
+
+    <script>
+      const tools = [
+        { id: "codex", name: "Codex", version: "0.155.1", state: "ready", note: "Đã cài và có thể lấy model + effort qua app-server" },
+        { id: "pi", name: "Pi", version: "0.85.1", state: "ready", note: "Đã cài; tìm thấy model của xAI" },
+        { id: "opencode", name: "OpenCode", version: "1.18.31", state: "ready", note: "Đã cài; lấy được model và variant" },
+        { id: "grok", name: "Grok", version: "1.0.34", state: "warning", note: "Đã cài nhưng chưa đăng nhập" },
+        { id: "agy", name: "Antigravity", version: "—", state: "missing", note: "Không tìm thấy lệnh agy" },
+      ];
+
+      const scenarios = {
+        normal: { title: "Bình thường: chọn Codex đã sẵn sàng", step: 0 },
+        discovery: { title: "Trục trặc: không lấy được danh sách model", step: 0 },
+        blocked: { title: "Bị chặn: chọn CLI chưa cài hoặc chưa đăng nhập", step: 0 },
+      };
+
+      let state = { scenario: "normal", step: 0, tool: null, model: null, effort: null };
+
+      function reset(scenario) {
+        state = { scenario, step: 0, tool: null, model: null, effort: null };
+        render();
+        log(`Đã đặt lại tình huống: ${scenarios[scenario].title}`);
+      }
+
+      function log(message) { document.querySelector("#result").textContent = message; }
+
+      function chooseTool(id) {
+        const tool = tools.find((item) => item.id === id);
+        state.tool = id;
+        if (tool.state !== "ready") {
+          log(tool.state === "missing"
+            ? `${tool.name} chưa được cài. Init dừng tại đây và chỉ hướng dẫn lệnh cài chính thức; không giả vờ cấu hình đã thành công.`
+            : `${tool.name} chưa đăng nhập. Init dừng trước khi tạo file và hướng dẫn chạy \`${id} login\`.`);
+          return render();
+        }
+        state.step = 1;
+        log(`Đã xác minh đúng ${tool.name} ${tool.version}; không chỉ dựa vào tên executable.`);
+        render();
+      }
+
+      function acceptRisk() {
+        state.step = 2;
+        log("Bạn đã chọn chạy tự động trên host. Sandcastle sẽ dùng worktree riêng, nhưng agent vẫn có quyền của tài khoản macOS hiện tại.");
+        render();
+      }
+
+      function chooseModel(model) {
+        state.model = model;
+        state.step = 3;
+        log(`Đã chọn ${model}. Các effort ở bước sau đến từ chính catalog của model này.`);
+        render();
+      }
+
+      function chooseEffort(effort) {
+        state.effort = effort;
+        state.step = 4;
+        log(`Cấu hình mô phỏng hoàn tất: Host → Codex → ${state.model} → ${effort}. Không file thật nào được tạo.`);
+        render();
+      }
+
+      function manualModel() {
+        const value = document.querySelector("#manual-model").value.trim();
+        if (!value) return log("Hãy nhập model ID trước khi tiếp tục.");
+        state.model = value;
+        state.step = 3;
+        log(`Đã nhận model nhập tay: ${value}. Init sẽ ghi rõ rằng model này chưa được xác minh từ CLI.`);
+        render();
+      }
+
+      function retryDiscovery() {
+        log("Đã thử lại nhưng vẫn không lấy được catalog. Bản prototype giữ nguyên màn hình để bạn so sánh: thử lại, nhập tay, hoặc dừng mà không tạo cấu hình sai.");
+      }
+
+      function renderSteps() {
+        const labels = ["1. Xác minh công cụ AI", "2. Cảnh báo quyền host", "3. Chọn model", "4. Chọn effort", "5. Xem lại"];
+        return labels.map((label, i) => `<div class="step ${i < state.step ? "done" : i === state.step ? "current" : ""}">${label}</div>`).join("");
+      }
+
+      function toolList(filter) {
+        return tools.filter(filter).map((tool) => `<button class="option" onclick="chooseTool('${tool.id}')">
+          <span>${tool.name} <small>${tool.version} — ${tool.note}</small></span>
+          <span class="status ${tool.state}">${tool.state === "ready" ? "Sẵn sàng" : tool.state === "warning" ? "Cần đăng nhập" : "Chưa cài"}</span>
+        </button>`).join("");
+      }
+
+      function renderScreen() {
+        if (state.step === 0) {
+          const filter = state.scenario === "normal" ? (t) => t.id === "codex" : state.scenario === "discovery" ? (t) => t.id === "codex" : (t) => ["grok", "agy"].includes(t.id);
+          return `<p>Sandcastle quét và xác minh các CLI trên máy:</p>${toolList(filter)}`;
+        }
+        if (state.step === 1) return `<div class="notice"><strong>Agent sẽ chạy trên máy này.</strong><br><br>Worktree tách thay đổi Git khỏi thư mục đang mở, nhưng không ngăn agent đọc hoặc sửa file khác mà tài khoản macOS của bạn có quyền truy cập.</div><div class="actions"><button class="primary" onclick="acceptRisk()">Tôi hiểu, tiếp tục</button><button onclick="reset(state.scenario)">Quay lại</button></div>`;
+        if (state.step === 2 && state.scenario === "discovery") return `<p>Codex phản hồi nhưng không trả về catalog model. Chưa có file cấu hình nào được tạo.</p><div class="actions"><button onclick="retryDiscovery()">Thử lại</button><button onclick="document.querySelector('#manual').classList.remove('hidden')">Nhập model thủ công</button><button class="danger" onclick="reset('discovery')">Dừng an toàn</button></div><div id="manual" class="hidden"><input id="manual-model" placeholder="Ví dụ: gpt-5.6-sol" /><button onclick="manualModel()">Dùng model chưa xác minh</button></div>`;
+        if (state.step === 2) return `<p>Model mà tài khoản Codex hiện tại có thể dùng:</p><button class="option" onclick="chooseModel('gpt-5.6-sol')"><span>GPT-5.6-Sol <small>Mặc định do Codex đề xuất</small></span><span class="status ready">Khuyên dùng</span></button><button class="option" onclick="chooseModel('gpt-6-astra')"><span>GPT-6-Astra <small>Dành cho công việc phức tạp</small></span></button>`;
+        if (state.step === 3) return `<p>Effort được model <code>${state.model}</code> hỗ trợ:</p><div class="actions">${["low", "medium", "high", "xhigh", "max", "ultra"].map(e => `<button onclick="chooseEffort('${e}')">${e}${e === "medium" ? " · mặc định" : ""}</button>`).join("")}</div>`;
+        return `<p><strong>Sẵn sàng tạo cấu hình</strong></p><div class="result">Nơi chạy: Trên máy này\nCông cụ AI: Codex\nModel: ${state.model}\nEffort: ${state.effort}\nGit: worktree riêng → merge khi thành công\nXác thực: dùng đăng nhập Codex hiện có</div><div class="actions"><button class="primary" onclick="log('Prototype dừng trước thao tác ghi file.')">Tạo cấu hình (mô phỏng)</button><button onclick="reset(state.scenario)">Làm lại</button></div>`;
+      }
+
+      function render() {
+        document.querySelector("#scenarios").innerHTML = Object.entries(scenarios).map(([id, item]) => `<button class="${state.scenario === id ? "active" : ""}" onclick="reset('${id}')">${item.title.split(":")[0]}</button>`).join("");
+        document.querySelector("#scenario-title").textContent = scenarios[state.scenario].title;
+        document.querySelector("#steps").innerHTML = renderSteps();
+        document.querySelector("#screen").innerHTML = renderScreen();
+      }
+
+      render();
+    </script>
+  </body>
+</html>
