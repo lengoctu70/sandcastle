@@ -472,6 +472,9 @@ CLAUDE_CODE_OAUTH_TOKEN=
     label: "Pi",
     defaultModel: "claude-sonnet-4-6",
     factoryImport: "pi",
+    // Pi's factory option is named `thinking` — `pi("model", { thinking:
+    // "high" })` emits the CLI's `--thinking` flag.
+    effortOption: "thinking",
     dockerfileTemplate: PI_DOCKERFILE,
     envExample: `# Anthropic API key
 ANTHROPIC_API_KEY=`,

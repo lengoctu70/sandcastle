@@ -355,13 +355,13 @@ describe("InitService scaffold", () => {
     expect(mainTs).not.toContain("effort");
   });
 
-  it("does not inject effort into factories that do not accept one", async () => {
+  it("injects the selected effort into the generated pi() call as thinking", async () => {
     const dir = await makeDir();
-    // `pi` declares no effortOption — an effort override stays in
-    // settings.json but must not appear in the generated factory call.
+    // Pi's factory option is `thinking` — the persisted effort reaches the
+    // CLI as `--thinking` without the user editing generated code.
     await runScaffold(dir, {
       agent: piAgent,
-      model: "claude-sonnet-4-6",
+      model: "anthropic/claude-sonnet-4-5",
       settings: { effort: "high" },
     });
 
@@ -369,7 +369,30 @@ describe("InitService scaffold", () => {
       join(dir, ".sandcastle", "main.mts"),
       "utf-8",
     );
-    expect(mainTs).toContain('pi("claude-sonnet-4-6")');
+    expect(mainTs).toContain(
+      'pi("anthropic/claude-sonnet-4-5", { thinking: "high" })',
+    );
+    const settings = JSON.parse(
+      await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.effort).toBe("high");
+  });
+
+  it("does not inject effort into factories that do not accept one", async () => {
+    const dir = await makeDir();
+    // `cursor` declares no effortOption — an effort override stays in
+    // settings.json but must not appear in the generated factory call.
+    await runScaffold(dir, {
+      agent: cursorAgent,
+      model: "composer-2",
+      settings: { effort: "high" },
+    });
+
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain('cursor("composer-2")');
     expect(mainTs).not.toContain("effort");
   });
 

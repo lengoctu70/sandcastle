@@ -4,6 +4,7 @@ import type {
   DiscoveryExec,
 } from "./contract.js";
 import { codexDiscoveryAdapter } from "./codex.js";
+import { piDiscoveryAdapter } from "./pi.js";
 import { nodeDiscoveryExec } from "./nodeExec.js";
 
 /**
@@ -17,6 +18,7 @@ import { nodeDiscoveryExec } from "./nodeExec.js";
  */
 const DISCOVERY_ADAPTERS: readonly AgentDiscoveryAdapter[] = [
   codexDiscoveryAdapter,
+  piDiscoveryAdapter,
 ];
 
 /** All registered discovery adapters, in display order. */
