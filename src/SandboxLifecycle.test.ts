@@ -1536,3 +1536,105 @@ describe("runHostHooks", () => {
     expect(content.trim()).toBe("ok");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Host-mode git config isolation (#31, F036): the no-sandbox provider runs
+// `sandbox.exec` directly on the host, so lifecycle git setup must not issue
+// any `git config --global` writes for providerTag "none" — they would mutate
+// the user's real ~/.gitconfig. Container providers keep the writes inside
+// their own boundary (ADR 0021).
+// ---------------------------------------------------------------------------
+
+describe("withSandboxLifecycle host git-config isolation (#31)", () => {
+  const setupWorktreeRepo = async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "host-git-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "file.txt", "original", "initial commit");
+
+    const worktreesDir = join(hostDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+    const worktreeDir = join(worktreesDir, "wt");
+    await execAsync(
+      `git worktree add -b "sandcastle/test" "${worktreeDir}" HEAD`,
+      { cwd: hostDir },
+    );
+    return { hostDir, worktreeDir };
+  };
+
+  /**
+   * Sandbox that records every exec command while delegating real execution
+   * to a local sandbox (with its own isolated GIT_CONFIG_GLOBAL, so stray
+   * writes can never touch the developer's real ~/.gitconfig).
+   */
+  const makeRecordingSandbox = (worktreeDir: string) => {
+    const commands: string[] = [];
+    const base = makeLocalSandbox(worktreeDir);
+    const sandbox: SandboxService = {
+      exec: (command, options) => {
+        commands.push(command);
+        return base.exec(command, options);
+      },
+      copyIn: base.copyIn,
+      copyFileOut: base.copyFileOut,
+    };
+    return { sandbox, commands };
+  };
+
+  it('providerTag "none" issues zero `git config --global` writes', async () => {
+    const { hostDir, worktreeDir } = await setupWorktreeRepo();
+    const { sandbox, commands } = makeRecordingSandbox(worktreeDir);
+
+    await Effect.runPromise(
+      withSandboxLifecycle(
+        {
+          hostRepoDir: hostDir,
+          sandboxRepoDir: worktreeDir,
+          branch: "sandcastle/test",
+          providerTag: "none",
+        },
+        sandbox,
+        () => Effect.succeed("ok"),
+      ).pipe(Effect.provide(testDisplayLayer)),
+    );
+
+    // Not a single global gitconfig write — host mode is read-only w.r.t.
+    // the user's global git configuration.
+    expect(
+      commands.some((c) => c.includes("git config --global")),
+    ).toBe(false);
+    // Sanity: the lifecycle did run (branch discovery happened).
+    expect(
+      commands.some((c) => c.includes("rev-parse --abbrev-ref HEAD")),
+    ).toBe(true);
+  });
+
+  it("container provider keeps safe.directory + identity setup inside its boundary", async () => {
+    const { hostDir, worktreeDir } = await setupWorktreeRepo();
+    const { sandbox, commands } = makeRecordingSandbox(worktreeDir);
+
+    await Effect.runPromise(
+      withSandboxLifecycle(
+        {
+          hostRepoDir: hostDir,
+          sandboxRepoDir: worktreeDir,
+          branch: "sandcastle/test",
+          providerTag: "bind-mount",
+        },
+        sandbox,
+        () => Effect.succeed("ok"),
+      ).pipe(Effect.provide(testDisplayLayer)),
+    );
+
+    expect(
+      commands.some((c) =>
+        c.includes("git config --global --add safe.directory"),
+      ),
+    ).toBe(true);
+    expect(commands.some((c) => c.includes("git config --global user.name"))).toBe(
+      true,
+    );
+    expect(
+      commands.some((c) => c.includes("git config --global user.email")),
+    ).toBe(true);
+  });
+});

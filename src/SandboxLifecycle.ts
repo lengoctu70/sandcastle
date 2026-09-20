@@ -13,6 +13,7 @@ import {
   type SandboxError,
 } from "./errors.js";
 import { type ExecResult, type SandboxService } from "./SandboxFactory.js";
+import type { SandboxProvider } from "./SandboxProvider.js";
 import type { Timeouts } from "./run.js";
 import { countCommitsToSync } from "./syncOut.js";
 
@@ -167,6 +168,12 @@ export interface SandboxLifecycleOptions {
   /** AbortSignal passed through to lifecycle hooks so they can cooperatively cancel.
    *  When omitted, hooks receive a never-aborted signal. */
   readonly signal?: AbortSignal;
+  /** Provider tag driving host-vs-sandbox git setup. When "none" (the
+   *  no-sandbox provider — `sandbox.exec` runs directly on the host), all
+   *  `git config --global` writes are skipped so the user's real ~/.gitconfig
+   *  is never touched (ADR 0021, F036). Container providers keep the writes —
+   *  they land inside the container's own $HOME. */
+  readonly providerTag?: SandboxProvider["tag"];
   /** Override default timeouts for built-in lifecycle steps. Unset keys keep their defaults. */
   readonly timeouts?: Timeouts;
   /** When true (used by `createWorktree`'s merge-to-head path), skip the post-merge
@@ -243,28 +250,33 @@ export const withSandboxLifecycle = <A>(
       Effect.gen(function* () {
         // The bind-mounted worktree may be owned by a different UID (host user
         // vs sandbox user). Mark it safe so git doesn't reject it with
-        // "dubious ownership".
-        yield* execOkWithGitTimeout(
-          sandbox,
-          `git config --global --add safe.directory "${sandboxRepoDir}"`,
-          gitSetupTimeoutMs,
-        );
+        // "dubious ownership", and propagate the host git identity so commits
+        // are attributed to the actual developer. All of it is skipped for the
+        // no-sandbox provider: `git config --global` there would write the
+        // user's real ~/.gitconfig — host mode performs zero global gitconfig
+        // writes (ADR 0021, F036). Container providers keep the writes inside
+        // their own boundary.
+        if (options.providerTag !== "none") {
+          yield* execOkWithGitTimeout(
+            sandbox,
+            `git config --global --add safe.directory "${sandboxRepoDir}"`,
+            gitSetupTimeoutMs,
+          );
 
-        // Propagate host git identity into the sandbox so commits are attributed
-        // to the actual developer without requiring manual setup.
-        if (hostGitName) {
-          yield* execOkWithGitTimeout(
-            sandbox,
-            `git config --global user.name "${hostGitName.replace(/"/g, '\\"')}"`,
-            gitSetupTimeoutMs,
-          );
-        }
-        if (hostGitEmail) {
-          yield* execOkWithGitTimeout(
-            sandbox,
-            `git config --global user.email "${hostGitEmail.replace(/"/g, '\\"')}"`,
-            gitSetupTimeoutMs,
-          );
+          if (hostGitName) {
+            yield* execOkWithGitTimeout(
+              sandbox,
+              `git config --global user.name "${hostGitName.replace(/"/g, '\\"')}"`,
+              gitSetupTimeoutMs,
+            );
+          }
+          if (hostGitEmail) {
+            yield* execOkWithGitTimeout(
+              sandbox,
+              `git config --global user.email "${hostGitEmail.replace(/"/g, '\\"')}"`,
+              gitSetupTimeoutMs,
+            );
+          }
         }
 
         // Repo is bind-mounted — discover branch directly

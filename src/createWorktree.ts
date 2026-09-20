@@ -320,9 +320,15 @@ export const createWorktree = async (
         const userArgs = opts.promptArgs ?? {};
         yield* validateNoBuiltInArgOverride(userArgs);
 
+        // TARGET_BRANCH is the host's active branch — the branch the
+        // worktree's work merges back into — never the worktree's own source
+        // branch (F027; same rule as run.ts / interactive.ts).
+        const currentHostBranch = yield* WorktreeManager.getCurrentBranch(
+          hostRepoDir,
+        );
         const effectiveArgs = {
           SOURCE_BRANCH: worktreeInfo.branch,
-          TARGET_BRANCH: worktreeInfo.branch,
+          TARGET_BRANCH: currentHostBranch,
           ...userArgs,
         };
         const builtInArgKeysSet = new Set<string>(BUILT_IN_PROMPT_ARG_KEYS);
@@ -416,6 +422,7 @@ export const createWorktree = async (
             applyToHost,
             timeouts: options.timeouts,
             keepSourceBranch: isMergeToHead,
+            providerTag: resolvedSandbox.tag,
           },
           sandbox,
           (ctx) =>
@@ -537,9 +544,14 @@ export const createWorktree = async (
         resolvedPrompt = rawPrompt;
       } else {
         yield* validateNoBuiltInArgOverride(userArgs);
+        // TARGET_BRANCH is the host's active branch — the merge target —
+        // never the worktree's source branch (F027).
+        const currentHostBranch = yield* WorktreeManager.getCurrentBranch(
+          hostRepoDir,
+        );
         const effectiveArgs = {
           SOURCE_BRANCH: worktreeInfo.branch,
-          TARGET_BRANCH: worktreeInfo.branch,
+          TARGET_BRANCH: currentHostBranch,
           ...userArgs,
         };
         const builtInArgKeysSet = new Set<string>(BUILT_IN_PROMPT_ARG_KEYS);
@@ -687,6 +699,7 @@ export const createWorktree = async (
           skipPromptExpansion: isInlinePrompt,
           timeouts: options.timeouts,
           keepSourceBranch: isMergeToHead,
+          sandboxTag: sandboxProvider.tag,
         });
 
         const completion = buildCompletionMessage(

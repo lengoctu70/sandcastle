@@ -754,6 +754,7 @@ export async function run(
       signal: options.signal,
       skipPromptExpansion: isInlinePrompt,
       timeouts: options.timeouts,
+      sandboxTag: options.sandbox.tag,
     });
 
     const completion = buildCompletionMessage(
