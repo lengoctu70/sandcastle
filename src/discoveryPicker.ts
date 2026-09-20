@@ -438,10 +438,26 @@ export const resolveDiscoveredSelection = (params: {
 
     let model: string;
     let modelVerified = true;
+    // Set when --model resolved through an exact effort/variant id rather
+    // than a model id — Devin's variant `model_uid`s select both the family
+    // and the thinking level in one selector (ADR 0021).
+    let variantRequested: string | undefined;
     if (modelFlag._tag === "Some" && modelFlag.value.trim().length > 0) {
       const requested = modelFlag.value.trim();
-      const found = catalog.some((m) => m.id === requested);
-      if (!found) {
+      // The live CLI accepts three selector shapes: the model id itself, a
+      // declared family alias (e.g. Devin's `opus`), and an exact
+      // variant/effort id (e.g. Devin's `claude-opus-5-high` model_uid).
+      const direct = catalog.find((m) => m.id === requested);
+      const viaAlias =
+        direct === undefined
+          ? catalog.find((m) => m.aliases?.includes(requested) === true)
+          : undefined;
+      const viaVariant =
+        direct === undefined && viaAlias === undefined
+          ? catalog.find((m) => m.effortChoices.some((e) => e.id === requested))
+          : undefined;
+      const matched = direct ?? viaAlias ?? viaVariant;
+      if (matched === undefined) {
         if (!allowUnverified) {
           const names = catalog.map((m) => m.id).join(", ");
           return yield* Effect.fail(
@@ -455,7 +471,11 @@ export const resolveDiscoveredSelection = (params: {
         const manual = manualFromFlags(modelFlag, effortFlag);
         return select(manual.model!, manual.effort, "manual-unverified");
       }
-      model = requested;
+      // Family selection stays distinct from exact-variant selection: the
+      // catalog id is always the model; a variant selector additionally
+      // carries its own id as the effort.
+      model = matched.id;
+      if (viaVariant !== undefined) variantRequested = requested;
     } else if (isInteractive) {
       const selected = yield* Effect.promise(() =>
         clack.select({
@@ -471,7 +491,19 @@ export const resolveDiscoveredSelection = (params: {
     } else {
       model = report.recommendedModel ?? catalog[0]!.id;
     }
-    const chosenModel = catalog.find((m) => m.id === model)!;
+    // The recommended/interactive selection is expected to be a catalog
+    // member, but `recommendedModel` surfaces raw CLI output — an
+    // off-catalog value (e.g. a Grok default-model alias) must degrade to a
+    // real catalog entry instead of crashing on effort resolution (F018).
+    const foundModel = catalog.find((m) => m.id === model);
+    if (foundModel === undefined) {
+      yield* d.status(
+        `Model khuyến nghị "${model}" không có trong catalog của ${agentLabel} — dùng "${catalog[0]!.id}".`,
+        "warn",
+      );
+      model = catalog[0]!.id;
+    }
+    const chosenModel = foundModel ?? catalog[0]!;
 
     let effort: string | undefined;
     if (effortFlag._tag === "Some" && effortFlag.value.trim().length > 0) {
@@ -507,6 +539,11 @@ export const resolveDiscoveredSelection = (params: {
         }
       }
       effort = requested;
+    } else if (variantRequested !== undefined) {
+      // `--model <variant-id>` already chose the thinking level — the variant
+      // id is carried as the effort so the provider can pass it back (Devin
+      // sends it to `--model` unchanged).
+      effort = variantRequested;
     } else if (chosenModel.effortChoices.length > 0) {
       if (isInteractive) {
         const selected = yield* Effect.promise(() =>

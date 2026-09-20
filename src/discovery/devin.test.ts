@@ -93,10 +93,15 @@ describe("devinDiscoveryAdapter", () => {
     ]);
     expect(report.recommendedModel).toBe("claude-opus-5");
 
-    // Aliases surface as the picker hint description.
+    // Aliases surface as the picker hint description AND as verified
+    // selectors — `devin --model opus` is accepted by the live CLI, so the
+    // init picker resolves them back to the family slug.
     expect(report.models[0]!.description).toBe("Alias: opus");
     expect(report.models[1]!.description).toBe("Alias: gemini");
     expect(report.models[2]!.description).toBeUndefined();
+    expect(report.models[0]!.aliases).toEqual(["opus"]);
+    expect(report.models[1]!.aliases).toEqual(["gemini"]);
+    expect(report.models[2]!.aliases).toBeUndefined();
 
     // Variants map to effort choices whose ids are the exact model_uids —
     // the values `--model` accepts back unchanged.
@@ -218,6 +223,7 @@ describe("devinDiscoveryAdapter", () => {
 
     expect(report.state).toBe("ready");
     expect(report.models.map((m) => m.id)).toEqual(["claude-opus-5"]);
+    expect(report.models[0]!.aliases).toEqual(["opus"]);
     expect(report.models[0]!.effortChoices.map((e) => e.id)).toEqual([
       "claude-opus-5-medium",
     ]);

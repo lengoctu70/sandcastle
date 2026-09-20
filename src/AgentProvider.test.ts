@@ -1,7 +1,7 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   claudeCode,
   codex,
@@ -385,6 +385,27 @@ describe("pi factory", () => {
     const { command, stdin } = provider.buildPrintCommand(opts("it's a test"));
     expect(command).not.toContain("it's a test");
     expect(stdin).toBe("it's a test");
+  });
+
+  it("buildInteractiveArgs applies the configured --thinking level", () => {
+    // The TUI honours the same global --thinking flag as print mode — a
+    // persisted thinking choice must reach interactive sessions too (F056).
+    const provider = pi("claude-sonnet-4-6", { thinking: "high" });
+    const args = provider.buildInteractiveArgs!(opts("fix the bug"));
+    expect(args).toEqual([
+      "pi",
+      "--model",
+      "claude-sonnet-4-6",
+      "--thinking",
+      "high",
+      "fix the bug",
+    ]);
+  });
+
+  it("buildInteractiveArgs omits --thinking when not configured", () => {
+    const provider = pi("claude-sonnet-4-6");
+    const args = provider.buildInteractiveArgs!(opts("fix the bug"));
+    expect(args).toEqual(["pi", "--model", "claude-sonnet-4-6", "fix the bug"]);
   });
 
   it("buildPrintCommand shell-escapes the model", () => {
@@ -1335,6 +1356,58 @@ describe("opencode factory", () => {
     const provider = opencode("opencode/big-pickle");
     const args = provider.buildInteractiveArgs!(opts("do something"));
     expect(args).not.toContain("--agent");
+  });
+
+  it("buildPrintCommand rejects prompts larger than the argv-safe limit", () => {
+    const provider = opencode("opencode/big-pickle");
+    const huge = "x".repeat(120 * 1024 + 1);
+    expect(() => provider.buildPrintCommand(opts(huge))).toThrow(
+      /OpenCode print-mode prompt is \d+ bytes \(max 122880 bytes\)/,
+    );
+    // The cap counts UTF-8 bytes, not characters.
+    const hugeMultibyte = "界".repeat(41 * 1024); // 3 bytes each → 126 KiB
+    expect(() => provider.buildPrintCommand(opts(hugeMultibyte))).toThrow(
+      /OpenCode print-mode prompt/,
+    );
+    // Just under the cap still builds.
+    const fits = "x".repeat(120 * 1024);
+    expect(() => provider.buildPrintCommand(opts(fits))).not.toThrow();
+  });
+
+  it("buildInteractiveArgs never emits --variant and warns when one is configured", () => {
+    // The TUI has no --variant flag (it exists only on `opencode run`) — a
+    // configured variant is reported honestly instead of being passed as a
+    // flag the CLI would reject or silently dropped (F056).
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const provider = opencode("opencode/big-pickle", { variant: "high" });
+      const args = provider.buildInteractiveArgs!(opts("do something"));
+      expect(args).toEqual([
+        "opencode",
+        "--model",
+        "opencode/big-pickle",
+        "--prompt",
+        "do something",
+      ]);
+      expect(args).not.toContain("--variant");
+      expect(spy).toHaveBeenCalledTimes(1);
+      const message = String(spy.mock.calls[0]![0]);
+      expect(message).toContain("--variant");
+      expect(message).toContain('"high"');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("buildInteractiveArgs stays quiet when no variant is configured", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const provider = opencode("opencode/big-pickle");
+      provider.buildInteractiveArgs!(opts("do something"));
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("parseStreamLine extracts session id from step_start", () => {

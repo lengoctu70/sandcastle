@@ -663,6 +663,9 @@ export const pi = (
 
   buildInteractiveArgs({ prompt }: AgentCommandOptions): string[] {
     const args = ["pi", "--model", model];
+    // `--thinking` is a global pi flag — apply the configured level so the
+    // TUI session uses the same reasoning choice as unattended runs (F056).
+    if (options?.thinking) args.push("--thinking", options.thinking);
     if (prompt) args.push(prompt);
     return args;
   },
@@ -957,6 +960,24 @@ const parseOpenCodeStreamLine = (line: string): ParsedStreamEvent[] => {
   return [];
 };
 
+/**
+ * OpenCode print mode passes the prompt as a positional argv argument; stdin
+ * is not documented for delivering the prompt to `opencode run`. Linux
+ * enforces a per-argument limit (~128 KiB, ARG_MAX stack). Stay slightly
+ * under so users get a clear error instead of spawn E2BIG — same guard as
+ * the Cursor, Copilot, and Devin providers.
+ */
+const OPENCODE_PRINT_PROMPT_MAX_BYTES = 120 * 1024;
+
+function assertOpenCodePrintPromptFitsArgv(prompt: string): void {
+  const n = Buffer.byteLength(prompt, "utf8");
+  if (n > OPENCODE_PRINT_PROMPT_MAX_BYTES) {
+    throw new Error(
+      `OpenCode print-mode prompt is ${n} bytes (max ${OPENCODE_PRINT_PROMPT_MAX_BYTES} bytes). The OpenCode CLI accepts the prompt only as a command-line argument; shorten the prompt or split the work. Other Sandcastle providers use stdin for large prompts.`,
+    );
+  }
+}
+
 /** Options for the opencode agent provider. */
 export interface OpenCodeOptions {
   /** Provider-specific reasoning effort variant (e.g. "high", "max", "low", "minimal"). */
@@ -983,6 +1004,7 @@ export const opencode = (
     prompt,
     dangerouslySkipPermissions,
   }: AgentCommandOptions): PrintCommand {
+    assertOpenCodePrintPromptFitsArgv(prompt);
     const variantFlag = options?.variant
       ? ` --variant ${shellEscape(options.variant)}`
       : "";
@@ -1000,6 +1022,17 @@ export const opencode = (
   buildInteractiveArgs({ prompt }: AgentCommandOptions): string[] {
     const args = ["opencode", "--model", model];
     if (options?.agent) args.push("--agent", options.agent);
+    // OpenCode's TUI exposes no `--variant` flag (that flag exists only on
+    // `opencode run`). Emitting it would produce an invalid invocation, so a
+    // configured variant is reported as unsupported here instead of being
+    // silently dropped or passed as a flag the CLI would reject (F056).
+    if (options?.variant !== undefined) {
+      console.error(
+        `sandcastle: OpenCode interactive (TUI) has no --variant flag — ` +
+          `the configured variant "${options.variant}" applies only to ` +
+          "unattended `opencode run` invocations.",
+      );
+    }
     // The TUI's seed-prompt flag is `--prompt` (long form only); `-p` is the
     // `opencode run`/`attach` basic-auth password flag, not a prompt seed.
     // Pre-fills the textbox but does not auto-submit (sst/opencode#3937).
