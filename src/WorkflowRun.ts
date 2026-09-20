@@ -346,6 +346,34 @@ const gitQuiet = async (
   }
 };
 
+/**
+ * Assert `cwd` is inside a usable git work tree with a resolvable HEAD.
+ * Runs before any settings/GitHub/agent work so a non-git directory or an
+ * unborn repository surfaces the actionable repository error instead of a
+ * raw git plumbing crash or a mislabeled `gh` permission failure (F060).
+ */
+const assertUsableRepo = async (cwd: string): Promise<void> => {
+  const inWorkTree = await git(["rev-parse", "--is-inside-work-tree"], cwd)
+    .then((out) => out === "true")
+    .catch(() => false);
+  if (!inWorkTree) {
+    throw new WorkflowRunError(
+      "Thư mục hiện tại không nằm trong một Git repository — " +
+        "`sandcastle run` cần chạy bên trong working tree của dự án. " +
+        "cd vào repo, hoặc chạy `git init` rồi tạo commit đầu tiên trước.",
+    );
+  }
+  const headResolves = await git(["rev-parse", "--verify", "HEAD"], cwd)
+    .then(() => true)
+    .catch(() => false);
+  if (!headResolves) {
+    throw new WorkflowRunError(
+      "Repository chưa có commit nào — HEAD chưa resolve được. " +
+        "Hãy tạo commit đầu tiên trước khi chạy `sandcastle run`.",
+    );
+  }
+};
+
 /** Run an Effect that needs at most FileSystem, surfacing the inner error. */
 const runEffect = async <A>(
   effect: Effect.Effect<A, unknown, FileSystem.FileSystem>,
@@ -1101,6 +1129,12 @@ const workflowRunPreflight = async (options: {
    */
   readonly resume?: boolean;
 }): Promise<WorkflowRunPreflight> => {
+  // A usable git checkout with a resolvable HEAD is the first requirement —
+  // checked before the settings load and every `gh` probe so a non-git
+  // directory or an unborn repository surfaces the actionable repository
+  // error rather than a raw exit-128 or a mislabeled GitHub failure (F060).
+  await assertUsableRepo(options.cwd);
+
   const gh: GithubIssueOps = makeGithubIssueOps(
     options.cwd,
     options.ghRunner ?? nodeGhRunner,
@@ -1341,6 +1375,31 @@ export const runIssueWorkflow = async (
         : `Không xác định được SHA đầu nhánh \`${targetBranch}\`.`,
     );
   }
+
+  // A dirty active checkout blocks landing only when the checkout IS the
+  // target branch — `git merge --ff-only` then runs in cwd and refuses to
+  // overwrite tracked local changes (F020). Untracked files are ignored:
+  // .sandcastle/ and other build artifacts routinely sit untracked without
+  // blocking a fast-forward. Reported before any agent starts so quota is
+  // never spent on work the landing cannot accept.
+  const activeBranch =
+    resume === undefined
+      ? targetBranch
+      : await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd).catch(() => "");
+  if (activeBranch === targetBranch) {
+    const trackedDirt = await git(
+      ["status", "--porcelain", "--untracked-files=no"],
+      cwd,
+    );
+    if (trackedDirt !== "") {
+      throw new WorkflowRunError(
+        `Checkout đang hoạt động có thay đổi chưa commit trên nhánh đích \`${targetBranch}\` — ` +
+          "bước landing sẽ merge fast-forward vào checkout này nên những thay đổi đó sẽ chặn merge. " +
+          "Hãy commit hoặc `git stash` chúng trước khi chạy `sandcastle run`.",
+      );
+    }
+  }
+
   const sourceBranch =
     resume?.sourceBranch ?? `sandcastle/issue-${issue.number}`;
 

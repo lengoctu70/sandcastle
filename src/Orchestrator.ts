@@ -8,6 +8,7 @@ import {
   SessionCaptureError,
 } from "./errors.js";
 import type { SandboxError } from "./errors.js";
+import type { SandboxProvider } from "./SandboxProvider.js";
 import type { SandboxService } from "./SandboxFactory.js";
 import { SandboxFactory, SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 import { withSandboxLifecycle, type SandboxHooks } from "./SandboxLifecycle.js";
@@ -365,6 +366,9 @@ export interface OrchestrateOptions {
   readonly timeouts?: Timeouts;
   /** Forwarded to `withSandboxLifecycle` — see `SandboxLifecycleOptions.keepSourceBranch`. */
   readonly keepSourceBranch?: boolean;
+  /** Forwarded to `withSandboxLifecycle` — see `SandboxLifecycleOptions.providerTag`.
+   *  "none" (host mode) suppresses every `git config --global` write. */
+  readonly sandboxTag?: SandboxProvider["tag"];
 }
 
 /** Per-iteration result carrying an optional session ID. */
@@ -450,6 +454,7 @@ export const orchestrate = (
               signal: options.signal,
               timeouts: options.timeouts,
               keepSourceBranch: options.keepSourceBranch,
+              providerTag: options.sandboxTag,
             },
             sandbox,
             (ctx) =>

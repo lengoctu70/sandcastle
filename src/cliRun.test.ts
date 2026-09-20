@@ -1813,3 +1813,94 @@ describe("sandcastle status / retry / discard (CLI seam)", () => {
     expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Repository preflight (ticket #31, F060/F020): `run` validates the host
+// checkout — inside a git work tree with a resolvable HEAD — before any `gh`
+// probe or agent invocation, and reports a dirty active checkout (tracked
+// changes on the checked-out target branch) before agent quota is spent.
+// ---------------------------------------------------------------------------
+
+describe("sandcastle run repository preflight (#31)", () => {
+  /** The call log may not exist at all when no shim was ever invoked. */
+  const readLogIfExists = async (logFile: string): Promise<string[]> =>
+    (await exists(logFile)) ? readLog(logFile) : [];
+
+  it("non-git directory: fails with repo guidance before any gh call or agent", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    // Remove the git dir — the working directory is no longer a repository.
+    await rm(join(repoDir, ".git"), { recursive: true, force: true });
+    await writeSettings(repoDir);
+
+    try {
+      await runCli("run --issue 5", repoDir, env);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("không nằm trong một Git repository");
+    }
+
+    // The repo gate precedes the gh probe + label check entirely.
+    const log = await readLogIfExists(logFile);
+    expect(log.some((l) => l.startsWith("gh "))).toBe(false);
+    expect(log.some((l) => l.startsWith("AGENT"))).toBe(false);
+  });
+
+  it("unborn repository (init, no commits): fails with commit guidance before any gh call", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    // Re-init without committing — HEAD does not resolve.
+    await rm(join(repoDir, ".git"), { recursive: true, force: true });
+    await initRepo(repoDir);
+    await writeSettings(repoDir);
+
+    try {
+      await runCli("run --issue 5", repoDir, env);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("chưa có commit");
+    }
+
+    const log = await readLogIfExists(logFile);
+    expect(log.some((l) => l.startsWith("gh "))).toBe(false);
+    expect(log.some((l) => l.startsWith("AGENT"))).toBe(false);
+  });
+
+  it("dirty active checkout on the target branch: reported before any agent starts", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+    // Tracked modification on the checked-out target branch — the landing's
+    // `git merge --ff-only` would refuse to overwrite it (F020).
+    await writeFile(join(repoDir, "hello.txt"), "dirty local change");
+
+    try {
+      await runCli("run --issue 5", repoDir, env);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("chưa commit");
+      expect(stdout + stderr).toContain("`main`");
+    }
+
+    const log = await readLog(logFile);
+    // Read-only gh probes (version/auth/label/view) ran — but no agent was
+    // invoked and no issue mutation was attempted.
+    expect(log.some((l) => l.startsWith("AGENT"))).toBe(false);
+    expect(log.some((l) => l.startsWith("gh issue comment"))).toBe(false);
+    expect(log.some((l) => l.startsWith("gh issue close"))).toBe(false);
+  });
+
+  it("untracked-only checkout (.sandcastle/, fixtures) does not trip the dirty check", async () => {
+    // makeFixture leaves untracked files in the repo (settings, issues.json,
+    // calls.log) — exactly like a real project after `init`. Untracked files
+    // cannot block `git merge --ff-only`, so the run must proceed.
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    expect(log.some((l) => l.startsWith("AGENT"))).toBe(true);
+    expect(stdout).toContain("Hoàn thành issue #5");
+  });
+});

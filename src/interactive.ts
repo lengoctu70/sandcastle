@@ -377,6 +377,7 @@ export const interactive = async (
           hostWorktreePath: isHeadMode ? hostRepoDir : worktreeInfo?.path,
           applyToHost,
           timeouts: options.timeouts,
+          providerTag: sandboxProvider.tag,
         },
         sandbox,
         (ctx) =>

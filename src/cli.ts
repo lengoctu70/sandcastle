@@ -119,6 +119,61 @@ const requireConfigDir = (
     }
   });
 
+/**
+ * Early repository gate for `init` (F060): the github-issues path probes and
+ * mutates GitHub state, which only works inside a usable checkout — `gh`'s
+ * "not a git repository" (or an unborn HEAD) otherwise surfaces mislabeled
+ * as a GitHub permission failure. Checked before any `gh` invocation so the
+ * first error is the actionable repository one.
+ */
+const requireUsableGitRepo = (cwd: string): Effect.Effect<void, InitError> =>
+  Effect.gen(function* () {
+    const inWorkTree = yield* Effect.sync(() => {
+      try {
+        return (
+          execSync("git rev-parse --is-inside-work-tree", {
+            cwd,
+            stdio: ["ignore", "pipe", "ignore"],
+          })
+            .toString()
+            .trim() === "true"
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (!inWorkTree) {
+      yield* Effect.fail(
+        new InitError({
+          message:
+            "Thư mục hiện tại không nằm trong một Git repository — " +
+            "`sandcastle init` với issue tracker GitHub cần chạy bên trong working tree của dự án. " +
+            "cd vào repo, hoặc chạy `git init` rồi tạo commit đầu tiên trước.",
+        }),
+      );
+    }
+    const headResolves = yield* Effect.sync(() => {
+      try {
+        execSync("git rev-parse --verify HEAD", {
+          cwd,
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (!headResolves) {
+      yield* Effect.fail(
+        new InitError({
+          message:
+            "Repository chưa có commit nào — HEAD chưa resolve được. " +
+            "Hãy tạo commit đầu tiên trước khi chạy `sandcastle init` với GitHub Issues.",
+        }),
+      );
+    }
+  });
+
 // --- Init command ---
 
 /**
@@ -758,6 +813,12 @@ const initCommand = Command.make(
       // CLI flag > interactive confirm. The flag is only meaningful for the github-issues tracker.
       let shouldCreateLabel = false;
       if (selectedIssueTracker.name === "github-issues") {
+        // A usable checkout with a resolvable HEAD is required before any
+        // `gh` probe or label mutation (F060) — otherwise "not a git
+        // repository" (or an unborn HEAD) surfaces mislabeled as a GitHub
+        // permission failure.
+        yield* requireUsableGitRepo(cwd);
+
         // Verify gh is installed AND authenticated before any label work or
         // scaffolding (ADR 0026) — GitHub failures must surface during setup,
         // not after agent work. Interactive runs may recheck after the user

@@ -1,9 +1,12 @@
+import { exec } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
-import type { GithubIssue } from "./githubIssues.js";
+import type { DiscoveryExec } from "./discovery/contract.js";
+import type { GithubIssue, GhRunner } from "./githubIssues.js";
 import {
   buildCompletionReport,
   buildFailureReport,
@@ -13,8 +16,12 @@ import {
   buildReviewPrompt,
   buildVerificationRepairPrompt,
   PHASE_LABEL,
+  runIssueWorkflow,
   runVerificationCommands,
+  WorkflowRunError,
 } from "./WorkflowRun.js";
+
+const execAsync = promisify(exec);
 
 const issue: GithubIssue = {
   number: 42,
@@ -406,5 +413,73 @@ describe("runVerificationCommands", () => {
     expect(results[0]!.status).toBe("failed");
     expect(results[0]!.outputTail).toContain("out");
     expect(results[0]!.outputTail).toContain("err");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Repository preflight (#31, F060): `runIssueWorkflow` validates a usable git
+// repository with a resolvable HEAD before any settings/GitHub/agent work, so
+// a non-git directory or an unborn repository surfaces an actionable
+// repository error instead of a raw git crash or a mislabeled `gh` failure.
+// ---------------------------------------------------------------------------
+
+describe("runIssueWorkflow repository preflight", () => {
+  /** Counting fakes — the preflight must never reach them. */
+  const makeProbes = () => {
+    const ghCalls: string[] = [];
+    const ghRunner: GhRunner = async (args) => {
+      ghCalls.push(args.join(" "));
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+    const execCalls: string[] = [];
+    const discoveryExec: DiscoveryExec = async (name, args) => {
+      execCalls.push(`${name} ${args.join(" ")}`);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+    return { ghCalls, ghRunner, execCalls, discoveryExec };
+  };
+
+  it("fails in a non-git directory before any gh probe or agent invocation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "wf-non-git-"));
+    const probes = makeProbes();
+
+    await expect(
+      runIssueWorkflow({
+        cwd: dir,
+        issueNumber: 5,
+        ghRunner: probes.ghRunner,
+        discoveryExec: probes.discoveryExec,
+      }),
+    ).rejects.toThrow(WorkflowRunError);
+    await expect(
+      runIssueWorkflow({
+        cwd: dir,
+        issueNumber: 5,
+        ghRunner: probes.ghRunner,
+        discoveryExec: probes.discoveryExec,
+      }),
+    ).rejects.toThrow("Git repository");
+
+    // Neither the gh runner nor the readiness probe was ever consulted.
+    expect(probes.ghCalls).toHaveLength(0);
+    expect(probes.execCalls).toHaveLength(0);
+  });
+
+  it("fails on an unborn repository (init, no commits) before any gh call", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "wf-unborn-"));
+    await execAsync("git init -b main", { cwd: dir });
+    const probes = makeProbes();
+
+    await expect(
+      runIssueWorkflow({
+        cwd: dir,
+        issueNumber: 5,
+        ghRunner: probes.ghRunner,
+        discoveryExec: probes.discoveryExec,
+      }),
+    ).rejects.toThrow("chưa có commit");
+
+    expect(probes.ghCalls).toHaveLength(0);
+    expect(probes.execCalls).toHaveLength(0);
   });
 });

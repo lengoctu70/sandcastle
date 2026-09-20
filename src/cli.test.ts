@@ -300,6 +300,7 @@ describe("sandcastle CLI", () => {
     if (process.platform === "win32") return; // POSIX shim only
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
     // gh readiness is probed before the label question — provide an
     // authenticated fake gh so the missing-flag failure is what surfaces.
     const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
@@ -1779,13 +1780,70 @@ process.exit(1);
       await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
     ) as Record<string, unknown>;
 
+  it("init --issue-tracker github-issues fails with repo guidance in a non-git directory (before gh probe or label)", async () => {
+    if (process.platform === "win32") return;
+    // No initRepo at all — cwd is a plain directory. The repository gate runs
+    // before any `gh` probe or label mutation, so an authenticated fake gh
+    // must not be consulted (F060: "not a git repository" must not masquerade
+    // as a GitHub permission failure).
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, { authenticated: true, labelCreate: "ok" });
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label true --build-image false`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("không nằm trong một Git repository");
+      // The repo error surfaces as itself — not as a label/permission error.
+      expect(output).not.toContain("label");
+      const entries = await readdir(hostDir);
+      expect(entries).not.toContain(".sandcastle");
+      expect(entries).not.toContain("package.json");
+    }
+  });
+
+  it("init --issue-tracker github-issues fails with commit guidance on an unborn repository (before gh probe or label)", async () => {
+    if (process.platform === "win32") return;
+    // `git init` but no commit — HEAD does not resolve.
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
+    await writeFakeGh(shimDir, { authenticated: true, labelCreate: "ok" });
+
+    try {
+      await execAsync(
+        `node ${cliPath} init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues --create-label true --build-image false`,
+        { cwd: hostDir, env: { ...process.env, PATH: shimmedPath(shimDir) } },
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("chưa có commit");
+      expect(output).not.toContain("label");
+      const entries = await readdir(hostDir);
+      expect(entries).not.toContain(".sandcastle");
+    }
+  });
+
   it("init --issue-tracker github-issues fails with install guidance when gh is missing", async () => {
     if (process.platform === "win32") return; // POSIX shim only
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
-    // PATH with only node — no gh anywhere.
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    // PATH with only node and git — the repo gate (#31) needs real git to
+    // see the usable checkout; `gh` alone is absent so its install guidance
+    // is what must surface.
     const bareShimDir = await mkdtemp(join(tmpdir(), "empty-path-"));
     await symlink(process.execPath, join(bareShimDir, "node"));
+    const gitBin = (await execAsync("command -v git")).stdout.trim();
+    await symlink(gitBin, join(bareShimDir, "git"));
 
     try {
       await execAsync(
@@ -1809,6 +1867,7 @@ process.exit(1);
     if (process.platform === "win32") return;
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
     const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
     await writeFakeGh(shimDir, { authenticated: false });
 
@@ -1832,6 +1891,7 @@ process.exit(1);
     if (process.platform === "win32") return;
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
     const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
     await writeFakeGh(shimDir, { authenticated: true });
 
@@ -1855,6 +1915,7 @@ process.exit(1);
     if (process.platform === "win32") return;
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
     const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
     await writeFakeGh(shimDir, { authenticated: true, labelCreate: "ok" });
 
@@ -1877,6 +1938,7 @@ process.exit(1);
     if (process.platform === "win32") return;
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
     const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
     await writeFakeGh(shimDir, {
       authenticated: true,
@@ -1896,6 +1958,7 @@ process.exit(1);
     if (process.platform === "win32") return;
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
     const shimDir = await mkdtemp(join(tmpdir(), "fake-gh-"));
     await writeFakeGh(shimDir, {
       authenticated: true,
@@ -2172,6 +2235,7 @@ process.exit(1);
     if (process.platform === "win32") return;
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
     await writeFile(
       join(hostDir, "package.json"),
       JSON.stringify({
