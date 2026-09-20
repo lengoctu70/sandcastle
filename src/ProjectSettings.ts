@@ -107,6 +107,13 @@ export interface ProjectSettings {
   readonly verificationStatus?: VerificationStatus;
   /** Bounded parallelism for parallel workflows; an integer from 1 to 4. */
   readonly parallelism: number;
+  /**
+   * Agent idle timeout in seconds — how long a run tolerates zero stdout
+   * bytes before failing with an idle-timeout error (ADR 0027). Omitted
+   * means the orchestrator default (600s). A positive integer; the field is
+   * absent rather than `null` when unset.
+   */
+  readonly idleTimeoutSeconds?: number;
   readonly roleOverrides?: RoleOverrides;
   /** Issue tracker choice (matches the init tracker registry, e.g. `"github-issues"`). */
   readonly issueTracker: string;
@@ -273,6 +280,8 @@ export interface InitialProjectSettings {
   readonly verificationStatus?: VerificationStatus;
   /** Defaults to `1` (sequential). Must stay within {@link MIN_PARALLELISM}–{@link MAX_PARALLELISM}. */
   readonly parallelism?: number;
+  /** Defaults to omitted (orchestrator default applies). Positive integer when set. */
+  readonly idleTimeoutSeconds?: number;
   readonly roleOverrides?: RoleOverrides;
 }
 
@@ -289,6 +298,8 @@ export interface ProjectSettingsInitOverrides {
   readonly verificationCommands?: readonly string[];
   readonly verificationStatus?: VerificationStatus;
   readonly parallelism?: number;
+  /** Defaults to omitted (orchestrator default applies). Positive integer when set. */
+  readonly idleTimeoutSeconds?: number;
   readonly roleOverrides?: RoleOverrides;
 }
 
@@ -314,6 +325,9 @@ export const makeProjectSettings = (
     ? { verificationStatus: init.verificationStatus }
     : {}),
   parallelism: init.parallelism ?? MIN_PARALLELISM,
+  ...(init.idleTimeoutSeconds !== undefined
+    ? { idleTimeoutSeconds: init.idleTimeoutSeconds }
+    : {}),
   ...(init.roleOverrides !== undefined
     ? { roleOverrides: init.roleOverrides }
     : {}),
@@ -356,6 +370,8 @@ export interface ProjectSettingsUpdate {
   /** `null` clears the stored status back to "configured, not yet run". */
   readonly verificationStatus?: VerificationStatus | null;
   readonly parallelism?: number;
+  /** `null` clears the stored override back to the orchestrator default. */
+  readonly idleTimeoutSeconds?: number | null;
   readonly roleOverrides?: Partial<
     Record<WorkflowRole, RoleOverrideUpdate | null>
   >;
@@ -438,6 +454,7 @@ const SETTINGS_FIELDS = [
   "verificationCommands",
   "verificationStatus",
   "parallelism",
+  "idleTimeoutSeconds",
   "roleOverrides",
   "issueTracker",
 ] as const;
@@ -535,6 +552,19 @@ const validateSettings = (
     );
   }
 
+  let idleTimeoutSeconds: number | undefined;
+  const rawIdleTimeout = raw["idleTimeoutSeconds"];
+  if (rawIdleTimeout !== undefined) {
+    if (
+      typeof rawIdleTimeout !== "number" ||
+      !Number.isInteger(rawIdleTimeout) ||
+      rawIdleTimeout < 1
+    ) {
+      fail(`trường "idleTimeoutSeconds" phải là số nguyên dương`);
+    }
+    idleTimeoutSeconds = rawIdleTimeout;
+  }
+
   let roleOverrides: RoleOverrides | undefined;
   if (raw["roleOverrides"] !== undefined) {
     if (!isRecord(raw["roleOverrides"])) {
@@ -567,6 +597,7 @@ const validateSettings = (
     verificationCommands: commands,
     ...(verificationStatus !== undefined ? { verificationStatus } : {}),
     parallelism,
+    ...(idleTimeoutSeconds !== undefined ? { idleTimeoutSeconds } : {}),
     ...(roleOverrides !== undefined ? { roleOverrides } : {}),
     issueTracker,
   };
@@ -754,6 +785,11 @@ const applyUpdate = (
   if (update.issueTracker !== undefined)
     next.issueTracker = update.issueTracker;
   if (update.parallelism !== undefined) next.parallelism = update.parallelism;
+  if (update.idleTimeoutSeconds === null) {
+    delete next.idleTimeoutSeconds;
+  } else if (update.idleTimeoutSeconds !== undefined) {
+    next.idleTimeoutSeconds = update.idleTimeoutSeconds;
+  }
   if (update.verificationCommands !== undefined) {
     next.verificationCommands = [...update.verificationCommands];
   }

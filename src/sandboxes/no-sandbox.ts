@@ -252,6 +252,7 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
         command: string,
         opts?: {
           onLine?: (line: string) => void;
+          onData?: (chunk: string) => void;
           cwd?: string;
           sudo?: boolean;
           stdin?: string;
@@ -326,6 +327,17 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
           proc.on("error", (error) => {
             reject(new Error(`exec failed: ${error.message}`));
           });
+
+          // Raw stdout bytes as they arrive — coexists with the readline
+          // splitter below; fires for partial unterminated lines too (ADR
+          // 0027: unframed-output agents like `devin -p` stream text without
+          // newlines, and byte-level activity is the idle-timeout signal).
+          if (opts?.onData !== undefined) {
+            const onData = opts.onData;
+            proc.stdout!.on("data", (chunk: Buffer) => {
+              onData(chunk.toString());
+            });
+          }
 
           const finish = (
             stdout: string,

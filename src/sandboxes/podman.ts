@@ -307,6 +307,7 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
           command: string,
           opts?: {
             onLine?: (line: string) => void;
+            onData?: (chunk: string) => void;
             cwd?: string;
             sudo?: boolean;
             stdin?: string;
@@ -335,6 +336,16 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
             proc.on("error", (error) => {
               reject(new Error(`podman exec failed: ${error.message}`));
             });
+
+            // Raw stdout bytes as they arrive — coexists with the readline
+            // splitter below; fires for partial unterminated lines too
+            // (ADR 0027: byte-level activity drives the idle timeout).
+            if (opts?.onData !== undefined) {
+              const onData = opts.onData;
+              proc.stdout!.on("data", (chunk: Buffer) => {
+                onData(chunk.toString());
+              });
+            }
 
             if (opts?.onLine) {
               const onLine = opts.onLine;

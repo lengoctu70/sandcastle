@@ -893,9 +893,7 @@ describe("hostVerificationExec", () => {
     expect(res.timedOut).toBe(true);
     expect(res.exitCode).toBeNull();
 
-    const descendantPid = Number(
-      res.stdout.match(/DESCENDANT_PID=(\d+)/)?.[1],
-    );
+    const descendantPid = Number(res.stdout.match(/DESCENDANT_PID=(\d+)/)?.[1]);
     expect(descendantPid).toBeGreaterThan(0);
     const deadline = Date.now() + 10_000;
     let alive = true;
@@ -1064,6 +1062,7 @@ describe("runIssueWorkflow (real repo, injected gh + verification exec)", () => 
   const writeSettings = async (
     dir: string,
     verificationCommands: readonly string[],
+    extra?: Record<string, unknown>,
   ) => {
     await mkdir(join(dir, ".sandcastle"), { recursive: true });
     await writeFile(
@@ -1078,6 +1077,7 @@ describe("runIssueWorkflow (real repo, injected gh + verification exec)", () => 
         verificationCommands,
         parallelism: 1,
         issueTracker: "github-issues",
+        ...extra,
       }),
     );
   };
@@ -1109,6 +1109,31 @@ fs.writeFileSync(path.join(cwd, "agent-work.txt"), "implemented " + tag + "\\n")
 cp.execSync("git add -A && git commit -m \\"agent work\\"", { cwd, stdio: "ignore" });
 console.log(JSON.stringify({ type: "step_start", sessionID: "oc-1" }));
 console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <promise>COMPLETE</promise>" } }));
+`,
+    );
+    await chmod(shim, 0o755);
+  };
+
+  /**
+   * Silent variant — stays completely quiet for `delayMs` (no stdout bytes)
+   * before doing the same work, so a short configured idle timeout kills it
+   * mid-run while the default 600s would let it finish.
+   */
+  const writeSlowSilentOpencode = async (dir: string, delayMs = 2500) => {
+    const shim = join(dir, "opencode");
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+setTimeout(() => {
+const fs = require("fs");
+const cp = require("child_process");
+const path = require("path");
+const cwd = process.cwd();
+const tag = Date.now() + "-" + Math.random().toString(36).slice(2);
+fs.writeFileSync(path.join(cwd, "agent-work.txt"), "implemented " + tag + "\\n");
+cp.execSync("git add -A && git commit -m \\"agent work\\"", { cwd, stdio: "ignore" });
+console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <promise>COMPLETE</promise>" } }));
+}, ${delayMs});
 `,
     );
     await chmod(shim, 0o755);
@@ -1367,6 +1392,57 @@ console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <pr
     // timedOut survives the recovery-record round-trip.
     expect(recovery.verification[0].timedOut).toBe(true);
   });
+
+  it("configured idleTimeoutSeconds reaches the agent invocation — a silent agent fails at the bound", async () => {
+    const repoDir = await makeRepo();
+    // The shim stays silent for 2.5s; a 1s configured idle timeout must kill
+    // it during implementation (the default 600s would let it finish).
+    await writeSettings(repoDir, [], { idleTimeoutSeconds: 1 });
+    const shimDir = await mkdtemp(join(tmpdir(), "wf-silent-shims-"));
+    await writeSlowSilentOpencode(shimDir);
+    vi.stubEnv("PATH", `${shimDir}:${process.env.PATH}`);
+
+    const result = await runIssueWorkflow({
+      cwd: repoDir,
+      issueNumber: 5,
+      ghRunner,
+      discoveryExec,
+      verificationExec: async () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+      }),
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.failurePhase).toBe("implementation");
+    expect(result.message).toContain("idle");
+  }, 30_000);
+
+  it("--idle-timeout beats the configured idleTimeoutSeconds", async () => {
+    const repoDir = await makeRepo();
+    // Settings say 1s — the shim's 2.5s silence would die under it. The
+    // option-level override (the CLI flag) wins, so the run survives.
+    await writeSettings(repoDir, [], { idleTimeoutSeconds: 1 });
+    const shimDir = await mkdtemp(join(tmpdir(), "wf-silent-shims-"));
+    await writeSlowSilentOpencode(shimDir);
+    vi.stubEnv("PATH", `${shimDir}:${process.env.PATH}`);
+
+    const result = await runIssueWorkflow({
+      cwd: repoDir,
+      issueNumber: 5,
+      ghRunner,
+      discoveryExec,
+      idleTimeoutSeconds: 30,
+      verificationExec: async () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+      }),
+    });
+
+    expect(result.outcome).toBe("landed");
+  }, 30_000);
 
   it("queue: an issue with a recovery record is skipped toward retry, never reimplemented", async () => {
     const repoDir = await makeRepo();

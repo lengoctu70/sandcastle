@@ -40,6 +40,12 @@ export interface SandboxService {
     command: string,
     options?: {
       onLine?: (line: string) => void;
+      /**
+       * Raw stdout chunks as they arrive — including partial, unterminated
+       * line bytes that `onLine` holds until EOF. Drives byte-level idle
+       * detection and unframed-output providers (ADR 0027).
+       */
+      onData?: (chunk: string) => void;
       cwd?: string;
       sudo?: boolean;
       stdin?: string;

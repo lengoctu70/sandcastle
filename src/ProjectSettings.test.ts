@@ -75,6 +75,7 @@ const fullSettings = (): ProjectSettings =>
     sandbox: "host",
     verificationCommands: ["npm run typecheck", "npm test"],
     parallelism: 4,
+    idleTimeoutSeconds: 1800,
     roleOverrides: {
       planner: { agent: "codex", model: "gpt-5.4", effort: "high" },
       reviewer: { model: "claude-opus-4-8" },
@@ -123,6 +124,7 @@ describe("ProjectSettings round-trip", () => {
     const raw = await readFile(projectSettingsPath(dir), "utf-8");
     expect(raw).not.toContain('"effort"');
     expect(raw).not.toContain('"agentExecutable"');
+    expect(raw).not.toContain('"idleTimeoutSeconds"');
     expect(raw).not.toContain('"roleOverrides"');
     // Manual entry is the honest default — never claimed as discovered.
     expect(loaded.modelSource).toBe("manual-unverified");
@@ -333,6 +335,23 @@ describe("loadProjectSettings diagnostics", () => {
     expect((err as Error).message).toContain("parallelism");
   });
 
+  it.each([0, -5, 1.5, "600"])(
+    "schema-invalid idleTimeoutSeconds %s is reported as malformed",
+    async (idleTimeoutSeconds) => {
+      const dir = await makeDir();
+      await mkdir(join(dir, ".sandcastle"));
+      await writeFile(
+        projectSettingsPath(dir),
+        JSON.stringify({ ...fullSettings(), idleTimeoutSeconds }),
+      );
+
+      const err = await failureOf(loadProjectSettings(dir));
+
+      expect(err).toBeInstanceOf(ProjectSettingsMalformedError);
+      expect((err as Error).message).toContain("idleTimeoutSeconds");
+    },
+  );
+
   it("unknown top-level keys are rejected rather than silently dropped", async () => {
     const dir = await makeDir();
     await mkdir(join(dir, ".sandcastle"));
@@ -415,6 +434,36 @@ describe("updateProjectSettings", () => {
       planner: { agent: "codex", model: "gpt-5.4", effort: "low" },
       merger: { agent: "pi" },
     });
+  });
+
+  it("sets and clears idleTimeoutSeconds — null returns to the orchestrator default", async () => {
+    const dir = await makeDir();
+    await run(
+      saveProjectSettings(
+        dir,
+        makeProjectSettings({
+          agent: "claude-code",
+          model: "claude-opus-4-8",
+          workflow: "simple-loop",
+          sandbox: "host",
+          issueTracker: "github-issues",
+        }),
+      ),
+    );
+
+    const updated = await run(
+      updateProjectSettings(dir, { idleTimeoutSeconds: 1800 }),
+    );
+    expect(updated.idleTimeoutSeconds).toBe(1800);
+    const raw = await readFile(projectSettingsPath(dir), "utf-8");
+    expect(raw).toContain('"idleTimeoutSeconds": 1800');
+
+    const cleared = await run(
+      updateProjectSettings(dir, { idleTimeoutSeconds: null }),
+    );
+    expect(cleared.idleTimeoutSeconds).toBeUndefined();
+    const rawCleared = await readFile(projectSettingsPath(dir), "utf-8");
+    expect(rawCleared).not.toContain('"idleTimeoutSeconds"');
   });
 
   it("clears an optional field with null and drops emptied role override objects", async () => {

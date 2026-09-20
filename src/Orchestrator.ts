@@ -12,7 +12,11 @@ import type { SandboxProvider } from "./SandboxProvider.js";
 import type { SandboxService } from "./SandboxFactory.js";
 import { SandboxFactory, SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 import { withSandboxLifecycle, type SandboxHooks } from "./SandboxLifecycle.js";
-import type { AgentProvider, IterationUsage } from "./AgentProvider.js";
+import type {
+  AgentProvider,
+  IterationUsage,
+  ParsedStreamEvent,
+} from "./AgentProvider.js";
 import type { Timeouts } from "./run.js";
 import { TextDeltaBuffer } from "./TextDeltaBuffer.js";
 
@@ -170,6 +174,41 @@ const invokeAgent = (
 
     resetTimer();
 
+    const applyParsedEvent = (parsed: ParsedStreamEvent) => {
+      if (parsed.type === "text") {
+        onText(parsed.text);
+        accumulatedOutput += parsed.text;
+      } else if (parsed.type === "result") {
+        resultText = parsed.result;
+        accumulatedOutput += parsed.result;
+      } else if (parsed.type === "tool_call") {
+        onToolCall(parsed.name, parsed.args);
+      } else if (parsed.type === "session_id") {
+        sessionId = parsed.sessionId;
+      } else if (parsed.type === "usage") {
+        usage = parsed.usage;
+      }
+    };
+
+    // Check for the completion signal AFTER parsing so the accumulator
+    // contains everything seen so far. Flip to the completion-grace timer
+    // the first time the signal appears. The matched signal is remembered:
+    // it was detected over the whole streamed conversation, so a later
+    // result event that drops it cannot erase it.
+    const checkCompletionSignal = () => {
+      if (!completionDetected) {
+        const matched = completionSignals.find((sig) =>
+          accumulatedOutput.includes(sig),
+        );
+        if (matched !== undefined) {
+          completionDetected = true;
+          detectedSignal = matched;
+          interruptFiber(warningFiber);
+          warningFiber = null;
+        }
+      }
+    };
+
     const execEffect = Effect.gen(function* () {
       const printCmd = provider.buildPrintCommand({
         prompt,
@@ -177,7 +216,24 @@ const invokeAgent = (
         resumeSession,
         forkSession,
       });
+      // Providers with unframed output (parseStreamChunk defined — e.g.
+      // `devin -p`, which streams text without ever emitting `\n`) get every
+      // raw chunk parsed as events; their line-level `text` events are
+      // dropped because the same bytes already arrived via chunks.
+      const chunkParser = provider.parseStreamChunk;
       const execResult = yield* sandbox.exec(printCmd.command, {
+        // Byte-level activity is the liveness signal: any stdout bytes —
+        // including a partial unterminated line — prove the agent is alive
+        // and reset the idle timer (ADR 0027).
+        onData: (chunk) => {
+          if (chunkParser !== undefined) {
+            for (const parsed of chunkParser(chunk)) {
+              applyParsedEvent(parsed);
+            }
+            checkCompletionSignal();
+          }
+          resetTimer();
+        },
         onLine: (line) => {
           // Surface the raw line FIRST so verbose mode/forwarders see every
           // stdout line the agent produced, including ones parseStreamLine
@@ -190,37 +246,10 @@ const invokeAgent = (
             // Swallow — must not skip parsing/timer logic below.
           }
           for (const parsed of provider.parseStreamLine(line)) {
-            if (parsed.type === "text") {
-              onText(parsed.text);
-              accumulatedOutput += parsed.text;
-            } else if (parsed.type === "result") {
-              resultText = parsed.result;
-              accumulatedOutput += parsed.result;
-            } else if (parsed.type === "tool_call") {
-              onToolCall(parsed.name, parsed.args);
-            } else if (parsed.type === "session_id") {
-              sessionId = parsed.sessionId;
-            } else if (parsed.type === "usage") {
-              usage = parsed.usage;
-            }
+            if (chunkParser !== undefined && parsed.type === "text") continue;
+            applyParsedEvent(parsed);
           }
-          // Check for the completion signal AFTER parsing this line so the
-          // accumulator contains everything seen so far. Flip to the
-          // completion-grace timer the first time the signal appears. The
-          // matched signal is remembered: it was detected over the whole
-          // streamed conversation, so a later result event that drops it
-          // cannot erase it.
-          if (!completionDetected) {
-            const matched = completionSignals.find((sig) =>
-              accumulatedOutput.includes(sig),
-            );
-            if (matched !== undefined) {
-              completionDetected = true;
-              detectedSignal = matched;
-              interruptFiber(warningFiber);
-              warningFiber = null;
-            }
-          }
+          checkCompletionSignal();
           resetTimer();
         },
         cwd: sandboxRepoDir,
@@ -334,7 +363,7 @@ export interface OrchestrateOptions {
   readonly branch?: string;
   readonly provider: AgentProvider;
   readonly completionSignal?: string | string[];
-  /** Idle timeout in seconds. If the agent produces no output for this long, it fails with AgentIdleTimeoutError. Default: 600 (10 minutes) */
+  /** Idle timeout in seconds. If the agent emits no stdout bytes for this long, it fails with AgentIdleTimeoutError — a partial unterminated line still counts as activity (ADR 0027). Default: 600 (10 minutes) */
   readonly idleTimeoutSeconds?: number;
   /**
    * Grace window in seconds after a completion signal is observed in the

@@ -112,7 +112,7 @@ export interface ResumeSandboxRunResultOptions {
   readonly promptArgs?: PromptArgs;
   /** Substring(s) the agent emits to stop the iteration loop early. */
   readonly completionSignal?: string | string[];
-  /** Idle timeout in seconds. Default: 600. */
+  /** Idle timeout in seconds — measured on stdout bytes, not complete lines (ADR 0027). Default: 600. */
   readonly idleTimeoutSeconds?: number;
   /** Grace window in seconds after a completion signal is observed but the agent process has not exited. See ADR 0019. Default: 60. */
   readonly completionTimeoutSeconds?: number;

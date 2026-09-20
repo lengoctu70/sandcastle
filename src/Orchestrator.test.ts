@@ -25,6 +25,7 @@ import {
   pi as piFactory,
   DEFAULT_MODEL,
 } from "./AgentProvider.js";
+import { devin as devinFactory } from "./agents/devin.js";
 import type { ExecResult, SandboxService } from "./SandboxFactory.js";
 import type { DockerError, ExecError, SandboxError } from "./errors.js";
 import { AgentError, AgentIdleTimeoutError } from "./errors.js";
@@ -2497,6 +2498,182 @@ describe("Orchestrator Display integration", () => {
     );
 
     // Should succeed because the raw stdout line at t=100ms resets the idle timer
+    expect(exitResult._tag).toBe("Success");
+  }, 10_000);
+
+  it("resets the idle timer on raw stdout bytes that never form a line (unframed output)", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "orch-idle-bytes-"));
+
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    // Devin-shaped mock: `devin -p` streams text bytes continuously but never
+    // emits `\n`, so a line reader sees nothing until exit (ADR 0027). The
+    // exec pushes two partial chunks via onData — at t=100ms and t=200ms —
+    // and never calls onLine. With idleTimeoutSeconds=0.15 (150ms), a
+    // line-based timer would fire at t=150ms; byte-level activity resets it.
+    const { factoryLayer } = makeTestSandboxFactory(hostDir, (dir) => {
+      const real = makeLocalSandbox(dir);
+      return {
+        exec: (command, options) => {
+          if (command.startsWith("devin ")) {
+            const onData = options?.onData;
+            return Effect.gen(function* () {
+              yield* Effect.promise(
+                () => new Promise((resolve) => setTimeout(resolve, 100)),
+              );
+              onData?.("Reading the codebase");
+              yield* Effect.promise(
+                () => new Promise((resolve) => setTimeout(resolve, 100)),
+              );
+              onData?.("Still working on the plan");
+              return {
+                stdout: "Reading the codebaseStill working on the plan",
+                stderr: "",
+                exitCode: 0,
+              };
+            });
+          }
+          return real.exec(command, options);
+        },
+        copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
+        copyFileOut: (sandboxPath, hostPath) =>
+          real.copyFileOut(sandboxPath, hostPath),
+      };
+    });
+
+    const exitResult = await Effect.runPromise(
+      orchestrate({
+        provider: devinFactory("test-model"),
+        hostRepoDir: hostDir,
+
+        iterations: 1,
+        prompt: "test",
+        idleTimeoutSeconds: 0.15, // 150ms — only byte-level activity can reset it
+      }).pipe(
+        Effect.provide(Layer.merge(factoryLayer, testDisplayLayer)),
+        Effect.exit,
+      ),
+    );
+
+    expect(exitResult._tag).toBe("Success");
+  }, 10_000);
+
+  it("surfaces unframed chunks as live text events without line-duplication", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "orch-unframed-"));
+
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    const events: AgentStreamEvent[] = [];
+    const emitterLayer = agentStreamEmitterLayer((e) => {
+      events.push(e);
+    });
+
+    // One chunk carries a `\n` so readline also emits the line — the
+    // line-level `text` event must be dropped (its bytes already arrived via
+    // the chunk) while the chunk itself surfaces immediately.
+    const { factoryLayer } = makeTestSandboxFactory(hostDir, (dir) => {
+      const real = makeLocalSandbox(dir);
+      return {
+        exec: (command, options) => {
+          if (command.startsWith("devin ")) {
+            const onData = options?.onData;
+            const onLine = options?.onLine;
+            return Effect.gen(function* () {
+              onData?.("hello world\n");
+              onLine?.("hello world");
+              return {
+                stdout: "hello world\n",
+                stderr: "",
+                exitCode: 0,
+              };
+            });
+          }
+          return real.exec(command, options);
+        },
+        copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
+        copyFileOut: (sandboxPath, hostPath) =>
+          real.copyFileOut(sandboxPath, hostPath),
+      };
+    });
+
+    const exitResult = await Effect.runPromise(
+      orchestrate({
+        provider: devinFactory("test-model"),
+        hostRepoDir: hostDir,
+
+        iterations: 1,
+        prompt: "test",
+        idleTimeoutSeconds: 10,
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(factoryLayer, testDisplayLayer, emitterLayer),
+        ),
+        Effect.exit,
+      ),
+    );
+
+    expect(exitResult._tag).toBe("Success");
+    const textOutput = events
+      .filter((e) => e.type === "text")
+      .map((e) => e.message)
+      .join("");
+    // Chunk delivered once — the completed line's text event is dropped.
+    expect(textOutput.match(/hello world/g)).toHaveLength(1);
+  }, 10_000);
+
+  it("resets the idle timer on byte-level activity for framed providers too", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "orch-idle-chunk-"));
+
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    // The bytes at t=100ms are a partial JSON event — readline holds them
+    // forever (no newline), so only onData sees them. The idle timer must
+    // still reset on raw bytes: stdout bytes are the liveness signal,
+    // whatever the provider's framing (ADR 0027).
+    const { factoryLayer } = makeTestSandboxFactory(hostDir, (dir) => {
+      const real = makeLocalSandbox(dir);
+      return {
+        exec: (command, options) => {
+          if (command.startsWith("claude ") && options?.onLine) {
+            const onData = options.onData;
+            const onLine = options.onLine;
+            return Effect.gen(function* () {
+              yield* Effect.promise(
+                () => new Promise((resolve) => setTimeout(resolve, 100)),
+              );
+              onData?.('{"type":"assistant","partial');
+              yield* Effect.promise(
+                () => new Promise((resolve) => setTimeout(resolve, 100)),
+              );
+              onLine(JSON.stringify({ type: "result", result: "done" }));
+              return { stdout: "", stderr: "", exitCode: 0 };
+            });
+          }
+          return real.exec(command, options);
+        },
+        copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
+        copyFileOut: (sandboxPath, hostPath) =>
+          real.copyFileOut(sandboxPath, hostPath),
+      };
+    });
+
+    const exitResult = await Effect.runPromise(
+      orchestrate({
+        provider: testProvider,
+        hostRepoDir: hostDir,
+
+        iterations: 1,
+        prompt: "test",
+        idleTimeoutSeconds: 0.15, // 150ms — only the partial chunk can reset it
+      }).pipe(
+        Effect.provide(Layer.merge(factoryLayer, testDisplayLayer)),
+        Effect.exit,
+      ),
+    );
+
     expect(exitResult._tag).toBe("Success");
   }, 10_000);
 

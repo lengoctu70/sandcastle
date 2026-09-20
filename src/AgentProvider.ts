@@ -302,6 +302,18 @@ export interface AgentProvider {
   buildPrintCommand(options: AgentCommandOptions): PrintCommand;
   buildInteractiveArgs?(options: AgentCommandOptions): string[];
   parseStreamLine(line: string): ParsedStreamEvent[];
+  /**
+   * Optional raw-chunk parser for agents with **unframed output** — print
+   * output that streams text bytes without ever emitting `\n`, so a line
+   * reader sees nothing until process exit (e.g. `devin -p`; see CONTEXT.md).
+   * When defined, the Orchestrator feeds every raw stdout chunk through it so
+   * output surfaces live instead of being held in the line buffer.
+   *
+   * `parseStreamLine` still runs on completed lines; for a provider that
+   * defines this method its `text` events are dropped — the bytes were
+   * already delivered as chunks — while other event types still apply.
+   */
+  parseStreamChunk?(chunk: string): ParsedStreamEvent[];
   /** Parse token usage from the captured session JSONL content. Only implemented by Claude Code. */
   parseSessionUsage?(content: string): IterationUsage | undefined;
 }

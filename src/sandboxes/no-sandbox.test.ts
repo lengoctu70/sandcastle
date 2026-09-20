@@ -155,6 +155,40 @@ describe("noSandbox", () => {
       expect(result.exitCode).toBe(0);
     });
 
+    itPosix(
+      "exec delivers raw stdout bytes via onData while the process still runs (unterminated lines included)",
+      async () => {
+        const provider = noSandbox();
+        const handle = await provider.create({
+          worktreePath: process.cwd(),
+          env: {},
+        });
+
+        // printf emits no newline — a line reader holds these bytes until
+        // EOF. `onData` must see them live instead (ADR 0027).
+        const chunks: string[] = [];
+        let firstChunkAt = 0;
+        const result = await handle.exec(
+          'printf "chunk-one"; sleep 0.3; printf "chunk-two"',
+          {
+            onData: (chunk) => {
+              if (firstChunkAt === 0) firstChunkAt = Date.now();
+              chunks.push(chunk);
+            },
+          },
+        );
+        const endedAt = Date.now();
+
+        expect(chunks.join("")).toBe("chunk-onechunk-two");
+        expect(result.stdout).toBe("chunk-onechunk-two");
+        expect(result.exitCode).toBe(0);
+        // The first bytes arrived while the process was still sleeping —
+        // not in one flush at exit.
+        expect(firstChunkAt).toBeGreaterThan(0);
+        expect(endedAt - firstChunkAt).toBeGreaterThanOrEqual(150);
+      },
+    );
+
     itPosix("exec respects cwd option", async () => {
       const provider = noSandbox();
       const handle = await provider.create({

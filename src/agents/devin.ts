@@ -82,6 +82,19 @@ const parseDevinStreamLine = (line: string): ParsedStreamEvent[] => {
   return [{ type: "text", text: `${text}\n` }];
 };
 
+/**
+ * `devin -p` streams text bytes continuously but never emits `\n`, so a
+ * line-oriented reader sees nothing until process exit (unframed output —
+ * see CONTEXT.md). Every raw chunk is ANSI-stripped and surfaced as a `text`
+ * event so output appears live in the run log; the corresponding line-level
+ * `text` event is dropped by the Orchestrator to avoid duplication.
+ */
+const parseDevinStreamChunk = (chunk: string): ParsedStreamEvent[] => {
+  const text = stripAnsi(chunk);
+  if (text.length === 0) return [];
+  return [{ type: "text", text }];
+};
+
 /** Options for the devin agent provider. */
 export interface DevinOptions {
   /**
@@ -154,5 +167,9 @@ export const devin = (
 
   parseStreamLine(line: string): ParsedStreamEvent[] {
     return parseDevinStreamLine(line);
+  },
+
+  parseStreamChunk(chunk: string): ParsedStreamEvent[] {
+    return parseDevinStreamChunk(chunk);
   },
 });

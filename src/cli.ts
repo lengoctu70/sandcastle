@@ -1313,6 +1313,29 @@ const runParallelismOption = Options.integer("parallelism").pipe(
   Options.optional,
 );
 
+const idleTimeoutOption = Options.integer("idle-timeout").pipe(
+  Options.withDescription(
+    "Seconds an agent may stay silent — zero stdout bytes — before the run fails (default: configured idleTimeoutSeconds or 600)",
+  ),
+  Options.optional,
+);
+
+/** Shared `--idle-timeout` validation for `run` and `retry`. */
+const resolveIdleTimeout = (
+  value: Option.Option<number>,
+): Effect.Effect<number | undefined, InitError> =>
+  Option.match(value, {
+    onNone: () => Effect.succeed<number | undefined>(undefined),
+    onSome: (seconds) =>
+      !Number.isInteger(seconds) || seconds < 1
+        ? Effect.fail(
+            new InitError({
+              message: `--idle-timeout phải là số nguyên dương (nhận: ${seconds}).`,
+            }),
+          )
+        : Effect.succeed<number | undefined>(seconds),
+  });
+
 type RunScope =
   | { readonly kind: "issue"; readonly issueNumber?: number }
   | { readonly kind: "all"; readonly parallelism?: number };
@@ -1323,12 +1346,14 @@ const runCommand = Command.make(
     issue: runIssueOption,
     all: runAllOption,
     parallelism: runParallelismOption,
+    idleTimeout: idleTimeoutOption,
   },
-  ({ issue, all, parallelism }) =>
+  ({ issue, all, parallelism, idleTimeout }) =>
     Effect.gen(function* () {
       const d = yield* Display;
       const cwd = process.cwd();
       const isInteractive = process.stdin.isTTY === true;
+      const idleTimeoutSeconds = yield* resolveIdleTimeout(idleTimeout);
 
       // #20: --all and --issue name different scopes — never combine them.
       if (all && issue._tag === "Some") {
@@ -1429,6 +1454,7 @@ const runCommand = Command.make(
             runIssueQueueWorkflow({
               cwd,
               parallelism: scope.parallelism,
+              idleTimeoutSeconds,
               onStatus: (message, severity) => {
                 Effect.runSync(d.status(message, severity));
               },
@@ -1464,6 +1490,7 @@ const runCommand = Command.make(
       yield* runWorkflowAndReport(d, {
         cwd,
         issueNumber: scope.issueNumber,
+        idleTimeoutSeconds,
         // The picker seam is only wired when a TTY exists — without it the
         // service requires --issue (or reports no eligible issues).
         ...(isInteractive
@@ -1672,11 +1699,12 @@ const statusCommand = Command.make("status", {}, () =>
  */
 const retryCommand = Command.make(
   "retry",
-  { issueNumber: issueNumberArg },
-  ({ issueNumber }) =>
+  { issueNumber: issueNumberArg, idleTimeout: idleTimeoutOption },
+  ({ issueNumber, idleTimeout }) =>
     Effect.gen(function* () {
       const d = yield* Display;
       const cwd = process.cwd();
+      const idleTimeoutSeconds = yield* resolveIdleTimeout(idleTimeout);
       const record: RecoveryReadResult = yield* Effect.promise(() =>
         readRecoveryState(cwd, issueNumber),
       );
@@ -1712,6 +1740,7 @@ const retryCommand = Command.make(
       yield* runWorkflowAndReport(d, {
         cwd,
         resume: record.state,
+        idleTimeoutSeconds,
         onStatus: (message, severity) => {
           Effect.runSync(d.status(message, severity));
         },

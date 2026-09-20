@@ -178,31 +178,37 @@ export const vercel = (options?: VercelOptions): IsolatedSandboxProvider =>
           command: string,
           opts?: {
             onLine?: (line: string) => void;
+            onData?: (chunk: string) => void;
             cwd?: string;
             sudo?: boolean;
           },
         ): Promise<ExecResult> => {
-          if (opts?.onLine) {
+          if (opts?.onLine !== undefined || opts?.onData !== undefined) {
             const onLine = opts.onLine;
+            const onData = opts.onData;
             const stdoutTail = new BoundedTail(maxOutputTailChars, "\n");
             const stderrTail = new BoundedTail(maxOutputTailChars, "");
             let partial = "";
 
             const stdoutWritable = new Writable({
               write(chunk, _encoding, callback) {
+                // Raw bytes first — unframed-output agents stream partial,
+                // unterminated lines that the split below holds in `partial`
+                // until a newline or stream end (ADR 0027).
+                onData?.(chunk.toString());
                 const text = partial + chunk.toString();
                 const lines = text.split("\n");
                 partial = lines.pop() ?? "";
                 for (const line of lines) {
                   stdoutTail.push(line);
-                  onLine(line);
+                  onLine?.(line);
                 }
                 callback();
               },
               final(callback) {
                 if (partial) {
                   stdoutTail.push(partial);
-                  onLine(partial);
+                  onLine?.(partial);
                   partial = "";
                 }
                 callback();

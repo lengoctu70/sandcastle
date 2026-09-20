@@ -130,7 +130,7 @@ export interface WorktreeRunOptions {
   readonly maxIterations?: number;
   /** Substring(s) the agent emits to stop the iteration loop early. */
   readonly completionSignal?: string | string[];
-  /** Idle timeout in seconds. Default: 600. */
+  /** Idle timeout in seconds — measured on stdout bytes, not complete lines (ADR 0027). Default: 600. */
   readonly idleTimeoutSeconds?: number;
   /** Grace window in seconds after a completion signal is observed but the agent process has not exited. See ADR 0019. Default: 60. */
   readonly completionTimeoutSeconds?: number;
@@ -323,9 +323,8 @@ export const createWorktree = async (
         // TARGET_BRANCH is the host's active branch — the branch the
         // worktree's work merges back into — never the worktree's own source
         // branch (F027; same rule as run.ts / interactive.ts).
-        const currentHostBranch = yield* WorktreeManager.getCurrentBranch(
-          hostRepoDir,
-        );
+        const currentHostBranch =
+          yield* WorktreeManager.getCurrentBranch(hostRepoDir);
         const effectiveArgs = {
           SOURCE_BRANCH: worktreeInfo.branch,
           TARGET_BRANCH: currentHostBranch,
@@ -546,9 +545,8 @@ export const createWorktree = async (
         yield* validateNoBuiltInArgOverride(userArgs);
         // TARGET_BRANCH is the host's active branch — the merge target —
         // never the worktree's source branch (F027).
-        const currentHostBranch = yield* WorktreeManager.getCurrentBranch(
-          hostRepoDir,
-        );
+        const currentHostBranch =
+          yield* WorktreeManager.getCurrentBranch(hostRepoDir);
         const effectiveArgs = {
           SOURCE_BRANCH: worktreeInfo.branch,
           TARGET_BRANCH: currentHostBranch,

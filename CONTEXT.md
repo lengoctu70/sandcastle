@@ -106,6 +106,14 @@ _Avoid_: "stuck agent" (implies stuck _mid-work_, not done-but-not-exited), "zom
 A silence-based grace window that takes over from the **idle timeout** once a **completion signal** is detected in the **agent**'s output. Reset by every subsequent output line so trailing data (token-usage events, terminal `result` events, **structured output** tags emitted after the signal) is still captured. On expiry the run resolves **successfully** with a warning that the process is hanging -- in contrast to **idle timeout** expiry, which fails the run. Configured via `completionTimeoutSeconds`; default 60 seconds. Independent of `idleTimeoutSeconds` -- they cover different phases.
 _Avoid_: "grace period" (too generic), "post-completion timeout", "completion grace window", "drain timeout"
 
+**Idle timeout**:
+The per-**iteration** limit on **agent** silence: if the **agent** process emits no stdout bytes for the configured duration, the iteration fails with `AgentIdleTimeoutError`. "No output" means no raw _bytes_ -- a partial line still counts as activity, so **unframed output** agents are not falsely killed while working. Default 600 seconds; configured via `idleTimeoutSeconds` on `run()` or `--idle-timeout`/`idleTimeoutSeconds` in settings on the issue-workflow CLI.
+_Avoid_: "hang detection" (too broad -- the **completion timeout** covers post-signal hangs), "line timeout" (misleading -- the unit is bytes, not lines)
+
+**Unframed output**:
+**Agent** print output that is not newline-delimited -- text bytes stream continuously but a line reader sees no complete line until process exit (e.g. `devin -p`). For a provider with unframed output, Sandcastle consumes raw stdout chunks as `text` events and bypasses line-based parsing, so output is displayed live and never dropped or double-reported.
+_Avoid_: "buffered output" (implies the agent buffers; it streams, just without `\n`), "raw mode"
+
 **Structured output**:
 A schema-validated JSON payload emitted by the **agent** inside a caller-specified XML tag and returned to the caller of `run()`. Configured via `output: Output.object({ tag, schema })`. Orthogonal to the **completion signal** -- a run can use either, both, or neither. The caller owns the prompt-side instruction telling the agent to emit the tag; Sandcastle does not inject it, and `run()` errors early if the resolved prompt does not contain the configured tag.
 _Avoid_: "output payload", "result", "JSON output"

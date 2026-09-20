@@ -498,7 +498,7 @@ if (closeResult.preservedWorktreePath) {
 | `promptArgs`               | PromptArgs         | —                             | Key-value map for `{{KEY}}` placeholder substitution                                                                                 |
 | `maxIterations`            | number             | `1`                           | Maximum iterations to run                                                                                                            |
 | `completionSignal`         | string \| string[] | `<promise>COMPLETE</promise>` | String(s) the agent emits to stop the iteration loop early                                                                           |
-| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on each agent output event                                                                          |
+| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on any stdout bytes, not just complete output lines                                                 |
 | `completionTimeoutSeconds` | number             | `60`                          | Grace window after the completion signal is seen but the agent process hasn't exited                                                 |
 | `name`                     | string             | —                             | Display name for the run                                                                                                             |
 | `logging`                  | object             | file (auto-generated)         | `{ type: 'file', path }` or `{ type: 'stdout' }`                                                                                     |
@@ -622,7 +622,7 @@ With `branchStrategy: { type: "merge-to-head" }`, each `wt.run()` / `wt.interact
 | `promptFile`               | string                 | —       | Path to prompt file                                                                                                                  |
 | `maxIterations`            | number                 | 1       | Maximum iterations to run                                                                                                            |
 | `completionSignal`         | string \| string[]     | —       | Substring(s) to stop the iteration loop early                                                                                        |
-| `idleTimeoutSeconds`       | number                 | 600     | Idle timeout in seconds                                                                                                              |
+| `idleTimeoutSeconds`       | number                 | 600     | Idle timeout in seconds — resets on any stdout bytes, not just complete output lines                                                 |
 | `completionTimeoutSeconds` | number                 | 60      | Grace window after completion signal is seen but agent process hasn't exited                                                         |
 | `name`                     | string                 | —       | Optional run name                                                                                                                    |
 | `logging`                  | LoggingOption          | file    | Logging mode                                                                                                                         |
@@ -963,11 +963,14 @@ When a repair budget is exhausted (or the failure isn't repairable), the run sto
 
 Only after landing does Sandcastle post a Vietnamese completion report (outcome, landed commits and change summary, executed verification, cautions — including how many repairs were needed) and then close the issue. On any pre-landing failure it posts a Vietnamese failure report instead, keeps the issue open, preserves the source branch and worktree under `.sandcastle/` for recovery, and never leaves your active checkout conflicted.
 
-| Option          | Required | Default                        | Description                                                                      |
-| --------------- | -------- | ------------------------------ | -------------------------------------------------------------------------------- |
-| `--issue`       | No       | Interactive run-scope picker   | GitHub issue number to implement — mutually exclusive with `--all`               |
-| `--all`         | No       | `false`                        | Run every open `Sandcastle`-labeled issue (ascending issue-number order)         |
-| `--parallelism` | No       | Configured `parallelism` (1–4) | Cap on how many `--all` issues run at once — `1` is sequential; requires `--all` |
+| Option           | Required | Default                                  | Description                                                                      |
+| ---------------- | -------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
+| `--issue`        | No       | Interactive run-scope picker             | GitHub issue number to implement — mutually exclusive with `--all`               |
+| `--all`          | No       | `false`                                  | Run every open `Sandcastle`-labeled issue (ascending issue-number order)         |
+| `--parallelism`  | No       | Configured `parallelism` (1–4)           | Cap on how many `--all` issues run at once — `1` is sequential; requires `--all` |
+| `--idle-timeout` | No       | Configured `idleTimeoutSeconds` or `600` | Seconds an agent may stay silent — zero stdout bytes — before the run fails      |
+
+The idle bound is measured on **stdout bytes**, not complete output lines: an agent that streams text without newlines (e.g. `devin -p` — see [ADR 0027](docs/adr/0027-byte-level-idle-timeout.md)) still counts as active, and its narration surfaces live in the run log instead of arriving in one block at exit. Persist a different default as `idleTimeoutSeconds` in `.sandcastle/settings.json`.
 
 ### `sandcastle status`
 
@@ -978,6 +981,10 @@ Lists every preserved failed task — one entry per recovery record under `.sand
 Continues one preserved failed task. The recovery record pins the task: `retry` never re-selects an issue, never creates a new implementation branch, and never starts the work over. It re-enters the workflow at the recorded failure phase — re-running verification (with a fresh bounded repair budget), or going straight to the integration/landing sequence when the failure happened there — inside the preserved worktree and on the preserved source branch. When the record carries an agent session id and the provider supports session storage, the next agent invocation resumes that session across the process restart; otherwise a fresh invocation against the preserved code carries the issue identity and failure context.
 
 A successful `retry` runs the normal safe path: verification, integration, freshness-checked landing, the Vietnamese completion report, issue closure, and cleanup of the recovery record, worktree, and branch. A `retry` that fails again rewrites the record with the new failure phase and an incremented retry count. Stale records are diagnosed in Vietnamese instead of being silently used — the issue now closed (work may have landed elsewhere), the target branch gone, or no committed work left to continue — and point at `sandcastle discard` for cleanup.
+
+| Option           | Required | Default                                  | Description                                                                 |
+| ---------------- | -------- | ---------------------------------------- | --------------------------------------------------------------------------- |
+| `--idle-timeout` | No       | Configured `idleTimeoutSeconds` or `600` | Seconds an agent may stay silent — zero stdout bytes — before the run fails |
 
 ### `sandcastle discard <issue-number>`
 
@@ -1038,7 +1045,7 @@ Removes the Podman image.
 | `copyToWorktree`           | string[]           | —                             | Host-relative file paths to copy into the sandbox before start (not supported with `branchStrategy: { type: 'head' }`)                                                                                                                                                                              |
 | `logging`                  | object             | file (auto-generated)         | `{ type: 'file', path }` or `{ type: 'stdout' }`                                                                                                                                                                                                                                                    |
 | `completionSignal`         | string \| string[] | `<promise>COMPLETE</promise>` | String or array of strings the agent emits to stop the iteration loop early                                                                                                                                                                                                                         |
-| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on each agent output event                                                                                                                                                                                                                                         |
+| `idleTimeoutSeconds`       | number             | `600`                         | Idle timeout in seconds — resets on any stdout bytes, not just complete output lines                                                                                                                                                                                                                |
 | `completionTimeoutSeconds` | number             | `60`                          | Grace window in seconds after the completion signal is observed but the agent process has not exited (hanging process). See [Hanging processes after the completion signal](#hanging-processes-after-the-completion-signal).                                                                        |
 | `resumeSession`            | string             | —                             | Resume a prior session by ID for agents that support resume. Incompatible with `maxIterations > 1`. Session file must exist on host.                                                                                                                                                                |
 | `signal`                   | AbortSignal        | —                             | Cancel the run when aborted. Kills the in-flight agent subprocess and cancels lifecycle hooks; the worktree is preserved on disk. Rejects with `signal.reason`.                                                                                                                                     |

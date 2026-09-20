@@ -355,6 +355,12 @@ export interface RunIssueWorkflowOptions {
    * standalone runs.
    */
   readonly preflight?: WorkflowRunPreflight;
+  /**
+   * Agent idle-timeout override in seconds (`--idle-timeout`). Beats
+   * `settings.idleTimeoutSeconds`; when both are absent the orchestrator
+   * default (600s) applies to every agent invocation in the run.
+   */
+  readonly idleTimeoutSeconds?: number;
 }
 
 // Re-exported so existing `WorkflowRun.js` importers keep working — the
@@ -653,10 +659,7 @@ const resolveRoleAgent = (
   ) {
     options[entry.executableOption] = settings.agentExecutable;
   }
-  if (
-    entry.execPlatformOption !== undefined &&
-    settings.sandbox !== "host"
-  ) {
+  if (entry.execPlatformOption !== undefined && settings.sandbox !== "host") {
     // Container sandboxes exec through POSIX `sh` even on a Windows host —
     // pin the exec platform or the provider defaults to `process.platform`
     // ("win32" there) and passes a host temp path the sandbox cannot see
@@ -1790,6 +1793,10 @@ export const runIssueWorkflow = async (
     }));
   const verificationConfigured = (): boolean =>
     settings.verificationCommands.length > 0;
+  // Per-invocation idle timeout — the CLI flag beats the persisted setting;
+  // when neither is set the orchestrator default applies inside wt.run.
+  const idleTimeoutSeconds =
+    options.idleTimeoutSeconds ?? settings.idleTimeoutSeconds;
 
   // ---- Issue selection — immutable once chosen (ADR 0026) -------------------
 
@@ -2190,6 +2197,7 @@ export const runIssueWorkflow = async (
       name: `issue-${issue.number}-integrate`,
       maxIterations: 1,
       completionSignal: DEFAULT_COMPLETION_SIGNAL,
+      idleTimeoutSeconds,
       ...(resumeSession !== undefined ? { resumeSession } : {}),
     });
     recordAgentRun(repair);
@@ -2772,6 +2780,7 @@ export const runIssueWorkflow = async (
           name: `issue-${issue.number}-plan`,
           maxIterations: 1,
           completionSignal: DEFAULT_COMPLETION_SIGNAL,
+          idleTimeoutSeconds,
         });
         recordAgentRun(planRun, { trackSession: false });
         const planText = lastAgentMessageText(
@@ -2818,6 +2827,7 @@ export const runIssueWorkflow = async (
         name: `issue-${issue.number}`,
         maxIterations: 1,
         completionSignal: DEFAULT_COMPLETION_SIGNAL,
+        idleTimeoutSeconds,
         ...(resumeSession !== undefined ? { resumeSession } : {}),
       });
       recordAgentRun(implResult);
@@ -2857,6 +2867,7 @@ export const runIssueWorkflow = async (
         name: `issue-${issue.number}-review`,
         maxIterations: 1,
         completionSignal: DEFAULT_COMPLETION_SIGNAL,
+        idleTimeoutSeconds,
       });
       recordAgentRun(reviewRun, { trackSession: false });
     } catch (e) {
@@ -2943,6 +2954,7 @@ export const runIssueWorkflow = async (
               name: `issue-${issue.number}`,
               maxIterations: 1,
               completionSignal: DEFAULT_COMPLETION_SIGNAL,
+              idleTimeoutSeconds,
               ...(resumeSession !== undefined ? { resumeSession } : {}),
             });
             recordAgentRun(repair);
@@ -3230,6 +3242,7 @@ export const runIssueWorkflow = async (
               name: `issue-${issue.number}-integrate`,
               maxIterations: 1,
               completionSignal: DEFAULT_COMPLETION_SIGNAL,
+              idleTimeoutSeconds,
               ...(resumeSession !== undefined ? { resumeSession } : {}),
             });
             recordAgentRun(repair);
@@ -3529,6 +3542,11 @@ export interface RunIssueQueueOptions {
   readonly verificationTimeoutMs?: number;
   /** Verification-execution boundary — forwarded to every queued issue's run. */
   readonly verificationExec?: VerificationExec;
+  /**
+   * Agent idle-timeout override in seconds (`--idle-timeout`) — forwarded to
+   * every queued issue's run; beats `settings.idleTimeoutSeconds`.
+   */
+  readonly idleTimeoutSeconds?: number;
 }
 
 /** Structured result of one queued `sandcastle run --all` invocation. */
@@ -3711,6 +3729,7 @@ export const runIssueQueueWorkflow = async (
           discoveryExec: options.discoveryExec,
           verificationTimeoutMs: options.verificationTimeoutMs,
           verificationExec: options.verificationExec,
+          idleTimeoutSeconds: options.idleTimeoutSeconds,
           sharedLock: lock,
           // One preflight per queue — the per-issue run skips its own probes.
           preflight: { settings, gh },

@@ -77,6 +77,15 @@ export const makeLocalSandbox = (sandboxDir: string): SandboxService => {
           );
         });
 
+        // Raw stdout bytes — the SandboxService contract's `onData` fires for
+        // partial unterminated lines too (ADR 0027).
+        if (options?.onData !== undefined) {
+          const onData = options.onData;
+          proc.stdout!.on("data", (chunk: Buffer) => {
+            onData(chunk.toString());
+          });
+        }
+
         const finish = (
           stdout: string,
           stderr: string,

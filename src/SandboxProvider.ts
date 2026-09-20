@@ -33,6 +33,12 @@ export interface BindMountSandboxHandle {
    * implementation that only calls `onLine` after the process exits does NOT
    * satisfy this contract.
    *
+   * When `onData` is set, the implementation additionally reports every raw
+   * stdout chunk as it arrives — including bytes of a partial, unterminated
+   * line that `onLine` never sees until EOF. Agents with unframed output
+   * (e.g. `devin -p`) stream text without newlines; idle detection keys on
+   * these bytes, not on completed lines (ADR 0027).
+   *
    * When `stdin` is set, the implementation pipes the string to the child
    * process's stdin and closes it. This avoids the Linux 128 KB per-arg limit.
    *
@@ -43,6 +49,7 @@ export interface BindMountSandboxHandle {
     command: string,
     options?: {
       onLine?: (line: string) => void;
+      onData?: (chunk: string) => void;
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
@@ -114,6 +121,12 @@ export interface IsolatedSandboxHandle {
    * implementation that only calls `onLine` after the process exits does NOT
    * satisfy this contract.
    *
+   * When `onData` is set, the implementation additionally reports every raw
+   * stdout chunk as it arrives — including bytes of a partial, unterminated
+   * line that `onLine` never sees until EOF. Agents with unframed output
+   * (e.g. `devin -p`) stream text without newlines; idle detection keys on
+   * these bytes, not on completed lines (ADR 0027).
+   *
    * When `stdin` is set, the implementation pipes the string to the child
    * process's stdin and closes it. This avoids the Linux 128 KB per-arg limit.
    *
@@ -124,6 +137,7 @@ export interface IsolatedSandboxHandle {
     command: string,
     options?: {
       onLine?: (line: string) => void;
+      onData?: (chunk: string) => void;
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
@@ -210,6 +224,12 @@ export interface NoSandboxHandle {
    * how Sandcastle delivers live feedback to the user and enforces idle timeouts —
    * without a streaming implementation, neither will work.
    *
+   * When `onData` is set, the implementation additionally reports every raw
+   * stdout chunk as it arrives — including bytes of a partial, unterminated
+   * line that `onLine` never sees until EOF. Agents with unframed output
+   * (e.g. `devin -p`) stream text without newlines; idle detection keys on
+   * these bytes, not on completed lines (ADR 0027).
+   *
    * When `stdin` is set, the implementation pipes the string to the child
    * process's stdin and closes it. This avoids the Linux 128 KB per-arg limit.
    *
@@ -220,6 +240,7 @@ export interface NoSandboxHandle {
     command: string,
     options?: {
       onLine?: (line: string) => void;
+      onData?: (chunk: string) => void;
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
