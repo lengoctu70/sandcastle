@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   access,
   chmod,
@@ -158,7 +159,8 @@ process.exit(1);
  * - `AGENT_BEGIN <issue>` / `AGENT_END <issue>` markers are appended to the
  *   shared call log so tests can compute max in-flight agent concurrency.
  * - `FAKE_AGENT_DELAY_MS` sleeps inside the run so overlapping parallel
- *   issues are actually observed in flight.
+ *   issues are actually observed in flight; `FAKE_AGENT_DELAY_ISSUE_<n>`
+ *   overrides it per issue so tests can order which run lands first.
  * - `FAKE_AGENT_FAIL_ISSUE=<n>` exits 1 (without committing) when the
  *   implementation prompt targets issue #<n> — repair prompts are unaffected,
  *   so the issue fails at the implementation phase and stays open.
@@ -192,7 +194,10 @@ process.stdin.on("end", () => {
     if (log) fs.appendFileSync(log, "AGENT_END " + issueNo + "\\n");
     process.exit(code);
   };
-  const delayMs = parseInt(process.env.FAKE_AGENT_DELAY_MS || "0", 10);
+  const delayMs = parseInt(
+    process.env["FAKE_AGENT_DELAY_ISSUE_" + issueNo] || process.env.FAKE_AGENT_DELAY_MS || "0",
+    10,
+  );
   if (delayMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, delayMs);
   const promptOut = process.env.FAKE_AGENT_PROMPT;
   if (promptOut) fs.appendFileSync(promptOut, "\\n===PROMPT " + n + "===\\n" + buf);
@@ -277,6 +282,84 @@ console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <pr
 `,
   );
   await chmod(shim, 0o755);
+};
+
+/**
+ * Fake `git` — passes every call through to the real git binary, except at
+ * the landing seam (`git merge --ff-only <branch>` or `git update-ref`),
+ * where env vars let a test act as an external actor moving the target
+ * branch or as a barrier inside the locked landing section:
+ * - `FAKE_GIT_DRIFT=once`  → commits an "external-drift" commit on the
+ *   checked-out target before the first real ref update only
+ *   (`FAKE_GIT_DRIFT_MARKER` records that it fired), so the update refuses
+ *   and the run must consume its bounded integration-rebuild budget.
+ * - `FAKE_GIT_DRIFT=always` → drifts before every ref update, exhausting the
+ *   budget — the run must stop safely, never force-updating.
+ * - `FAKE_GIT_HOLD_ISSUE=<n>` + `FAKE_GIT_HELD_FILE`/`FAKE_GIT_RELEASE_FILE`
+ *   → when the ref update targets issue <n>'s integration branch, the shim
+ *   writes HELD_FILE, then blocks inside the locked landing section until
+ *   RELEASE_FILE exists — a deterministic barrier proving what siblings may
+ *   or may not do while the section is held.
+ */
+const writeFakeGit = async (dir: string) => {
+  const { stdout: realGitOut } = await execAsync("command -v git");
+  const realGit = realGitOut.trim();
+  const shim = join(dir, "git");
+  await writeFile(
+    shim,
+    `#!/usr/bin/env node
+const cp = require("child_process");
+const fs = require("fs");
+const args = process.argv.slice(2);
+const realGit = ${JSON.stringify(realGit)};
+const isFfMerge = args[0] === "merge" && args.includes("--ff-only");
+const isUpdateRef = args[0] === "update-ref";
+if (isFfMerge || isUpdateRef) {
+  const drift = process.env.FAKE_GIT_DRIFT;
+  const marker = process.env.FAKE_GIT_DRIFT_MARKER;
+  const doDrift =
+    drift === "always" ||
+    (drift === "once" && marker && !fs.existsSync(marker));
+  if (doDrift) {
+    if (marker) fs.writeFileSync(marker, "1");
+    cp.execSync(realGit + " commit --allow-empty -qm external-drift", {
+      stdio: "ignore",
+    });
+  }
+  const holdIssue = process.env.FAKE_GIT_HOLD_ISSUE;
+  const branch = args.find((a) => /issue-\\d+-integrate/.test(a));
+  if (holdIssue && branch && branch.includes("issue-" + holdIssue + "-integrate")) {
+    const heldFile = process.env.FAKE_GIT_HELD_FILE;
+    const releaseFile = process.env.FAKE_GIT_RELEASE_FILE;
+    if (heldFile) fs.writeFileSync(heldFile, "1");
+    if (releaseFile) {
+      const deadline = Date.now() + 120000;
+      while (!fs.existsSync(releaseFile)) {
+        if (Date.now() > deadline) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 25);
+      }
+    }
+  }
+}
+const r = cp.spawnSync(realGit, args, { stdio: "inherit" });
+if (r.error) { console.error(String(r.error)); process.exit(1); }
+process.exit(r.status === null ? 1 : r.status);
+`,
+  );
+  await chmod(shim, 0o755);
+};
+
+/** Poll `cond` until it holds or `timeoutMs` elapses (deterministic test barriers). */
+const waitFor = async (
+  cond: () => boolean | Promise<boolean>,
+  timeoutMs = 60_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await cond()) return;
+    if (Date.now() > deadline) throw new Error("waitFor: condition timed out");
+    await new Promise((r) => setTimeout(r, 50));
+  }
 };
 
 interface FixtureEnv {
@@ -1001,6 +1084,190 @@ describe("sandcastle run --all (queued issues, #20)", () => {
 
     const { stdout } = await runCli("run --all", repoDir, env);
     expect(stdout).toContain("Không có issue nào đang mở");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Coordinated integration (#32): Sandcastle-owned merges override user merge
+// policy, the shared mutation lock covers only the mutation seams (agent +
+// verification stay concurrent), drift inside the landing seam consumes the
+// bounded rebuild budget, and cleanup is serialized with landings.
+// ---------------------------------------------------------------------------
+
+describe("sandcastle run — coordinated integration (#32)", () => {
+  it("a user merge.ff=only policy cannot break the Sandcastle-owned integration merge", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+    // User-level merge policy that refuses every non-fast-forward merge —
+    // the integration merge must override it explicitly (F022).
+    await execAsync("git config merge.ff only", { cwd: repoDir });
+
+    // Pre-seed a diverged source branch so the integration merge is a real
+    // 3-way merge — the case merge.ff=only aborts on.
+    await execAsync("git checkout -b sandcastle/issue-5", { cwd: repoDir });
+    await commitFile(repoDir, "seeded.txt", "branch\n", "seeded branch commit");
+    await execAsync("git checkout main", { cwd: repoDir });
+    await commitFile(repoDir, "other.txt", "main\n", "seeded main commit");
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    // The run landed despite merge.ff=only — the integration merge commit
+    // and both sides' content are on main.
+    expect(stdout).toContain("đã được đóng");
+    const merges = await git(repoDir, "rev-list --merges -1 main");
+    expect(merges.length).toBeGreaterThan(0);
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(files).toContain("seeded.txt");
+    expect(files).toContain("other.txt");
+    const log = await readLog(logFile);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+  });
+
+  it("target drift inside the landing seam consumes the rebuild budget and lands on the new tip", async () => {
+    const { repoDir, shimDir, logFile, env } = await makeFixture([ISSUE_5]);
+    await writeFakeGit(shimDir);
+    await writeSettings(repoDir);
+    // The fake git moves the target inside the first ref update — after the
+    // freshness check, inside the locked landing section (F052).
+    env.FAKE_GIT_DRIFT = "once";
+    env.FAKE_GIT_DRIFT_MARKER = join(repoDir, ".drift-fired");
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    // The refused ref update was diagnosed as drift, the integration state
+    // was rebuilt once on the new tip, and the run landed.
+    expect(stdout).toContain("dựng lại");
+    const mainLog = await git(repoDir, "log --format=%s main");
+    expect(mainLog).toContain("external-drift");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    const log = await readLog(logFile);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+  });
+
+  it("target drift on every landing attempt exhausts the budget — safe stop, no force-update, every created commit recorded", async () => {
+    const { repoDir, shimDir, logFile, env } = await makeFixture([ISSUE_5]);
+    await writeFakeGit(shimDir);
+    await writeSettings(repoDir);
+    env.FAKE_GIT_DRIFT = "always";
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+
+    const log = await readLog(logFile);
+    expect(log.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
+    expect(log.some((l) => l.startsWith("gh issue close"))).toBe(false);
+
+    // The agent's work never landed — main only carries the drift commits
+    // and the active checkout is clean of tracked modifications/conflicts.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).not.toContain("agent-work.txt");
+    expect(await git(repoDir, "rev-parse --abbrev-ref HEAD")).toBe("main");
+    expect(await git(repoDir, "status --porcelain --untracked-files=no")).toBe(
+      "",
+    );
+    expect(await git(repoDir, "ls-files -u")).toBe("");
+
+    // Recovery records the landing-phase stop with the spent rebuild budget
+    // — and every commit the run created, including the deterministic
+    // integration merge commits, not just the agent's (F053).
+    const recovery = JSON.parse(
+      await readFile(
+        join(repoDir, ".sandcastle", "recovery", "issue-5.json"),
+        "utf-8",
+      ),
+    );
+    expect(recovery.failurePhase).toBe("landing");
+    expect(recovery.attempts).toMatchObject({
+      implementation: 1,
+      mergeConflictRepair: 0,
+      integrationRebuild: 1,
+    });
+    const implSha = await git(repoDir, "rev-parse sandcastle/issue-5");
+    const commitShas = recovery.commits.map((c: { sha: string }) => c.sha);
+    expect(commitShas).toContain(implSha);
+    // impl commit + at least one deterministic merge commit per attempt.
+    expect(commitShas.length).toBeGreaterThanOrEqual(2);
+
+    // No leftover integration worktree; the source worktree is preserved.
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees).not.toContain("integrate");
+    expect(worktrees).toContain("sandcastle-issue-5");
+  });
+
+  it("queue: while one issue holds the landing lock a sibling still runs agent + verification, and the checkout never moves before landing", async () => {
+    const { repoDir, shimDir, logFile, env } = await makeFixture(
+      [ISSUE_5, ISSUE_7],
+      { FAKE_AGENT_PER_ISSUE_FILE: "1" },
+    );
+    await writeFakeGit(shimDir);
+    // Barrier pair: the fake git parks issue 5 inside its locked landing
+    // section until .release-5 exists; issue 7's source-stage verification
+    // (running in the `sandcastle-issue-7` worktree) cannot complete until
+    // issue 5 is parked — so the marker below is proof the sibling ran its
+    // verification while a landing section was held, i.e. verification is
+    // outside the shared mutation lock (ADR 0025).
+    const verifyCmd =
+      `me=$(basename "$PWD"); ` +
+      `if [ "$me" = "sandcastle-issue-7" ]; then ` +
+      `i=0; while [ ! -f "${join(repoDir, ".held-5")}" ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done; ` +
+      `fi; ` +
+      `echo "VERIFY $me" >> "${logFile}"`;
+    await writeSettings(repoDir, {
+      verificationCommands: [verifyCmd],
+      parallelism: 2,
+    });
+    env.FAKE_GIT_HOLD_ISSUE = "5";
+    env.FAKE_GIT_HELD_FILE = join(repoDir, ".held-5");
+    env.FAKE_GIT_RELEASE_FILE = join(repoDir, ".release-5");
+
+    const baseSha = await git(repoDir, "rev-parse refs/heads/main");
+    const runPromise = runCli("run --all --parallelism 2", repoDir, env);
+
+    // Barrier: issue 5 is now inside the locked landing section (freshness
+    // check passed, ref update held by the shim).
+    await waitFor(() => existsSync(join(repoDir, ".held-5")));
+
+    // Issue 7's agent finished and its source verification ran — while the
+    // landing lock was still held by issue 5.
+    await waitFor(async () =>
+      (await readLog(logFile)).some((l) => l === "VERIFY sandcastle-issue-7"),
+    );
+    const log = await readLog(logFile);
+    expect(log).toContain("AGENT_END 7");
+
+    // The active checkout is still untouched: target tip unchanged, no
+    // unmerged paths, no tracked-file edits — it only moves at landing.
+    expect(await git(repoDir, "rev-parse refs/heads/main")).toBe(baseSha);
+    expect(await git(repoDir, "status --porcelain --untracked-files=no")).toBe(
+      "",
+    );
+    expect(await git(repoDir, "ls-files -u")).toBe("");
+
+    // Issue 5's own integration worktree still exists mid-landing — sibling
+    // cleanup can never prune it (shared cleanup is inside the same lock).
+    const midList = await git(repoDir, "worktree list --porcelain");
+    expect(midList).toMatch(/issue-5-integrate/);
+
+    await writeFile(join(repoDir, ".release-5"), "1");
+    const { stdout } = await runPromise;
+
+    // Both issues landed — serialized landings, concurrent work.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work-5.txt");
+    expect(files).toContain("agent-work-7.txt");
+    const finalLog = await readLog(logFile);
+    expect(finalLog.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    expect(finalLog.some((l) => l.startsWith("gh issue close 7"))).toBe(true);
+    expect(maxAgentConcurrency(finalLog)).toBe(2);
+    // All derived worktrees cleaned — no sibling deleted another's mid-flight.
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+    void stdout;
   });
 });
 
