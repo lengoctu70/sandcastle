@@ -8,6 +8,8 @@
 
 ## Bắt đầu nhanh
 
+> Người mới? Xem [INSTALL.md](./INSTALL.md) — hướng dẫn cài đặt từng bước chỉ bằng copy–paste.
+
 > Hướng dẫn ngắn nhất để cài đặt và chạy Sandcastle — dùng lại tài khoản subscription của agent CLI bạn đã đăng nhập trên máy. Tài liệu tham khảo chi tiết phía dưới (API, sandbox providers, prompts, templates, CLI options) vẫn bằng tiếng Anh.
 
 ### Bạn cần có
@@ -28,7 +30,7 @@ npm i -D @lengoctu70/sandcastle
 ### 2. Khởi tạo trong repo của bạn
 
 ```bash
-npx sandcastle init
+npx @lengoctu70/sandcastle init
 ```
 
 Init hỏi bạn bằng tiếng Việt (mọi bước đều có flag tương đương cho chế độ non-interactive — xem [`sandcastle init`](#sandcastle-init)):
