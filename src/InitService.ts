@@ -12,6 +12,7 @@ import { SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 const GITIGNORE = `.env
 logs/
 worktrees/
+recovery/
 `;
 
 /**
@@ -185,6 +186,14 @@ const LOCKFILES: ReadonlyArray<readonly [string, PackageManager]> = [
 ];
 
 /**
+ * Strip a leading UTF-8 byte-order mark so `JSON.parse` accepts package.json
+ * files written by editors that emit one (common on Windows). Only the BOM at
+ * position 0 is removed — the rest of the content is left untouched.
+ */
+const stripBom = (content: string): string =>
+  content.startsWith("\uFEFF") ? content.slice(1) : content;
+
+/**
  * Detect the host project's package manager. An explicit corepack-style
  * `packageManager` field in package.json wins; otherwise the first matching
  * lockfile decides. Defaults to npm when nothing matches.
@@ -204,7 +213,7 @@ export const detectPackageManager = (
         .readFileString(pkgPath)
         .pipe(Effect.orElseSucceed(() => ""));
       try {
-        const pkg = JSON.parse(content) as Record<string, unknown>;
+        const pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
         const field = pkg["packageManager"];
         if (typeof field === "string") {
           const name = field.split("@")[0];
@@ -262,7 +271,7 @@ export const hostHasDependency = (
       .readFileString(pkgPath)
       .pipe(Effect.orElseSucceed(() => ""));
     try {
-      const parsed = JSON.parse(content) as Record<string, unknown>;
+      const parsed = JSON.parse(stripBom(content)) as Record<string, unknown>;
       const depMaps = [
         "dependencies",
         "devDependencies",
@@ -357,7 +366,7 @@ export const detectVerificationCandidates = (
         .readFileString(pkgPath)
         .pipe(Effect.orElseSucceed(() => ""));
       try {
-        const pkg = JSON.parse(content) as Record<string, unknown>;
+        const pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
         const scripts = pkg["scripts"];
         if (typeof scripts === "object" && scripts !== null) {
           for (const name of NPM_VERIFICATION_SCRIPTS) {
@@ -422,6 +431,12 @@ export type PackageScriptOutcome =
   | { readonly kind: "kept-existing" }
   /** package.json exists but is not parseable — nothing was written. */
   | { readonly kind: "skipped-malformed" }
+  /**
+   * package.json parses, but its `scripts` field is not a string map
+   * (array, `null`, or a primitive) — reported and preserved rather than
+   * coerced into an object.
+   */
+  | { readonly kind: "malformed-scripts" }
   /** No package.json at all — a minimal one was created for the script. */
   | { readonly kind: "created-package-json" }
   /**
@@ -445,7 +460,10 @@ const detectJsonIndent = (content: string): string => {
  *
  * When no package.json exists, a minimal `{ "private": true, "scripts": … }`
  * is created so `npm run sandcastle` still works. A malformed package.json
- * yields `skipped-malformed` rather than a destructive rewrite.
+ * yields `skipped-malformed` rather than a destructive rewrite, and a
+ * `scripts` field that is not a string map yields `malformed-scripts` —
+ * both leave the file byte-identical. Rewrites preserve a leading UTF-8
+ * BOM and the file's existing LF or CRLF line-ending convention.
  */
 export const ensureSandcastleScript = (
   repoDir: string,
@@ -475,12 +493,20 @@ export const ensureSandcastleScript = (
       return { kind: "created-package-json" };
     }
 
-    const content = yield* fs
-      .readFileString(pkgPath)
+    // Read raw bytes so a leading UTF-8 BOM stays detectable —
+    // `readFileString` decodes it away before `JSON.parse` ever sees it.
+    const bytes = yield* fs
+      .readFile(pkgPath)
       .pipe(Effect.mapError((e) => new Error(e.message)));
+    const hasBom =
+      bytes.length >= 3 &&
+      bytes[0] === 0xef &&
+      bytes[1] === 0xbb &&
+      bytes[2] === 0xbf;
+    const content = new TextDecoder().decode(bytes);
     let pkg: Record<string, unknown>;
     try {
-      pkg = JSON.parse(content) as Record<string, unknown>;
+      pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
     } catch {
       return { kind: "skipped-malformed" };
     }
@@ -488,17 +514,34 @@ export const ensureSandcastleScript = (
       return { kind: "skipped-malformed" };
     }
 
-    const scripts =
-      typeof pkg["scripts"] === "object" && pkg["scripts"] !== null
-        ? (pkg["scripts"] as Record<string, unknown>)
-        : undefined;
+    // A `scripts` field that isn't a string map (array, `null`, primitive)
+    // can't be merged safely — report it and leave the file untouched rather
+    // than coercing it into an object.
+    const rawScripts = pkg["scripts"];
+    if (
+      rawScripts !== undefined &&
+      (typeof rawScripts !== "object" ||
+        rawScripts === null ||
+        Array.isArray(rawScripts))
+    ) {
+      return { kind: "malformed-scripts" };
+    }
+    const scripts = rawScripts as Record<string, unknown> | undefined;
+
+    // Any defined `sandcastle` entry — including a non-string one, which a
+    // string check would silently overwrite — goes through the explicit
+    // resolution path.
     const existing = scripts?.[SANDCASTLE_SCRIPT_NAME];
-    if (typeof existing === "string" && existing.trim().length > 0) {
+    if (existing !== undefined) {
       if (existing === SANDCASTLE_SCRIPT_COMMAND) {
         return { kind: "already-correct" };
       }
       if (resolution === "ask") {
-        return { kind: "conflict", existing };
+        return {
+          kind: "conflict",
+          existing:
+            typeof existing === "string" ? existing : JSON.stringify(existing),
+        };
       }
       if (resolution === "keep") {
         return { kind: "kept-existing" };
@@ -509,8 +552,16 @@ export const ensureSandcastleScript = (
     nextScripts[SANDCASTLE_SCRIPT_NAME] = SANDCASTLE_SCRIPT_COMMAND;
     pkg["scripts"] = nextScripts;
 
-    const serialized =
+    // Re-serialize in the file's own convention: detected indentation, its
+    // CRLF line endings if it uses them, and its BOM if it had one.
+    let serialized =
       JSON.stringify(pkg, null, detectJsonIndent(content)) + "\n";
+    if (content.includes("\r\n")) {
+      serialized = serialized.replaceAll("\n", "\r\n");
+    }
+    if (hasBom) {
+      serialized = "\uFEFF" + serialized;
+    }
     yield* fs
       .writeFileString(pkgPath, serialized)
       .pipe(Effect.mapError((e) => new Error(e.message)));
@@ -1948,7 +1999,7 @@ const detectMainFilename = (
       .readFileString(pkgPath)
       .pipe(Effect.orElseSucceed(() => ""));
     try {
-      const pkg = JSON.parse(content) as Record<string, unknown>;
+      const pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
       return pkg["type"] === "module" ? "main.ts" : "main.mts";
     } catch {
       return "main.mts";

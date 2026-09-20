@@ -249,6 +249,32 @@ describe("PromptPreprocessor", () => {
     expect(error.elapsedMs).toBeGreaterThanOrEqual(30_000);
   });
 
+  it("does not execute shell expressions inside HTML comments", async () => {
+    const { sandboxDir, sandbox, displayLayer } = await setup();
+    // `exit 1` inside the comment would fail with PromptError if it ran;
+    // only the live block outside the comment is expanded.
+    const prompt =
+      "<!-- Example: !`exit 1` or !`git log --oneline -10` -->\nBody: !`echo ok`";
+    const result = await run(prompt, sandbox, displayLayer, sandboxDir);
+    expect(result).toBe(
+      "<!-- Example: !`exit 1` or !`git log --oneline -10` -->\nBody: ok",
+    );
+  });
+
+  it("passes a prompt whose shell expressions are all inside comments through unchanged", async () => {
+    const { sandboxDir, sandbox, displayLayer } = await setup();
+    const prompt = "<!-- Use !`command` for dynamic context. -->\n\n# Task";
+    const result = await run(prompt, sandbox, displayLayer, sandboxDir);
+    expect(result).toBe(prompt);
+  });
+
+  it("treats an unclosed HTML comment as running to the end of the prompt", async () => {
+    const { sandboxDir, sandbox, displayLayer } = await setup();
+    const prompt = "Intro\n<!-- !`exit 1`\nStill commented: !`exit 2`";
+    const result = await run(prompt, sandbox, displayLayer, sandboxDir);
+    expect(result).toBe(prompt);
+  });
+
   it("does not show taskLog when prompt has no commands", async () => {
     const { sandboxDir, sandbox, displayLayer, displayRef } = await setup();
     const prompt = "Just a plain prompt with no commands.";

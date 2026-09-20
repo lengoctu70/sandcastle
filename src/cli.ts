@@ -923,6 +923,13 @@ const initCommand = Command.make(
               "warn",
             );
             break;
+          case "malformed-scripts":
+            packageScriptReady = false;
+            yield* d.status(
+              `"scripts" trong package.json không phải là object — giữ nguyên và bỏ qua bước thêm script "sandcastle". Sửa "scripts" thành object rồi thêm "sandcastle": "sandcastle run" để dùng \`npm run sandcastle\`.`,
+              "warn",
+            );
+            break;
           case "already-correct":
             break;
         }
