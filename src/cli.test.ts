@@ -2730,6 +2730,37 @@ process.exit(1);
       });
     });
 
+    it("configure --model on a host project drops the persisted effort instead of replaying it (F037)", async () => {
+      if (process.platform === "win32") return;
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+      const shimDir = await mkdtemp(join(tmpdir(), "fake-codex-"));
+      await writeFakeCodex(shimDir, true);
+      const env = { ...process.env, PATH: shimmedPath(shimDir) };
+
+      await execAsync(
+        `node ${cliPath} init --agent codex --template blank --sandbox host --issue-tracker beads`,
+        { cwd: hostDir, env },
+      );
+      // sol's catalog accepts "high" — persist an effort that terra (which
+      // only offers medium/xhigh) would reject.
+      await configure("--effort high", hostDir, env);
+      expect((await readSettings(hostDir))["effort"]).toBe("high");
+
+      // `--model` alone must not replay "high" as an explicit flag — that
+      // would hard-error naming `--effort high` (a flag never passed) or
+      // silently keep a stale effort. Terra's catalog default wins instead.
+      await configure("--model gpt-5.6-terra", hostDir, env);
+      const settings = await readSettings(hostDir);
+      expect(settings).toMatchObject({
+        agent: "codex",
+        model: "gpt-5.6-terra",
+        effort: "xhigh",
+        modelSource: "discovered",
+      });
+    });
+
     it("configure --effort on a host project fails for a catalog-unsupported value", async () => {
       if (process.platform === "win32") return;
       const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));

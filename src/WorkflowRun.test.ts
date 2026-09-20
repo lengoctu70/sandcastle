@@ -857,6 +857,58 @@ describe("hostVerificationExec", () => {
     expect(res.timedOut).toBe(true);
     expect(res.exitCode).not.toBe(0);
   });
+
+  it("settles at the deadline when a spawned grandchild keeps the stdio pipes", async () => {
+    if (process.platform === "win32") return; // POSIX process-group scheme
+    // Same wedge F002 fixed for discovery probes: the shell's child spawns
+    // a same-group grandchild that inherits the stdio pipes, ignores
+    // SIGTERM, and reports its pid, then the child exits — `close` can
+    // never fire while the grandchild lives. The promise must settle at
+    // the deadline anyway, and the deadline must reap the grandchild.
+    const dir = await mkdtemp(join(tmpdir(), "verify-host-"));
+    // Written to a file to keep the shell quoting honest.
+    const script = join(dir, "spawn-descendant.cjs");
+    await writeFile(
+      script,
+      `const c = require("node:child_process").spawn(
+        process.execPath,
+        ["-e", 'process.on("SIGTERM",()=>{});setTimeout(()=>{},6e4)'],
+        { stdio: "inherit" },
+      );
+      console.log("DESCENDANT_PID=" + c.pid);
+      c.unref();
+      `,
+    );
+    const timeoutMs = 300;
+    const started = Date.now();
+    const res = await hostVerificationExec(`node "${script}"`, {
+      cwd: dir,
+      timeoutMs,
+    });
+    const elapsed = Date.now() - started;
+
+    // Bounded settlement: timeout + SIGKILL grace + scheduling slack —
+    // never the grandchild's 60s lifetime.
+    expect(elapsed).toBeLessThan(timeoutMs + 3_000);
+    expect(res.timedOut).toBe(true);
+    expect(res.exitCode).toBeNull();
+
+    const descendantPid = Number(
+      res.stdout.match(/DESCENDANT_PID=(\d+)/)?.[1],
+    );
+    expect(descendantPid).toBeGreaterThan(0);
+    const deadline = Date.now() + 10_000;
+    let alive = true;
+    while (alive && Date.now() < deadline) {
+      try {
+        process.kill(descendantPid, 0);
+      } catch {
+        alive = false;
+      }
+      if (alive) await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(alive).toBe(false);
+  });
 });
 
 describe("bindVerificationExec", () => {

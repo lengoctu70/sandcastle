@@ -607,6 +607,17 @@ export interface AgentEntry {
    * never emitted for them.
    */
   readonly executableOption?: string;
+  /**
+   * Name of the factory-options field that receives the exec-shell platform
+   * — `"execPlatform"` for `grok("grok-4.6", { execPlatform: "linux" })`.
+   * A container sandbox always execs through a POSIX `sh`, even when the
+   * host is Windows — without the pin the provider defaults to
+   * `process.platform` (`"win32"` there) and passes a host temp path that
+   * does not exist inside the container. Emitted only for container-based
+   * providers; host mode keeps the platform default. Agents whose factories
+   * take no execPlatform option leave this unset.
+   */
+  readonly execPlatformOption?: string;
 }
 
 const CLAUDE_CODE_DOCKERFILE = `FROM node:22-bookworm
@@ -1025,6 +1036,10 @@ GITHUB_TOKEN=`,
     // Grok's factory accepts `executable` — xAI installs the same binary as
     // both `grok` and `agent`, and discovery reports which one answered.
     executableOption: "executable",
+    // Grok's prompt delivery depends on the exec shell's platform
+    // (/dev/stdin vs a host temp file) — container sandboxes exec through
+    // POSIX `sh` even on a Windows host, so the generated call pins it.
+    execPlatformOption: "execPlatform",
     dockerfileTemplate: GROK_DOCKERFILE,
     // Host mode reuses the machine's `grok login` subscription session — the
     // .env.example block only applies to container sandboxes.
@@ -1735,6 +1750,15 @@ const rewriteMainTs = (
       optionEntries.push(
         `${agent.executableOption}: ${JSON.stringify(agentExecutable)}`,
       );
+    }
+    if (
+      agent.execPlatformOption !== undefined &&
+      sandboxProvider.runsOnHost !== true
+    ) {
+      // A container sandbox execs through POSIX `sh` regardless of the host
+      // OS — pin it, or a Windows host defaults the provider to a host temp
+      // path that does not exist inside the sandbox.
+      optionEntries.push(`${agent.execPlatformOption}: "linux"`);
     }
     const optionsSuffix =
       optionEntries.length > 0 ? `, { ${optionEntries.join(", ")} }` : "";

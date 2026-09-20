@@ -1,4 +1,4 @@
-import { exec, execFile } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { join, posix, relative, sep } from "node:path";
 import { promisify } from "node:util";
@@ -653,6 +653,16 @@ const resolveRoleAgent = (
   ) {
     options[entry.executableOption] = settings.agentExecutable;
   }
+  if (
+    entry.execPlatformOption !== undefined &&
+    settings.sandbox !== "host"
+  ) {
+    // Container sandboxes exec through POSIX `sh` even on a Windows host —
+    // pin the exec platform or the provider defaults to `process.platform`
+    // ("win32" there) and passes a host temp path the sandbox cannot see
+    // (same pin rewriteMainTs emits into generated mains).
+    options[entry.execPlatformOption] = "linux";
+  }
   return {
     provider: factory(
       model,
@@ -1256,58 +1266,144 @@ const VERIFICATION_STREAM_TAIL_CHARS = 1024 * 1024;
 const SIGKILL_GRACE_MS = 500;
 
 /**
- * The host {@link VerificationExec} — `child_process.exec` on the host with
- * our own timeout so `timedOut` is honest (the `exec` `timeout` option only
- * surfaces kills through the error object). SIGTERM first, then SIGKILL after
- * a grace period. Stream capture is bounded to a rolling tail — a runaway
- * command cannot exhaust memory.
+ * The host {@link VerificationExec} — the command runs through the host's
+ * shell (`/bin/sh` on POSIX, cmd.exe on Windows — same routing `exec` used)
+ * with our own timeout so `timedOut` is honest. SIGTERM first, then SIGKILL
+ * after a grace period. Stream capture is a rolling tail bounded to
+ * {@link VERIFICATION_STREAM_TAIL_CHARS} — a runaway command cannot exhaust
+ * memory.
+ *
+ * Settlement is bounded by a hard deadline (the same fix F002 applied to
+ * discovery probes in discovery/nodeExec.ts): `close` only fires once stdio
+ * reaches EOF, so a spawned grandchild that inherited the stdout/stderr
+ * pipes would otherwise hold the result open forever. At the deadline the
+ * whole process tree is signalled; after the SIGKILL grace our end of every
+ * owned stream is destroyed and the promise settles exactly once with
+ * `timedOut: true` and `exitCode: null`, independent of EOF.
  */
 export const hostVerificationExec: VerificationExec = (command, options) =>
   new Promise((resolve) => {
+    const isWindows = process.platform === "win32";
+    let stdoutTail = "";
+    let stderrTail = "";
     let timedOut = false;
     let settled = false;
+    let childExited = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
     const settle = (result: VerificationExecResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (killTimer !== undefined) clearTimeout(killTimer);
       resolve(result);
     };
-    const child = exec(
-      command,
-      {
-        cwd: options.cwd,
-        env: process.env,
-        // stdout/stderr are still buffered by exec — bound them like the old
-        // maxBuffer did so a flood of output fails the command honestly
-        // rather than growing memory without limit.
-        maxBuffer: VERIFICATION_STREAM_TAIL_CHARS,
-      },
-      (error, stdout, stderr) => {
-        const err = error as {
-          code?: unknown;
-          message?: string;
-        } | null;
-        settle({
-          stdout: stdout ?? "",
-          stderr: stderr ?? "",
-          exitCode:
-            err === null ? 0 : typeof err.code === "number" ? err.code : null,
-          ...(timedOut ? { timedOut: true } : {}),
-          ...(err !== null &&
-          typeof err.code === "string" &&
-          err.code.length > 0
-            ? { spawnError: err.code }
-            : {}),
-        });
-      },
-    );
+    const child = spawn(command, {
+      shell: true,
+      cwd: options.cwd,
+      env: process.env,
+      windowsHide: true,
+      // POSIX: make the shell a process-group leader so a descendant that
+      // inherited the stdio pipes stays inside the signalling boundary at
+      // the deadline (same scheme as discovery/nodeExec.ts and
+      // sandboxes/no-sandbox.ts). Windows has no detached groups —
+      // taskkill /T walks the tree instead.
+      detached: !isWindows,
+    });
+    child.on("exit", () => {
+      childExited = true;
+    });
+    child.on("error", (err) => {
+      // Spawn failure — e.g. ENOENT when the shell itself cannot start.
+      settle({
+        stdout: stdoutTail,
+        stderr: stderrTail,
+        exitCode: null,
+        spawnError: (err as NodeJS.ErrnoException).code ?? "SPAWN_ERROR",
+      });
+    });
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdoutTail = (stdoutTail + chunk.toString()).slice(
+        -VERIFICATION_STREAM_TAIL_CHARS,
+      );
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderrTail = (stderrTail + chunk.toString()).slice(
+        -VERIFICATION_STREAM_TAIL_CHARS,
+      );
+    });
+    child.on("close", (code) => {
+      settle({
+        stdout: stdoutTail,
+        stderr: stderrTail,
+        exitCode: code,
+        ...(timedOut ? { timedOut: true } : {}),
+      });
+    });
+    // Verification commands get no stdin — close it so a command that reads
+    // it sees EOF instead of blocking until the timeout.
+    child.stdin.on("error", () => {});
+    child.stdin.end();
+
+    /**
+     * Signal the command's whole process tree — best-effort, never throws.
+     * Windows: `taskkill /PID /T /F` covers the cmd.exe wrapper, the command
+     *   itself, and every descendant it started.
+     * POSIX: `detached` made `child.pid` the process-group id. When the
+     *   leader already exited, probe the group first — while it exists its
+     *   members are necessarily our descendants, so a lingering pipe-holder
+     *   is still signalled but a dead (possibly reused) pgid never is.
+     */
+    const signalTree = (signal: "SIGTERM" | "SIGKILL"): void => {
+      const pid = child.pid;
+      if (pid === undefined) return;
+      if (isWindows) {
+        try {
+          spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+          });
+        } catch {
+          /* best-effort — the tree may already be gone */
+        }
+        return;
+      }
+      if (childExited) {
+        try {
+          process.kill(-pid, 0);
+        } catch {
+          return; // group is gone — nothing of ours left to signal
+        }
+      }
+      try {
+        process.kill(-pid, signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          /* already exited */
+        }
+      }
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      const killTimer = setTimeout(
-        () => child.kill("SIGKILL"),
-        SIGKILL_GRACE_MS,
-      );
+      signalTree("SIGTERM");
+      killTimer = setTimeout(() => {
+        // The command ignored SIGTERM or a descendant still holds the stdio
+        // pipes — `close` cannot be awaited. Force-kill the tree, drop our
+        // end of every owned stream so EOF cannot be owed to anyone, and
+        // settle the honest timeout result exactly once.
+        signalTree("SIGKILL");
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.stdin.destroy();
+        settle({
+          stdout: stdoutTail,
+          stderr: stderrTail,
+          exitCode: null,
+          timedOut: true,
+        });
+      }, SIGKILL_GRACE_MS);
       killTimer.unref();
     }, options.timeoutMs);
     timer.unref();
@@ -1326,7 +1422,7 @@ export const hostVerificationExec: VerificationExec = (command, options) =>
  *   and `exec` maps the host `cwd` onto the sandbox-side mount so commands
  *   run inside the sandbox against that exact worktree. `close` tears the
  *   sandbox down; an expired command also closes it, since a runtime `exec`
- *   has no reliable in-container kill path.
+ *   has no reliable in-sandbox kill path.
  * - `isolated`: the worktree's committed state is synced into the sandbox;
  *   commands run against the synced copy at the provider's worktree path.
  */
@@ -1414,8 +1510,8 @@ export const bindVerificationExec = async (options: {
         resolve(result);
       };
       const timer = setTimeout(() => {
-        // A container runtime's `exec` has no abort path that reliably
-        // reaches the in-container process — tearing the sandbox down is the
+        // A sandbox runtime's `exec` has no abort path that reliably
+        // reaches the in-sandbox process — tearing the sandbox down is the
         // guaranteed kill. The command resolves immediately as timed-out.
         settle({
           stdout: "",
@@ -1854,7 +1950,7 @@ export const runIssueWorkflow = async (
    * Bind the verification executor for one stage's worktree: the injected
    * boundary when present, else the configured sandbox over `worktreePath`
    * (host mode needs no sandbox at all). The caller owns `close` — always in
-   * a `finally` so a thrown stage can't leak a container.
+   * a `finally` so a thrown stage can't leak a sandbox.
    */
   const verificationExecFor = async (
     worktreePath: string,
@@ -1868,6 +1964,20 @@ export const runIssueWorkflow = async (
       worktreePath,
       env: sandbox.tag === "none" ? {} : await verificationSandboxEnv(),
     });
+  };
+
+  /**
+   * Close a bound verification executor and rebind a fresh one for the same
+   * worktree. Needed before a verification re-run after a repair: a command
+   * that timed out tore its sandbox down (a runtime `exec` has no in-sandbox
+   * kill path), so the old binding may point at a dead sandbox.
+   */
+  const rebindVerificationExec = async (
+    bound: BoundVerificationExec,
+    worktreePath: string,
+  ): Promise<BoundVerificationExec> => {
+    await bound.close().catch(() => {});
+    return verificationExecFor(worktreePath);
   };
 
   // A retry lands on the branch the failed run was targeting, even when the
@@ -2384,36 +2494,48 @@ export const runIssueWorkflow = async (
 
     // Source-branch + worktree + record cleanup — only once the required
     // GitHub completion succeeded (report posted AND issue closed — an
-    // issue closed externally still leaves the report owing).
+    // issue closed externally still leaves the report owing). The git
+    // mutations run inside the shared repo lock like every other worktree/
+    // branch teardown (#32): a queue sibling's `worktree add` must never
+    // race our `worktree prune`/`branch -D`.
     let preservedWorktreePath: string | undefined = worktreeOnDisk
       ? params.worktreePath
       : undefined;
     if (issueClosed && reportPosted) {
-      if (preservedWorktreePath !== undefined) {
-        const wtPath = preservedWorktreePath;
-        // Same policy as Worktree.close(): a dirty worktree is preserved
-        // (it may hold uncommitted user-visible state); a clean one goes.
-        // An unreadable worktree is preserved too — never delete what we
-        // cannot inspect.
-        const dirty = await runEffect(
-          WorktreeManager.hasUncommittedChanges(wtPath),
-        ).catch(() => true);
-        if (!dirty) {
-          await gitQuiet(["worktree", "remove", "--force", wtPath], cwd);
-          await gitQuiet(["worktree", "prune"], cwd);
-          const lingering = await stat(wtPath)
-            .then((s) => s.isDirectory())
-            .catch(() => false);
-          if (!lingering) preservedWorktreePath = undefined;
-        }
-      }
-      if (preservedWorktreePath === undefined) {
-        // The worktree is gone (or never kept), so nothing checks the source
-        // branch out anymore — its content is on the target, so force-delete
-        // is safe (and required: `-d` would refuse when the active checkout
-        // isn't the target).
-        await gitQuiet(["branch", "-D", sourceBranch], cwd);
-      }
+      preservedWorktreePath = await lock.withLock(
+        async (): Promise<string | undefined> => {
+          let preserved = preservedWorktreePath;
+          if (preserved !== undefined) {
+            const wtPath = preserved;
+            // Same policy as Worktree.close(): a dirty worktree is
+            // preserved (it may hold uncommitted user-visible state); a
+            // clean one goes. An unreadable worktree is preserved too —
+            // never delete what we cannot inspect.
+            const dirty = await runEffect(
+              WorktreeManager.hasUncommittedChanges(wtPath),
+            ).catch(() => true);
+            if (!dirty) {
+              await gitQuiet(["worktree", "remove", "--force", wtPath], cwd);
+              await gitQuiet(["worktree", "prune"], cwd);
+              const lingering = await stat(wtPath)
+                .then((s) => s.isDirectory())
+                .catch(() => false);
+              if (!lingering) preserved = undefined;
+            }
+          }
+          if (preserved === undefined) {
+            // The worktree is gone (or never kept), so nothing checks the
+            // source branch out anymore — its content is on the target, so
+            // force-delete is safe (and required: `-d` would refuse when
+            // the active checkout isn't the target).
+            await gitQuiet(["branch", "-D", sourceBranch], cwd);
+          }
+          return preserved;
+        },
+        () => status("Đang chờ một issue khác dọn dẹp repo…"),
+      );
+      // A file op, not a shared-repo git mutation — it stays outside the
+      // lock (the record is per-issue state no sibling touches).
       await clearRecoveryState(cwd, issue.number);
     }
 
@@ -2830,11 +2952,11 @@ export const runIssueWorkflow = async (
           status(
             `Đang chạy lại lệnh xác minh ${verificationEnvWhere} sau khi sửa…`,
           );
-          // Rebind: a command that timed out tore its sandbox down (runtime
-          // exec has no in-container kill), so the re-run needs a fresh one.
           try {
-            await boundSource.close().catch(() => {});
-            boundSource = await verificationExecFor(wt.worktreePath);
+            boundSource = await rebindVerificationExec(
+              boundSource,
+              wt.worktreePath,
+            );
           } catch (e) {
             return fail(e);
           }
@@ -3170,11 +3292,8 @@ export const runIssueWorkflow = async (
           status(
             `Đang chạy lại lệnh xác minh sau merge ${verificationEnvWhere} sau khi sửa…`,
           );
-          // Rebind: a command that timed out tore its sandbox down (runtime
-          // exec has no in-container kill), so the re-run needs a fresh one.
           try {
-            await boundInteg.close().catch(() => {});
-            boundInteg = await verificationExecFor(integPath);
+            boundInteg = await rebindVerificationExec(boundInteg, integPath);
           } catch (e) {
             return fail(e);
           }

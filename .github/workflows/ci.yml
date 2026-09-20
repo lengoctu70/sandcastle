@@ -16,3 +16,23 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  # Windows coverage for the platform-aware subset: GitHub argument/process
+  # tests plus the no-sandbox process tests authored with itWindows/itPosix
+  # gates (POSIX-only blocks — e.g. the extensionless-shim real-spawn tests —
+  # self-skip there by design).
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build
+      - run: >-
+          npx vitest run
+          src/githubIssues.test.ts
+          src/githubSetup.test.ts
+          src/discovery/nodeExec.test.ts
+          src/sandboxes/no-sandbox.test.ts

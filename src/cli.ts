@@ -1762,87 +1762,116 @@ const discardCommand = Command.make(
       }
       const state = record.state;
 
-      // Show exactly what would be destroyed BEFORE asking.
-      const probe = yield* Effect.promise(() =>
-        probeRecoveryArtifacts(cwd, state),
-      );
-      yield* d.text(
-        `Sẽ xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}:`,
-      );
-      yield* d.text(
-        `  • Nhánh \`${state.sourceBranch}\`` +
-          (probe.branchExists
-            ? probe.comparison === "ok"
-              ? ` (${probe.preservedCommits.length} commit chưa merge)`
-              : // A failed comparison is UNKNOWN — never "0 commits" (F030):
-                // the branch may hold real unmerged work the user is about
-                // to delete, so the prompt must say so explicitly.
-                ` (số commit chưa merge không xác định — ` +
-                (probe.comparison === "target-missing"
-                  ? `nhánh đích \`${state.targetBranch}\` không còn`
-                  : `không so sánh được với nhánh đích \`${state.targetBranch}\``) +
-                `)`
-            : " (đã mất)"),
-      );
-      if (state.worktreePath !== undefined) {
-        yield* d.text(
-          `  • Worktree \`${state.worktreePath}\`` +
-            (probe.worktreeExists ? "" : " (đã mất)"),
+      // `retry` holds the per-issue lock for its whole run (F065) — a
+      // discard that slipped in mid-retry would delete the worktree/branch
+      // out from under the running workflow, so the same lock gates this
+      // mutation too. It is taken BEFORE the probe+prompt so the state the
+      // user confirms cannot be changed by a retry starting in between; a
+      // live holder means a retry is in progress and discard must refuse.
+      // Corrupt records never reach here — they are refused above — so a
+      // missing lock file is the normal case, not an error.
+      const lock = yield* Effect.tryPromise({
+        try: () => acquireRetryLock(cwd, issueNumber),
+        catch: (e) =>
+          new InitError({
+            message:
+              e instanceof RetryLockHeldError
+                ? `Một tiến trình retry đang giữ khóa cho issue #${issueNumber} ` +
+                  `(${e.holderDetail}) — không thể xóa công việc đang được ` +
+                  "chạy lại. Đợi retry kết thúc rồi chạy lại " +
+                  `\`sandcastle discard ${issueNumber}\`; nếu retry đã dừng ` +
+                  `đột ngột, xóa tệp khóa \`${e.lockPath}\` rồi thử lại.`
+                : `Không tạo được khóa discard cho issue #${issueNumber}: ` +
+                  (e instanceof Error ? e.message : String(e)),
+          }),
+      });
+      yield* Effect.gen(function* () {
+        // Show exactly what would be destroyed BEFORE asking.
+        const probe = yield* Effect.promise(() =>
+          probeRecoveryArtifacts(cwd, state),
         );
-      }
-      yield* d.text(`  • Bản ghi ${recoveryStatePath(cwd, issueNumber)}`);
-      if (state.landingState !== undefined) {
         yield* d.text(
-          `  ⚠ Công việc đã merge vào \`${state.targetBranch}\` — xóa bản ghi sẽ ` +
-            `bỏ qua bước GitHub còn lại (${state.landingState === "landed-awaiting-report" ? "đăng báo cáo + đóng issue" : "đóng issue"}); ` +
-            "issue sẽ cần xử lý thủ công trên GitHub.",
+          `Sẽ xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}:`,
         );
-      }
+        yield* d.text(
+          `  • Nhánh \`${state.sourceBranch}\`` +
+            (probe.branchExists
+              ? probe.comparison === "ok"
+                ? ` (${probe.preservedCommits.length} commit chưa merge)`
+                : // A failed comparison is UNKNOWN — never "0 commits" (F030):
+                  // the branch may hold real unmerged work the user is about
+                  // to delete, so the prompt must say so explicitly.
+                  ` (số commit chưa merge không xác định — ` +
+                  (probe.comparison === "target-missing"
+                    ? `nhánh đích \`${state.targetBranch}\` không còn`
+                    : `không so sánh được với nhánh đích \`${state.targetBranch}\``) +
+                  `)`
+              : " (đã mất)"),
+        );
+        if (state.worktreePath !== undefined) {
+          yield* d.text(
+            `  • Worktree \`${state.worktreePath}\`` +
+              (probe.worktreeExists ? "" : " (đã mất)"),
+          );
+        }
+        yield* d.text(`  • Bản ghi ${recoveryStatePath(cwd, issueNumber)}`);
+        if (state.landingState !== undefined) {
+          yield* d.text(
+            `  ⚠ Công việc đã merge vào \`${state.targetBranch}\` — xóa bản ghi sẽ ` +
+              `bỏ qua bước GitHub còn lại (${state.landingState === "landed-awaiting-report" ? "đăng báo cáo + đóng issue" : "đóng issue"}); ` +
+              "issue sẽ cần xử lý thủ công trên GitHub.",
+          );
+        }
 
-      let confirmed = yes;
-      if (!confirmed) {
-        if (process.stdin.isTTY !== true) {
+        let confirmed = yes;
+        if (!confirmed) {
+          if (process.stdin.isTTY !== true) {
+            return yield* Effect.fail(
+              new InitError({
+                message:
+                  "Lệnh `discard` cần xác nhận. Chạy lại với `--yes` để xóa, " +
+                  "hoặc chạy trong terminal tương tác để được hỏi xác nhận.",
+              }),
+            );
+          }
+          const answer = yield* Effect.promise(() =>
+            clack.confirm({
+              message: `Xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}?`,
+              initialValue: false,
+            }),
+          );
+          confirmed = answer === true;
+        }
+        if (!confirmed) {
+          yield* d.status(
+            "Đã hủy — worktree, nhánh và bản ghi phục hồi được giữ nguyên.",
+            "info",
+          );
+          return;
+        }
+
+        const outcome = yield* Effect.promise(() =>
+          discardRecoveryWork(cwd, state),
+        );
+        if (!outcome.ok) {
           return yield* Effect.fail(
             new InitError({
               message:
-                "Lệnh `discard` cần xác nhận. Chạy lại với `--yes` để xóa, " +
-                "hoặc chạy trong terminal tương tác để được hỏi xác nhận.",
+                "Không xóa được toàn bộ công việc được giữ lại — bản ghi phục hồi vẫn còn:\n" +
+                outcome.failures.map((f) => `  • ${f}`).join("\n"),
             }),
           );
         }
-        const answer = yield* Effect.promise(() =>
-          clack.confirm({
-            message: `Xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}?`,
-            initialValue: false,
-          }),
-        );
-        confirmed = answer === true;
-      }
-      if (!confirmed) {
         yield* d.status(
-          "Đã hủy — worktree, nhánh và bản ghi phục hồi được giữ nguyên.",
-          "info",
+          `Đã xóa công việc được giữ lại của issue #${issueNumber}` +
+            ` (worktree: ${outcome.worktreeRemoved ? "đã xóa" : "không có"}` +
+            `, nhánh: ${outcome.branchRemoved ? "đã xóa" : "không có"}).`,
+          "success",
         );
-        return;
-      }
-
-      const outcome = yield* Effect.promise(() =>
-        discardRecoveryWork(cwd, state),
-      );
-      if (!outcome.ok) {
-        return yield* Effect.fail(
-          new InitError({
-            message:
-              "Không xóa được toàn bộ công việc được giữ lại — bản ghi phục hồi vẫn còn:\n" +
-              outcome.failures.map((f) => `  • ${f}`).join("\n"),
-          }),
-        );
-      }
-      yield* d.status(
-        `Đã xóa công việc được giữ lại của issue #${issueNumber}` +
-          ` (worktree: ${outcome.worktreeRemoved ? "đã xóa" : "không có"}` +
-          `, nhánh: ${outcome.branchRemoved ? "đã xóa" : "không có"}).`,
-        "success",
+      }).pipe(
+        // Released on every exit — declined confirmation, failure, success —
+        // so a discard never wedges a later retry behind a dead lock file.
+        Effect.ensuring(Effect.promise(() => lock.release())),
       );
     }),
 );
