@@ -179,13 +179,18 @@ const asVerificationResults = (
     ) {
       return undefined;
     }
+    const outputTail =
+      typeof obj["outputTail"] === "string" ? obj["outputTail"] : "";
     out.push({
       command: obj["command"],
       status,
       exitCode: typeof obj["exitCode"] === "number" ? obj["exitCode"] : null,
       durationMs: typeof obj["durationMs"] === "number" ? obj["durationMs"] : 0,
-      outputTail:
-        typeof obj["outputTail"] === "string" ? obj["outputTail"] : "",
+      outputTail,
+      // The fuller repair diagnostic — records written before the field
+      // existed fall back to the short tail, still the best evidence a
+      // retry's repair prompt can offer.
+      output: typeof obj["output"] === "string" ? obj["output"] : outputTail,
       // Optional in the record shape — older recovery files simply lack it.
       ...(obj["timedOut"] === true ? { timedOut: true as const } : {}),
     });
