@@ -265,6 +265,9 @@ process.stdin.on("end", () => {
     if (buf.includes("# Verification repair")) {
       fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
     }
+    if (buf.includes("# Integration repair")) {
+      fs.writeFileSync(path.join(cwd, "integrate-ok.flag"), "ok\\n");
+    }
     const name = process.env.FAKE_AGENT_FILE
       || (process.env.FAKE_AGENT_PER_ISSUE_FILE === "1" && issueNo !== "?"
         ? "agent-work-" + issueNo + ".txt"
@@ -323,6 +326,9 @@ if (prompt.includes("# Merge conflict repair")) {
 } else if (!isPlan && !isReview) {
   if (prompt.includes("# Verification repair")) {
     fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
+  }
+  if (prompt.includes("# Integration repair")) {
+    fs.writeFileSync(path.join(cwd, "integrate-ok.flag"), "ok\\n");
   }
   fs.writeFileSync(path.join(cwd, process.env.FAKE_AGENT_FILE || "agent-work.txt"), "implemented " + n + "\\n");
   cp.execSync("git add -A && git commit -m \\"opencode work " + n + "\\"", { cwd, stdio: "ignore" });
@@ -1099,6 +1105,146 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
       implementation: 1,
       mergeConflictRepair: 1,
     });
+  });
+
+  it("integrated verification failure: agent repairs the merged tree in the integration worktree and lands", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    // Fails only inside the integration worktree until the repair commits
+    // integrate-ok.flag — the fake claude writes it for "# Integration
+    // repair" prompts. Source-stage verification always passes.
+    const verifyCmd =
+      `echo VERIFY >> "${logFile}"; ` +
+      `case "$PWD" in *integrate*) ` +
+      `if [ ! -f integrate-ok.flag ]; then echo "INTEGRATED VERIFY FAILED" >&2; exit 1; fi;; esac`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    // One implementation run on the source worktree, then ONE integrated
+    // repair — a native resume of the recorded session.
+    expect(log.filter((l) => l === "AGENT").length).toBe(1);
+    expect(log).toContain("AGENT_RESUME fake-session-1");
+    // source pass → integrated fail → integrated pass after repair.
+    expect(log.filter((l) => l === "VERIFY").length).toBe(3);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    expect(stdout).toContain("Hoàn thành issue #5");
+
+    // The repair prompt ran against the merged state with the integrated
+    // failure's command + diagnostic output.
+    const prompts = await readFile(promptFile, "utf-8");
+    const repairPrompt = prompts.split("===PROMPT 2===")[1] ?? "";
+    expect(repairPrompt).toContain("# Integration repair");
+    expect(repairPrompt).toContain("merged");
+    expect(repairPrompt).toContain("INTEGRATED VERIFY FAILED");
+
+    // The repair landed on main — the flag the agent committed in the
+    // integration worktree survived the fold back onto the source branch.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(files).toContain("integrate-ok.flag");
+    // No leftover integration worktree/branch; the recovery record is gone.
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
+
+  it("integrated verification failure: exhausted repair preserves durable state and a separate retry lands the folded repairs", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    // Fail inside the integration worktree on the first three integrated
+    // invocations — enough to exhaust the 2-repair budget — then pass.
+    const icount = join(repoDir, ".icount");
+    const verifyCmd =
+      `n=$(cat "${icount}" 2>/dev/null || echo 0); echo $((n+1)) > "${icount}"; ` +
+      `echo VERIFY >> "${logFile}"; ` +
+      `case "$PWD" in *integrate*) ` +
+      `if [ "$n" -lt 4 ]; then echo "INTEG FAIL n=$n" >&2; exit 1; fi;; esac`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    // 1) The run exhausts the bounded integrated-repair budget and stops.
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    const log1 = await readLog(logFile);
+    // Implementation + exactly two bounded integrated repairs.
+    expect(log1.filter((l) => l === "AGENT").length).toBe(1);
+    expect(log1).toContain("AGENT_RESUME fake-session-1");
+    expect(log1).toContain("AGENT_RESUME fake-session-2");
+    // source pass + integrated fail ×3 (initial + one per repair).
+    expect(log1.filter((l) => l === "VERIFY").length).toBe(4);
+    expect(log1.some((l) => l.startsWith("gh issue close"))).toBe(false);
+
+    // Durable state: the phase, the integrated failure diagnostics, and the
+    // spent repair budget all survive for a separate `retry` process.
+    const recovery = JSON.parse(
+      await readFile(recoveryPath(repoDir, 5), "utf-8"),
+    );
+    expect(recovery).toMatchObject({
+      failurePhase: "integration-verification",
+      sourceBranch: "sandcastle/issue-5",
+      issue: { number: 5 },
+      attempts: {
+        implementation: 1,
+        verificationRepair: 0,
+        integrationVerificationRepair: 2,
+        mergeConflictRepair: 0,
+        integrationRebuild: 0,
+      },
+    });
+    expect(recovery.integrationVerification[0].output).toContain("INTEG FAIL");
+
+    // 2) A separate `retry` process continues from the integrated failure:
+    //    no implementation re-run, and the re-merge uses the source branch
+    //    that already carries the folded repairs — not the unchanged merge.
+    const before = await readLog(logFile);
+    const { stdout } = await runCli("retry 5", repoDir, env);
+
+    const delta = (await readLog(logFile)).slice(before.length);
+    expect(delta.filter((l) => l === "AGENT").length).toBe(0);
+    expect(delta.some((l) => l.startsWith("AGENT_RESUME"))).toBe(false);
+    // Only the rebuilt integration verify ran — the gate counter had moved.
+    expect(delta.filter((l) => l === "VERIFY").length).toBe(1);
+    expect(delta.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    expect(stdout).toContain("Hoàn thành issue #5");
+
+    // The folded repair commits are on main.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(files).toContain("integrate-ok.flag");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
+
+  it("integrated repair survives a target-branch rebuild after drift", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    // The first integrated verification moves main AND fails; the repair
+    // fixes it, the freshness check then sees the drift and rebuilds — the
+    // rebuilt merge must include the folded repair.
+    const vcount = join(repoDir, ".vcount");
+    const verifyCmd =
+      `n=$(cat "${vcount}" 2>/dev/null || echo 0); echo $((n+1)) > "${vcount}"; ` +
+      `echo VERIFY >> "${logFile}"; ` +
+      `case "$PWD" in *integrate*) ` +
+      `if [ "$n" = "1" ]; then git -C "${repoDir}" commit --allow-empty -qm moved; echo "INTEG FAIL" >&2; exit 1; fi; ` +
+      `if [ ! -f integrate-ok.flag ]; then echo "INTEG FAIL" >&2; exit 1; fi;; esac`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    // source pass → integrated fail+move → integrated pass → rebuilt
+    // integrated pass.
+    expect(log.filter((l) => l === "VERIFY").length).toBe(4);
+    expect(log).toContain("AGENT_RESUME fake-session-1");
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    expect(stdout).toContain("dựng lại");
+    expect(stdout).toContain("Hoàn thành issue #5");
+
+    // The rebuild merged the repaired source: the racing commit and the
+    // agent's repair are both on main.
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(files).toContain("integrate-ok.flag");
+    expect(await git(repoDir, "log --format=%s main")).toContain("moved");
   });
 
   it("target branch moved during integration: rebuilds once on the new tip and lands", async () => {
@@ -2469,12 +2615,14 @@ describe("post-landing GitHub completion recovery (CLI seam)", () => {
     const { stdout: retryOut } = await runCli("retry 5", repoDir, env2);
 
     const delta = (await readLog(logFile)).slice(before.length);
-    expect(delta.filter((l) => l === "AGENT" || l === "AGENT_BEGIN 5").length).toBe(
-      0,
-    );
+    expect(
+      delta.filter((l) => l === "AGENT" || l === "AGENT_BEGIN 5").length,
+    ).toBe(0);
     expect(delta.some((l) => l.startsWith("gh issue list"))).toBe(false);
     expect(delta.some((l) => l.startsWith("gh label list"))).toBe(false);
-    const commentIdx = delta.findIndex((l) => l.startsWith("gh issue comment 5"));
+    const commentIdx = delta.findIndex((l) =>
+      l.startsWith("gh issue comment 5"),
+    );
     const closeIdx = delta.findIndex((l) => l.startsWith("gh issue close 5"));
     expect(commentIdx).toBeGreaterThan(-1);
     expect(closeIdx).toBeGreaterThan(commentIdx); // report before close (ADR 0023)
@@ -2559,10 +2707,9 @@ describe("post-landing GitHub completion recovery (CLI seam)", () => {
   });
 
   it("issue already closed on GitHub: retry finishes cleanup without another close call", async () => {
-    const { repoDir, logFile, issuesFile, env } = await makeFixture(
-      [ISSUE_5],
-      { FAKE_GH_CLOSE_FAIL: "1" },
-    );
+    const { repoDir, logFile, issuesFile, env } = await makeFixture([ISSUE_5], {
+      FAKE_GH_CLOSE_FAIL: "1",
+    });
     await writeSettings(repoDir);
 
     await runCli("run --issue 5", repoDir, env);
