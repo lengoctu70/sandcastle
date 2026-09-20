@@ -253,6 +253,7 @@ const asAttempts = (raw: unknown): WorkflowRunAttempts | undefined => {
     implementation: counter("implementation"),
     verificationRepair: counter("verificationRepair"),
     mergeConflictRepair: counter("mergeConflictRepair"),
+    integrationVerificationRepair: counter("integrationVerificationRepair"),
     integrationRebuild: counter("integrationRebuild"),
   };
 };

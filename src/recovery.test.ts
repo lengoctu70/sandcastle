@@ -51,6 +51,7 @@ const makeState = (issueNumber: number): RecoveryState => ({
     implementation: 1,
     verificationRepair: 0,
     mergeConflictRepair: 0,
+    integrationVerificationRepair: 0,
     integrationRebuild: 0,
   },
   retryCount: 0,
