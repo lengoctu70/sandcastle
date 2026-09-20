@@ -85,18 +85,22 @@ const issuesPath = () => process.env.FAKE_GH_ISSUES;
 const issues = () => JSON.parse(fs.readFileSync(issuesPath(), "utf-8"));
 if (key === "--version") { console.log("gh version 2.90.0"); process.exit(0); }
 if (key === "auth status") {
-  console.log("github.com\\n  ✓ Logged in to github.com as test");
+  console.log("github.com\\n  ✓ Logged in to github.com account test (keyring)");
   process.exit(0);
 }
 if (args[0] === "label" && args[1] === "create") {
   console.log("✓ Label created"); process.exit(0);
 }
 if (args[0] === "label" && args[1] === "list") {
-  console.log(JSON.stringify([{ name: "Sandcastle" }]));
+  const si = args.indexOf("--search");
+  const search = si !== -1 ? String(args[si + 1]).toLowerCase() : undefined;
+  const known = [{ name: "Sandcastle" }];
+  const out = search === undefined ? known : known.filter((l) => l.name.toLowerCase().indexOf(search) !== -1);
+  console.log(JSON.stringify(out));
   process.exit(0);
 }
 if (args[0] === "issue" && args[1] === "list") {
-  const open = issues().filter((i) => i.state === "OPEN" && (i.labels || []).some((l) => l.name === "Sandcastle"));
+  const open = issues().filter((i) => i.state === "OPEN" && (i.labels || []).some((l) => (l.name || "").toLowerCase() === "sandcastle"));
   console.log(JSON.stringify(open));
   process.exit(0);
 }
@@ -108,18 +112,30 @@ if (args[0] === "issue" && args[1] === "view") {
   process.exit(0);
 }
 if (args[0] === "issue" && args[1] === "comment") {
-  console.log("commented");
-  process.exit(0);
-}
-if (args[0] === "issue" && args[1] === "close") {
+  const bf = args.indexOf("--body-file");
+  const finish = (body) => {
+    if (log) fs.appendFileSync(log, "--- GH-BODY ---\\n" + body + "\\n--- /GH-BODY ---\\n");
+    console.log("commented");
+    process.exit(0);
+  };
+  if (bf !== -1 && args[bf + 1] !== "-") {
+    finish(fs.readFileSync(args[bf + 1], "utf-8"));
+  } else {
+    let body = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (d) => (body += d));
+    process.stdin.on("end", () => finish(body));
+  }
+} else if (args[0] === "issue" && args[1] === "close") {
   const n = parseInt(args[2], 10);
   const all = issues().map((i) => (i.number === n ? { ...i, state: "CLOSED" } : i));
   fs.writeFileSync(issuesPath(), JSON.stringify(all));
   console.log("closed");
   process.exit(0);
+} else {
+  console.error("unexpected gh args: " + key);
+  process.exit(1);
 }
-console.error("unexpected gh args: " + key);
-process.exit(1);
 `,
   );
   await chmod(shim, 0o755);

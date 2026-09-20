@@ -12,6 +12,7 @@ import { SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 const GITIGNORE = `.env
 logs/
 worktrees/
+recovery/
 `;
 
 /**
@@ -185,6 +186,14 @@ const LOCKFILES: ReadonlyArray<readonly [string, PackageManager]> = [
 ];
 
 /**
+ * Strip a leading UTF-8 byte-order mark so `JSON.parse` accepts package.json
+ * files written by editors that emit one (common on Windows). Only the BOM at
+ * position 0 is removed — the rest of the content is left untouched.
+ */
+const stripBom = (content: string): string =>
+  content.startsWith("\uFEFF") ? content.slice(1) : content;
+
+/**
  * Detect the host project's package manager. An explicit corepack-style
  * `packageManager` field in package.json wins; otherwise the first matching
  * lockfile decides. Defaults to npm when nothing matches.
@@ -204,7 +213,7 @@ export const detectPackageManager = (
         .readFileString(pkgPath)
         .pipe(Effect.orElseSucceed(() => ""));
       try {
-        const pkg = JSON.parse(content) as Record<string, unknown>;
+        const pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
         const field = pkg["packageManager"];
         if (typeof field === "string") {
           const name = field.split("@")[0];
@@ -262,7 +271,7 @@ export const hostHasDependency = (
       .readFileString(pkgPath)
       .pipe(Effect.orElseSucceed(() => ""));
     try {
-      const parsed = JSON.parse(content) as Record<string, unknown>;
+      const parsed = JSON.parse(stripBom(content)) as Record<string, unknown>;
       const depMaps = [
         "dependencies",
         "devDependencies",
@@ -357,7 +366,7 @@ export const detectVerificationCandidates = (
         .readFileString(pkgPath)
         .pipe(Effect.orElseSucceed(() => ""));
       try {
-        const pkg = JSON.parse(content) as Record<string, unknown>;
+        const pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
         const scripts = pkg["scripts"];
         if (typeof scripts === "object" && scripts !== null) {
           for (const name of NPM_VERIFICATION_SCRIPTS) {
@@ -422,6 +431,12 @@ export type PackageScriptOutcome =
   | { readonly kind: "kept-existing" }
   /** package.json exists but is not parseable — nothing was written. */
   | { readonly kind: "skipped-malformed" }
+  /**
+   * package.json parses, but its `scripts` field is not a string map
+   * (array, `null`, or a primitive) — reported and preserved rather than
+   * coerced into an object.
+   */
+  | { readonly kind: "malformed-scripts" }
   /** No package.json at all — a minimal one was created for the script. */
   | { readonly kind: "created-package-json" }
   /**
@@ -445,7 +460,10 @@ const detectJsonIndent = (content: string): string => {
  *
  * When no package.json exists, a minimal `{ "private": true, "scripts": … }`
  * is created so `npm run sandcastle` still works. A malformed package.json
- * yields `skipped-malformed` rather than a destructive rewrite.
+ * yields `skipped-malformed` rather than a destructive rewrite, and a
+ * `scripts` field that is not a string map yields `malformed-scripts` —
+ * both leave the file byte-identical. Rewrites preserve a leading UTF-8
+ * BOM and the file's existing LF or CRLF line-ending convention.
  */
 export const ensureSandcastleScript = (
   repoDir: string,
@@ -475,12 +493,20 @@ export const ensureSandcastleScript = (
       return { kind: "created-package-json" };
     }
 
-    const content = yield* fs
-      .readFileString(pkgPath)
+    // Read raw bytes so a leading UTF-8 BOM stays detectable —
+    // `readFileString` decodes it away before `JSON.parse` ever sees it.
+    const bytes = yield* fs
+      .readFile(pkgPath)
       .pipe(Effect.mapError((e) => new Error(e.message)));
+    const hasBom =
+      bytes.length >= 3 &&
+      bytes[0] === 0xef &&
+      bytes[1] === 0xbb &&
+      bytes[2] === 0xbf;
+    const content = new TextDecoder().decode(bytes);
     let pkg: Record<string, unknown>;
     try {
-      pkg = JSON.parse(content) as Record<string, unknown>;
+      pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
     } catch {
       return { kind: "skipped-malformed" };
     }
@@ -488,17 +514,34 @@ export const ensureSandcastleScript = (
       return { kind: "skipped-malformed" };
     }
 
-    const scripts =
-      typeof pkg["scripts"] === "object" && pkg["scripts"] !== null
-        ? (pkg["scripts"] as Record<string, unknown>)
-        : undefined;
+    // A `scripts` field that isn't a string map (array, `null`, primitive)
+    // can't be merged safely — report it and leave the file untouched rather
+    // than coercing it into an object.
+    const rawScripts = pkg["scripts"];
+    if (
+      rawScripts !== undefined &&
+      (typeof rawScripts !== "object" ||
+        rawScripts === null ||
+        Array.isArray(rawScripts))
+    ) {
+      return { kind: "malformed-scripts" };
+    }
+    const scripts = rawScripts as Record<string, unknown> | undefined;
+
+    // Any defined `sandcastle` entry — including a non-string one, which a
+    // string check would silently overwrite — goes through the explicit
+    // resolution path.
     const existing = scripts?.[SANDCASTLE_SCRIPT_NAME];
-    if (typeof existing === "string" && existing.trim().length > 0) {
+    if (existing !== undefined) {
       if (existing === SANDCASTLE_SCRIPT_COMMAND) {
         return { kind: "already-correct" };
       }
       if (resolution === "ask") {
-        return { kind: "conflict", existing };
+        return {
+          kind: "conflict",
+          existing:
+            typeof existing === "string" ? existing : JSON.stringify(existing),
+        };
       }
       if (resolution === "keep") {
         return { kind: "kept-existing" };
@@ -509,8 +552,16 @@ export const ensureSandcastleScript = (
     nextScripts[SANDCASTLE_SCRIPT_NAME] = SANDCASTLE_SCRIPT_COMMAND;
     pkg["scripts"] = nextScripts;
 
-    const serialized =
+    // Re-serialize in the file's own convention: detected indentation, its
+    // CRLF line endings if it uses them, and its BOM if it had one.
+    let serialized =
       JSON.stringify(pkg, null, detectJsonIndent(content)) + "\n";
+    if (content.includes("\r\n")) {
+      serialized = serialized.replaceAll("\n", "\r\n");
+    }
+    if (hasBom) {
+      serialized = "\uFEFF" + serialized;
+    }
     yield* fs
       .writeFileString(pkgPath, serialized)
       .pipe(Effect.mapError((e) => new Error(e.message)));
@@ -546,6 +597,27 @@ export interface AgentEntry {
    * unset — their generated call keeps the single-argument form.
    */
   readonly effortOption?: string;
+  /**
+   * Name of the factory-options field that receives the discovered executable
+   * name — `"executable"` for `grok("grok-4.6", { executable: "agent" })`.
+   * Host-mode discovery can fingerprint a binary under an alias (xAI ships
+   * Grok as both `grok` and `agent`); persisting it means `run` and the
+   * generated `main` invoke the exact probed entrypoint. Agents whose
+   * factories take no executable option leave this unset — the alias is
+   * never emitted for them.
+   */
+  readonly executableOption?: string;
+  /**
+   * Name of the factory-options field that receives the exec-shell platform
+   * — `"execPlatform"` for `grok("grok-4.6", { execPlatform: "linux" })`.
+   * A container sandbox always execs through a POSIX `sh`, even when the
+   * host is Windows — without the pin the provider defaults to
+   * `process.platform` (`"win32"` there) and passes a host temp path that
+   * does not exist inside the container. Emitted only for container-based
+   * providers; host mode keeps the platform default. Agents whose factories
+   * take no execPlatform option leave this unset.
+   */
+  readonly execPlatformOption?: string;
 }
 
 const CLAUDE_CODE_DOCKERFILE = `FROM node:22-bookworm
@@ -961,6 +1033,13 @@ GITHUB_TOKEN=`,
     defaultModel: "grok-4.6",
     factoryImport: "grok",
     effortOption: "effort",
+    // Grok's factory accepts `executable` — xAI installs the same binary as
+    // both `grok` and `agent`, and discovery reports which one answered.
+    executableOption: "executable",
+    // Grok's prompt delivery depends on the exec shell's platform
+    // (/dev/stdin vs a host temp file) — container sandboxes exec through
+    // POSIX `sh` even on a Windows host, so the generated call pins it.
+    execPlatformOption: "execPlatform",
     dockerfileTemplate: GROK_DOCKERFILE,
     // Host mode reuses the machine's `grok login` subscription session — the
     // .env.example block only applies to container sandboxes.
@@ -1628,6 +1707,7 @@ const rewriteMainTs = (
   agent: AgentEntry,
   model: string,
   effort: string | undefined,
+  agentExecutable: string | undefined,
   sandboxProvider: SandboxProviderEntry,
   mainFilename: string,
   providerVariant: boolean,
@@ -1659,11 +1739,29 @@ const rewriteMainTs = (
     // When init resolved a reasoning effort and the agent's factory accepts
     // one, it is emitted as the options argument — `codex("gpt-5.6-sol",
     // { effort: "xhigh" })` — so the persisted settings.json value reaches
-    // the agent CLI without the user editing generated code.
+    // the agent CLI without the user editing generated code. The discovered
+    // executable alias rides in the same options object for agents whose
+    // factory takes one (`grok("…", { executable: "agent" })`).
+    const optionEntries: string[] = [];
+    if (effort !== undefined && agent.effortOption !== undefined) {
+      optionEntries.push(`${agent.effortOption}: ${JSON.stringify(effort)}`);
+    }
+    if (agentExecutable !== undefined && agent.executableOption !== undefined) {
+      optionEntries.push(
+        `${agent.executableOption}: ${JSON.stringify(agentExecutable)}`,
+      );
+    }
+    if (
+      agent.execPlatformOption !== undefined &&
+      sandboxProvider.runsOnHost !== true
+    ) {
+      // A container sandbox execs through POSIX `sh` regardless of the host
+      // OS — pin it, or a Windows host defaults the provider to a host temp
+      // path that does not exist inside the sandbox.
+      optionEntries.push(`${agent.execPlatformOption}: "linux"`);
+    }
     const optionsSuffix =
-      effort !== undefined && agent.effortOption !== undefined
-        ? `, { ${agent.effortOption}: ${JSON.stringify(effort)} }`
-        : "";
+      optionEntries.length > 0 ? `, { ${optionEntries.join(", ")} }` : "";
     const factoryCallRe = new RegExp(
       `${agent.factoryImport}\\(["']([^"']+)["']\\)`,
       "g",
@@ -1948,7 +2046,7 @@ const detectMainFilename = (
       .readFileString(pkgPath)
       .pipe(Effect.orElseSucceed(() => ""));
     try {
-      const pkg = JSON.parse(content) as Record<string, unknown>;
+      const pkg = JSON.parse(stripBom(content)) as Record<string, unknown>;
       return pkg["type"] === "module" ? "main.ts" : "main.mts";
     } catch {
       return "main.mts";
@@ -2055,6 +2153,7 @@ export const scaffold = (
         agent: agent.name,
         model,
         effort: settingsOverrides?.effort,
+        agentExecutable: settingsOverrides?.agentExecutable,
         modelSource: settingsOverrides?.modelSource,
         workflow: templateName,
         sandbox:
@@ -2070,14 +2169,16 @@ export const scaffold = (
       }),
     );
 
-    // Rewrite main file with the selected agent factory, model, effort, and
-    // sandbox provider. A `main.<provider>.mts` variant is already
-    // provider-native, so it skips the docker() placeholder rewrite.
+    // Rewrite main file with the selected agent factory, model, effort,
+    // executable alias, and sandbox provider. A `main.<provider>.mts` variant
+    // is already provider-native, so it skips the docker() placeholder
+    // rewrite.
     yield* rewriteMainTs(
       configDir,
       agent,
       model,
       settingsOverrides?.effort,
+      settingsOverrides?.agentExecutable,
       sandboxProvider,
       mainFilename,
       mainSource !== "main.mts",

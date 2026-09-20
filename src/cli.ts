@@ -54,11 +54,13 @@ import {
   type RunIssueWorkflowOptions,
 } from "./WorkflowRun.js";
 import {
+  acquireRetryLock,
   discardRecoveryWork,
   listRecoveryStates,
   probeRecoveryArtifacts,
   readRecoveryState,
   recoveryStatePath,
+  RetryLockHeldError,
   type RecoveryReadResult,
   type RecoveryState,
 } from "./recovery.js";
@@ -112,6 +114,61 @@ const requireConfigDir = (
       yield* Effect.fail(
         new ConfigDirError({
           message: "No .sandcastle/ found. Run `sandcastle init` first.",
+        }),
+      );
+    }
+  });
+
+/**
+ * Early repository gate for `init` (F060): the github-issues path probes and
+ * mutates GitHub state, which only works inside a usable checkout — `gh`'s
+ * "not a git repository" (or an unborn HEAD) otherwise surfaces mislabeled
+ * as a GitHub permission failure. Checked before any `gh` invocation so the
+ * first error is the actionable repository one.
+ */
+const requireUsableGitRepo = (cwd: string): Effect.Effect<void, InitError> =>
+  Effect.gen(function* () {
+    const inWorkTree = yield* Effect.sync(() => {
+      try {
+        return (
+          execSync("git rev-parse --is-inside-work-tree", {
+            cwd,
+            stdio: ["ignore", "pipe", "ignore"],
+          })
+            .toString()
+            .trim() === "true"
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (!inWorkTree) {
+      yield* Effect.fail(
+        new InitError({
+          message:
+            "Thư mục hiện tại không nằm trong một Git repository — " +
+            "`sandcastle init` với issue tracker GitHub cần chạy bên trong working tree của dự án. " +
+            "cd vào repo, hoặc chạy `git init` rồi tạo commit đầu tiên trước.",
+        }),
+      );
+    }
+    const headResolves = yield* Effect.sync(() => {
+      try {
+        execSync("git rev-parse --verify HEAD", {
+          cwd,
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (!headResolves) {
+      yield* Effect.fail(
+        new InitError({
+          message:
+            "Repository chưa có commit nào — HEAD chưa resolve được. " +
+            "Hãy tạo commit đầu tiên trước khi chạy `sandcastle init` với GitHub Issues.",
         }),
       );
     }
@@ -455,6 +512,10 @@ const initCommand = Command.make(
       let selectedAgent!: AgentEntry;
       let selectedModel!: string;
       let selectedEffort: string | undefined;
+      // The executable name the host-mode probe actually fingerprinted
+      // (e.g. Grok answering only under its `agent` alias) — persisted as
+      // `agentExecutable` so `run` invokes the same entrypoint.
+      let selectedExecutable: string | undefined;
       let modelSource: ModelSource = "manual-unverified";
 
       const applySelection = (
@@ -462,12 +523,14 @@ const initCommand = Command.make(
         selection: {
           model: string;
           effort?: string;
+          executable?: string;
           modelSource: ModelSource;
         },
       ) => {
         selectedAgent = agent;
         selectedModel = selection.model;
         selectedEffort = selection.effort;
+        selectedExecutable = selection.executable;
         modelSource = selection.modelSource;
       };
 
@@ -750,6 +813,12 @@ const initCommand = Command.make(
       // CLI flag > interactive confirm. The flag is only meaningful for the github-issues tracker.
       let shouldCreateLabel = false;
       if (selectedIssueTracker.name === "github-issues") {
+        // A usable checkout with a resolvable HEAD is required before any
+        // `gh` probe or label mutation (F060) — otherwise "not a git
+        // repository" (or an unborn HEAD) surfaces mislabeled as a GitHub
+        // permission failure.
+        yield* requireUsableGitRepo(cwd);
+
         // Verify gh is installed AND authenticated before any label work or
         // scaffolding (ADR 0026) — GitHub failures must surface during setup,
         // not after agent work. Interactive runs may recheck after the user
@@ -821,9 +890,12 @@ const initCommand = Command.make(
             yield* Effect.fail(
               new InitError({
                 message:
-                  `Không tạo được label "Sandcastle": ${labelResult.detail}. ` +
-                  "Kiểm tra quyền ghi của tài khoản `gh` trên repository này " +
-                  "(label cần quyền Issues: write), hoặc chạy lại init với --create-label false.",
+                  labelResult.kind === "forbidden"
+                    ? `Không tạo được label "Sandcastle": ${labelResult.detail}. ` +
+                      "Kiểm tra quyền ghi của tài khoản `gh` trên repository này " +
+                      "(label cần quyền Issues: write), hoặc chạy lại init với --create-label false."
+                    : `Không tạo được label "Sandcastle": ${labelResult.detail}. ` +
+                      "Chạy lại init với --create-label false để bỏ qua bước này.",
               }),
             );
           }
@@ -920,6 +992,13 @@ const initCommand = Command.make(
               "warn",
             );
             break;
+          case "malformed-scripts":
+            packageScriptReady = false;
+            yield* d.status(
+              `"scripts" trong package.json không phải là object — giữ nguyên và bỏ qua bước thêm script "sandcastle". Sửa "scripts" thành object rồi thêm "sandcastle": "sandcastle run" để dùng \`npm run sandcastle\`.`,
+              "warn",
+            );
+            break;
           case "already-correct":
             break;
         }
@@ -937,6 +1016,9 @@ const initCommand = Command.make(
           settings: {
             modelSource,
             ...(selectedEffort !== undefined ? { effort: selectedEffort } : {}),
+            ...(selectedExecutable !== undefined
+              ? { agentExecutable: selectedExecutable }
+              : {}),
             verificationCommands,
             ...(verificationStatus !== undefined ? { verificationStatus } : {}),
           },
@@ -1363,6 +1445,12 @@ const runCommand = Command.make(
           case "no-issues":
             yield* d.status(result.message, "info");
             break;
+          case "skipped":
+            // Nothing failed, but ≥1 issue was left for `sandcastle retry`
+            // because it already has a recovery record — surface the summary
+            // as a warning so the pending preserved work isn't missed.
+            yield* d.status(result.message, "warn");
+            break;
           case "failed":
             // Per-issue failure reports were already posted; landed issues
             // stay landed. Exit non-zero so scripts/CI observe the failures.
@@ -1423,6 +1511,11 @@ const runWorkflowAndReport = (
       case "no-issues":
         yield* d.status(result.message, "info");
         break;
+      case "skipped":
+        // Only queue runs produce "skipped" — a standalone run never does;
+        // handled for completeness so the union stays exhaustive.
+        yield* d.status(result.message, "warn");
+        break;
       case "failed":
         // The failure report was already posted to the issue; the process
         // exits non-zero so scripts/CI observe the failed run.
@@ -1461,10 +1554,20 @@ const formatRecoveryEntry = async (
   }
   const s = entry.state;
   const probe = await probeRecoveryArtifacts(cwd, s);
+  const retrySuffix = s.retryCount > 0 ? ` — đã retry ${s.retryCount} lần` : "";
   const lines = [
     `• Issue #${s.issue.number} — ${s.issue.title}`,
-    `  Dừng ở bước "${PHASE_LABEL[s.failurePhase]}" lúc ${s.failedAt}` +
-      (s.retryCount > 0 ? ` — đã retry ${s.retryCount} lần` : ""),
+    s.landingState === undefined
+      ? `  Dừng ở bước "${PHASE_LABEL[s.failurePhase]}" lúc ${s.failedAt}${retrySuffix}`
+      : // Post-landing record (#37): the work is already on the target
+        // branch — what remains is a GitHub step, not a failure phase.
+        `  Đã merge vào \`${s.targetBranch}\`` +
+        (s.landedSha !== undefined ? ` (${s.landedSha.slice(0, 8)})` : "") +
+        ` — ${
+          s.landingState === "landed-awaiting-report"
+            ? "chờ đăng báo cáo hoàn thành rồi đóng issue"
+            : "báo cáo đã đăng — chờ đóng issue"
+        } lúc ${s.failedAt}${retrySuffix}`,
     `  Nhánh \`${s.sourceBranch}\`${probe.branchExists ? "" : " (đã mất)"}` +
       ` · Worktree \`${s.worktreePath ?? "—"}\`` +
       (s.worktreePath !== undefined && !probe.worktreeExists
@@ -1473,23 +1576,53 @@ const formatRecoveryEntry = async (
     `  Sửa tự động đã dùng: xác minh ${s.attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
       ` · xung đột merge ${s.attempts.mergeConflictRepair}/${MAX_MERGE_CONFLICT_REPAIR_ATTEMPTS}` +
       ` · dựng lại tích hợp ${s.attempts.integrationRebuild}/${MAX_TARGET_REBUILD_ATTEMPTS}`,
-    `  Lỗi: ${firstLineOf(s.error)}`,
+    `  ${s.landingState === undefined ? "Lỗi" : "Chi tiết"}: ${firstLineOf(s.error)}`,
   ];
-  const stale: string[] = [];
-  if (!probe.branchExists) stale.push("nhánh nguồn đã mất");
-  if (probe.landedOrEmpty) {
-    stale.push(
-      "nhánh không còn commit chưa merge (có thể đã merge ở nơi khác)",
+  if (s.landingState !== undefined) {
+    lines.push(
+      "  Retry chỉ hoàn tất các bước GitHub (đăng báo cáo/đóng issue) — không chạy lại agent hay merge lại.",
     );
+  } else {
+    const stale: string[] = [];
+    if (!probe.branchExists) stale.push("nhánh nguồn đã mất");
+    if (probe.landedOrEmpty) {
+      stale.push(
+        "nhánh không còn commit chưa merge (có thể đã merge ở nơi khác)",
+      );
+    }
+    if (
+      s.worktreePath !== undefined &&
+      !probe.worktreeExists &&
+      probe.branchExists
+    ) {
+      stale.push("worktree đã mất — retry sẽ dựng lại từ nhánh");
+    }
+    if (stale.length > 0) lines.push(`  ⚠ Lỗi thời: ${stale.join("; ")}.`);
+    // A comparison that could not run is UNKNOWN, never "0 unmerged commits"
+    // (F030) — and an empty range on a run that never committed is
+    // INCOMPLETE work, not landed or stale (F072).
+    if (probe.comparison === "target-missing") {
+      lines.push(
+        "  ⚠ Không xác định được số commit chưa merge — nhánh đích " +
+          `\`${s.targetBranch}\` không còn; kiểm tra thủ công trước khi discard.`,
+      );
+    } else if (probe.comparison === "unknown") {
+      lines.push(
+        "  ⚠ Không xác định được số commit chưa merge — không so sánh được " +
+          `với nhánh đích \`${s.targetBranch}\`; kiểm tra thủ công trước khi discard.`,
+      );
+    } else if (
+      probe.comparison === "ok" &&
+      probe.branchExists &&
+      probe.preservedCommits.length === 0 &&
+      s.commits.length === 0
+    ) {
+      lines.push(
+        "  Chưa hoàn thành: lần chạy chưa tạo commit nào trên nhánh " +
+          "— không phải đã merge hay lỗi thời.",
+      );
+    }
   }
-  if (
-    s.worktreePath !== undefined &&
-    !probe.worktreeExists &&
-    probe.branchExists
-  ) {
-    stale.push("worktree đã mất — retry sẽ dựng lại từ nhánh");
-  }
-  if (stale.length > 0) lines.push(`  ⚠ Lỗi thời: ${stale.join("; ")}.`);
   return lines.join("\n");
 };
 
@@ -1508,9 +1641,21 @@ const statusCommand = Command.make("status", {}, () =>
         yield* Effect.promise(() => formatRecoveryEntry(cwd, entry)),
       );
     }
-    yield* d.text(
-      "Dùng `sandcastle retry <số-issue>` để tiếp tục, hoặc `sandcastle discard <số-issue>` để xóa công việc được giữ lại.",
-    );
+    // Name only commands that can actually handle each entry kind (F071):
+    // `retry`/`discard` work on parseable records; a corrupt record can
+    // neither resume nor be probed for safe deletion, so its exit path is
+    // manual file cleanup — never a discard loop that always refuses.
+    if (entries.some((e) => e.kind === "ok")) {
+      yield* d.text(
+        "Dùng `sandcastle retry <số-issue>` để tiếp tục, hoặc `sandcastle discard <số-issue>` để xóa công việc được giữ lại.",
+      );
+    }
+    if (entries.some((e) => e.kind === "corrupt")) {
+      yield* d.text(
+        "Bản ghi BỊ HỎNG không dùng được với `retry`/`discard` — " +
+          "sửa hoặc xóa tệp thủ công theo đường dẫn in ở trên.",
+      );
+    }
   }),
 );
 
@@ -1519,6 +1664,11 @@ const statusCommand = Command.make("status", {}, () =>
  * pins the issue/branch/worktree so the run NEVER re-selects an issue or
  * creates a new implementation branch; it re-enters the workflow at the
  * recorded failure phase.
+ *
+ * A per-issue lock file (`.sandcastle/recovery/issue-<N>.lock`, F065) is
+ * acquired after the record checks out and BEFORE the workflow can mutate
+ * the worktree or the Git index, so two processes can never retry the same
+ * issue at once; it is released when the run ends for any reason.
  */
 const retryCommand = Command.make(
   "retry",
@@ -1548,13 +1698,24 @@ const retryCommand = Command.make(
           }),
         );
       }
+      const lock = yield* Effect.tryPromise({
+        try: () => acquireRetryLock(cwd, issueNumber),
+        catch: (e) =>
+          new InitError({
+            message:
+              e instanceof RetryLockHeldError
+                ? e.message
+                : `Không tạo được khóa retry cho issue #${issueNumber}: ` +
+                  (e instanceof Error ? e.message : String(e)),
+          }),
+      });
       yield* runWorkflowAndReport(d, {
         cwd,
         resume: record.state,
         onStatus: (message, severity) => {
           Effect.runSync(d.status(message, severity));
         },
-      });
+      }).pipe(Effect.ensuring(Effect.promise(() => lock.release())));
     }),
 );
 
@@ -1601,71 +1762,116 @@ const discardCommand = Command.make(
       }
       const state = record.state;
 
-      // Show exactly what would be destroyed BEFORE asking.
-      const probe = yield* Effect.promise(() =>
-        probeRecoveryArtifacts(cwd, state),
-      );
-      yield* d.text(
-        `Sẽ xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}:`,
-      );
-      yield* d.text(
-        `  • Nhánh \`${state.sourceBranch}\`` +
-          (probe.branchExists
-            ? ` (${probe.preservedCommits.length} commit chưa merge)`
-            : " (đã mất)"),
-      );
-      if (state.worktreePath !== undefined) {
-        yield* d.text(
-          `  • Worktree \`${state.worktreePath}\`` +
-            (probe.worktreeExists ? "" : " (đã mất)"),
+      // `retry` holds the per-issue lock for its whole run (F065) — a
+      // discard that slipped in mid-retry would delete the worktree/branch
+      // out from under the running workflow, so the same lock gates this
+      // mutation too. It is taken BEFORE the probe+prompt so the state the
+      // user confirms cannot be changed by a retry starting in between; a
+      // live holder means a retry is in progress and discard must refuse.
+      // Corrupt records never reach here — they are refused above — so a
+      // missing lock file is the normal case, not an error.
+      const lock = yield* Effect.tryPromise({
+        try: () => acquireRetryLock(cwd, issueNumber),
+        catch: (e) =>
+          new InitError({
+            message:
+              e instanceof RetryLockHeldError
+                ? `Một tiến trình retry đang giữ khóa cho issue #${issueNumber} ` +
+                  `(${e.holderDetail}) — không thể xóa công việc đang được ` +
+                  "chạy lại. Đợi retry kết thúc rồi chạy lại " +
+                  `\`sandcastle discard ${issueNumber}\`; nếu retry đã dừng ` +
+                  `đột ngột, xóa tệp khóa \`${e.lockPath}\` rồi thử lại.`
+                : `Không tạo được khóa discard cho issue #${issueNumber}: ` +
+                  (e instanceof Error ? e.message : String(e)),
+          }),
+      });
+      yield* Effect.gen(function* () {
+        // Show exactly what would be destroyed BEFORE asking.
+        const probe = yield* Effect.promise(() =>
+          probeRecoveryArtifacts(cwd, state),
         );
-      }
-      yield* d.text(`  • Bản ghi ${recoveryStatePath(cwd, issueNumber)}`);
+        yield* d.text(
+          `Sẽ xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}:`,
+        );
+        yield* d.text(
+          `  • Nhánh \`${state.sourceBranch}\`` +
+            (probe.branchExists
+              ? probe.comparison === "ok"
+                ? ` (${probe.preservedCommits.length} commit chưa merge)`
+                : // A failed comparison is UNKNOWN — never "0 commits" (F030):
+                  // the branch may hold real unmerged work the user is about
+                  // to delete, so the prompt must say so explicitly.
+                  ` (số commit chưa merge không xác định — ` +
+                  (probe.comparison === "target-missing"
+                    ? `nhánh đích \`${state.targetBranch}\` không còn`
+                    : `không so sánh được với nhánh đích \`${state.targetBranch}\``) +
+                  `)`
+              : " (đã mất)"),
+        );
+        if (state.worktreePath !== undefined) {
+          yield* d.text(
+            `  • Worktree \`${state.worktreePath}\`` +
+              (probe.worktreeExists ? "" : " (đã mất)"),
+          );
+        }
+        yield* d.text(`  • Bản ghi ${recoveryStatePath(cwd, issueNumber)}`);
+        if (state.landingState !== undefined) {
+          yield* d.text(
+            `  ⚠ Công việc đã merge vào \`${state.targetBranch}\` — xóa bản ghi sẽ ` +
+              `bỏ qua bước GitHub còn lại (${state.landingState === "landed-awaiting-report" ? "đăng báo cáo + đóng issue" : "đóng issue"}); ` +
+              "issue sẽ cần xử lý thủ công trên GitHub.",
+          );
+        }
 
-      let confirmed = yes;
-      if (!confirmed) {
-        if (process.stdin.isTTY !== true) {
+        let confirmed = yes;
+        if (!confirmed) {
+          if (process.stdin.isTTY !== true) {
+            return yield* Effect.fail(
+              new InitError({
+                message:
+                  "Lệnh `discard` cần xác nhận. Chạy lại với `--yes` để xóa, " +
+                  "hoặc chạy trong terminal tương tác để được hỏi xác nhận.",
+              }),
+            );
+          }
+          const answer = yield* Effect.promise(() =>
+            clack.confirm({
+              message: `Xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}?`,
+              initialValue: false,
+            }),
+          );
+          confirmed = answer === true;
+        }
+        if (!confirmed) {
+          yield* d.status(
+            "Đã hủy — worktree, nhánh và bản ghi phục hồi được giữ nguyên.",
+            "info",
+          );
+          return;
+        }
+
+        const outcome = yield* Effect.promise(() =>
+          discardRecoveryWork(cwd, state),
+        );
+        if (!outcome.ok) {
           return yield* Effect.fail(
             new InitError({
               message:
-                "Lệnh `discard` cần xác nhận. Chạy lại với `--yes` để xóa, " +
-                "hoặc chạy trong terminal tương tác để được hỏi xác nhận.",
+                "Không xóa được toàn bộ công việc được giữ lại — bản ghi phục hồi vẫn còn:\n" +
+                outcome.failures.map((f) => `  • ${f}`).join("\n"),
             }),
           );
         }
-        const answer = yield* Effect.promise(() =>
-          clack.confirm({
-            message: `Xóa vĩnh viễn công việc được giữ lại của issue #${issueNumber}?`,
-            initialValue: false,
-          }),
-        );
-        confirmed = answer === true;
-      }
-      if (!confirmed) {
         yield* d.status(
-          "Đã hủy — worktree, nhánh và bản ghi phục hồi được giữ nguyên.",
-          "info",
+          `Đã xóa công việc được giữ lại của issue #${issueNumber}` +
+            ` (worktree: ${outcome.worktreeRemoved ? "đã xóa" : "không có"}` +
+            `, nhánh: ${outcome.branchRemoved ? "đã xóa" : "không có"}).`,
+          "success",
         );
-        return;
-      }
-
-      const outcome = yield* Effect.promise(() =>
-        discardRecoveryWork(cwd, state),
-      );
-      if (!outcome.ok) {
-        return yield* Effect.fail(
-          new InitError({
-            message:
-              "Không xóa được toàn bộ công việc được giữ lại — bản ghi phục hồi vẫn còn:\n" +
-              outcome.failures.map((f) => `  • ${f}`).join("\n"),
-          }),
-        );
-      }
-      yield* d.status(
-        `Đã xóa công việc được giữ lại của issue #${issueNumber}` +
-          ` (worktree: ${outcome.worktreeRemoved ? "đã xóa" : "không có"}` +
-          `, nhánh: ${outcome.branchRemoved ? "đã xóa" : "không có"}).`,
-        "success",
+      }).pipe(
+        // Released on every exit — declined confirmation, failure, success —
+        // so a discard never wedges a later retry behind a dead lock file.
+        Effect.ensuring(Effect.promise(() => lock.release())),
       );
     }),
 );

@@ -6,6 +6,14 @@ import { SHELL_BLOCK_MARKER } from "./PromptPreprocessor.js";
 const SHELL_BLOCK_PATTERN = /!`([^`]+)`/g;
 
 /**
+ * `<!-- ... -->` HTML comment spans in a prompt. A `!`...`` inside a comment
+ * is documentation, not a live command — e.g. the blank template's usage
+ * examples — so it is never marked for execution. An unclosed `<!--`
+ * comments out the rest of the prompt, matching HTML parsing.
+ */
+const HTML_COMMENT_PATTERN = /<!--[\s\S]*?(?:-->|$)/g;
+
+/**
  * A map of named values used for prompt argument substitution.
  * Each key corresponds to a `{{KEY}}` placeholder in the prompt; the value
  * replaces it before the prompt is passed to the agent.
@@ -92,9 +100,19 @@ export const substitutePromptArgs = (
   // Mark shell blocks written in the raw template so the preprocessor can
   // distinguish them from `!`...`` patterns that arrive via arg substitution.
   // Strip any markers already present in raw input so they can't be forged.
-  const markedPrompt = prompt
-    .replaceAll(SHELL_BLOCK_MARKER, "")
-    .replace(SHELL_BLOCK_PATTERN, `!${SHELL_BLOCK_MARKER}\`$1\``);
+  // `!`...`` inside HTML comments stays unmarked — comments are inert
+  // documentation and their example commands must never execute.
+  const strippedPrompt = prompt.replaceAll(SHELL_BLOCK_MARKER, "");
+  const commentRanges = [...strippedPrompt.matchAll(HTML_COMMENT_PATTERN)].map(
+    (match) => [match.index, match.index + match[0].length] as const,
+  );
+  const markedPrompt = strippedPrompt.replace(
+    SHELL_BLOCK_PATTERN,
+    (block, command: string, offset: number) =>
+      commentRanges.some(([start, end]) => offset >= start && offset < end)
+        ? block
+        : `!${SHELL_BLOCK_MARKER}\`${command}\``,
+  );
   const sanitizedArgs: PromptArgs = Object.fromEntries(
     Object.entries(args).map(([key, value]) => [
       key,

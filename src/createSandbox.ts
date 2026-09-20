@@ -477,6 +477,7 @@ const buildSandboxHandle = (
               skipPromptExpansion: isInlinePrompt,
               timeouts,
               keepSourceBranch: mergeToHead,
+              sandboxTag: ctx.providerTag,
             });
 
             const completion = buildCompletionMessage(
@@ -614,6 +615,7 @@ const buildSandboxHandle = (
                 applyToHost,
                 timeouts,
                 keepSourceBranch: mergeToHead,
+                providerTag: ctx.providerTag,
               },
               sandbox,
               (ctx) =>
@@ -832,9 +834,14 @@ export const createSandboxFromWorktree = async (
   if (sandboxOnReady?.length || hostOnReady?.length) {
     await Effect.runPromise(
       Effect.gen(function* () {
-        yield* sandbox.exec(
-          `git config --global --add safe.directory "${sandboxRepoDir}"`,
-        );
+        // safe.directory marks the worktree safe inside a container's own
+        // $HOME; for the no-sandbox provider the write would land in the
+        // user's real ~/.gitconfig — host mode skips it (ADR 0021, F036).
+        if (options.sandbox.tag !== "none") {
+          yield* sandbox.exec(
+            `git config --global --add safe.directory "${sandboxRepoDir}"`,
+          );
+        }
         const sandboxEffects = (sandboxOnReady ?? []).map((hook) =>
           sandbox.exec(hook.command, {
             cwd: sandboxRepoDir,
@@ -1020,9 +1027,14 @@ export const createSandbox = async (
 
           if (sandboxOnReady?.length || hostOnReady?.length) {
             yield* Effect.gen(function* () {
-              yield* sandbox.exec(
-                `git config --global --add safe.directory "${sandboxRepoDir}"`,
-              );
+              // Same boundary rule as the lifecycle: safe.directory stays
+              // inside the container; the no-sandbox provider never writes
+              // the user's real ~/.gitconfig (ADR 0021, F036).
+              if (options.sandbox.tag !== "none") {
+                yield* sandbox.exec(
+                  `git config --global --add safe.directory "${sandboxRepoDir}"`,
+                );
+              }
               const sandboxEffects = (sandboxOnReady ?? []).map((hook) =>
                 sandbox.exec(hook.command, {
                   cwd: sandboxRepoDir,

@@ -24,6 +24,20 @@ const createIsolatedGitEnv = (): Record<string, string> => {
   return { GIT_CONFIG_GLOBAL: globalConfigPath };
 };
 
+/**
+ * Mirror of the no-sandbox provider's close-code mapping: signal termination
+ * (`code === null`) is never a successful exit.
+ */
+const exitCodeFromClose = (
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): number => {
+  if (code !== null) return code;
+  if (signal === "SIGKILL") return 137;
+  if (signal === "SIGTERM") return 143;
+  return 1;
+};
+
 export const makeLocalSandbox = (sandboxDir: string): SandboxService => {
   const gitEnv = createIsolatedGitEnv();
   const env = { ...process.env, ...gitEnv };
@@ -41,7 +55,13 @@ export const makeLocalSandbox = (sandboxDir: string): SandboxService => {
           env,
         });
 
+        // Capture stdin write failures (early child exit → EPIPE) so they
+        // surface as an invocation failure, not an unhandled stream error.
+        let stdinError: Error | undefined;
         if (options?.stdin !== undefined) {
+          proc.stdin!.on("error", (error: Error) => {
+            stdinError = error;
+          });
           proc.stdin!.write(options.stdin);
           proc.stdin!.end();
         }
@@ -57,6 +77,28 @@ export const makeLocalSandbox = (sandboxDir: string): SandboxService => {
           );
         });
 
+        const finish = (
+          stdout: string,
+          stderr: string,
+          code: number | null,
+          signal: NodeJS.Signals | null,
+        ): void => {
+          const exitCode = exitCodeFromClose(code, signal);
+          resume(
+            Effect.succeed({
+              stdout,
+              stderr:
+                stdinError === undefined
+                  ? stderr
+                  : `${stderr}\nstdin write failed: ${stdinError.message}`,
+              // A prompt that never reached the child is an invocation
+              // failure even when the child's own exit code was 0.
+              exitCode:
+                stdinError !== undefined && exitCode === 0 ? 1 : exitCode,
+            }),
+          );
+        };
+
         if (options?.onLine) {
           const onLine = options.onLine;
           const stdoutTail = new BoundedTail(MAX_TAIL_CHARS, "\n");
@@ -69,14 +111,8 @@ export const makeLocalSandbox = (sandboxDir: string): SandboxService => {
           proc.stderr!.on("data", (chunk: Buffer) => {
             stderrTail.push(chunk.toString());
           });
-          proc.on("close", (code) => {
-            resume(
-              Effect.succeed({
-                stdout: stdoutTail.toString(),
-                stderr: stderrTail.toString(),
-                exitCode: code ?? 0,
-              }),
-            );
+          proc.on("close", (code, signal) => {
+            finish(stdoutTail.toString(), stderrTail.toString(), code, signal);
           });
         } else {
           const stdoutChunks: string[] = [];
@@ -87,14 +123,8 @@ export const makeLocalSandbox = (sandboxDir: string): SandboxService => {
           proc.stderr!.on("data", (chunk: Buffer) => {
             stderrChunks.push(chunk.toString());
           });
-          proc.on("close", (code) => {
-            resume(
-              Effect.succeed({
-                stdout: stdoutChunks.join(""),
-                stderr: stderrChunks.join(""),
-                exitCode: code ?? 0,
-              }),
-            );
+          proc.on("close", (code, signal) => {
+            finish(stdoutChunks.join(""), stderrChunks.join(""), code, signal);
           });
         }
       });

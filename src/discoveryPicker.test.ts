@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { Effect, Option, Ref } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -219,6 +221,49 @@ const claudeReady = (): Record<string, Handler | DiscoveryExecResult> => ({
   }),
 });
 
+// --- Devin: version + auth status + families/variants catalog fixture ---
+
+/** The sanitized `devin models list --format json` capture. */
+const DEVIN_CATALOG_PATH = join(
+  import.meta.dirname,
+  "discovery",
+  "fixtures",
+  "devin-models.json",
+);
+
+/** A real fixture-backed Devin report — catalog parsing included. */
+const devinReport = async (): Promise<AgentDiscoveryReport> => {
+  const { exec } = makeExec({
+    "devin --version": res({ stdout: "devin 3000.10.31 (b98cc431)\n" }),
+    "devin auth status": res({ stdout: "Logged in (via Devin).\n" }),
+    "devin models list --format json": res({
+      stdout: await readFile(DEVIN_CATALOG_PATH, "utf-8"),
+    }),
+  });
+  const report = await getDiscoveryAdapter("devin")!.discover(exec);
+  expect(report.state).toBe("ready");
+  return report;
+};
+
+/** resolveDiscoveredSelection against a pre-fetched Devin report. */
+const resolveDevin = (
+  report: AgentDiscoveryReport,
+  flags: { model?: string; effort?: string },
+  ref = displayRef(),
+) =>
+  resolveDiscoveredSelection({
+    adapter: getDiscoveryAdapter("devin")!,
+    agentLabel: "Devin",
+    defaultModel: "claude-opus-5",
+    modelFlag:
+      flags.model !== undefined ? Option.some(flags.model) : Option.none(),
+    effortFlag:
+      flags.effort !== undefined ? Option.some(flags.effort) : Option.none(),
+    isInteractive: false,
+    allowUnverified: false,
+    initialReport: report,
+  }).pipe(Effect.provide(SilentDisplay.layer(ref)));
+
 // ---------------------------------------------------------------------------
 // Run helpers
 // ---------------------------------------------------------------------------
@@ -292,6 +337,7 @@ describe("pickHostAgent", () => {
     expect(picked.selection).toEqual({
       model: "gpt-5.6-terra",
       effort: "xhigh",
+      executable: "codex",
       modelSource: "discovered",
     });
   });
@@ -326,6 +372,7 @@ describe("pickHostAgent", () => {
     expect(mockSelect).toHaveBeenCalledTimes(2);
     expect(picked.selection).toEqual({
       model: "openai/gpt-4o-mini",
+      executable: "pi",
       modelSource: "discovered",
     });
   });
@@ -362,6 +409,9 @@ describe("pickHostAgent", () => {
     expect(picked.agent.name).toBe("codex");
     expect(picked.selection).toEqual({
       model: "custom-model-9",
+      // unauthenticated still fingerprinted the binary — the probed
+      // executable rides along with the manual entry.
+      executable: "codex",
       modelSource: "manual-unverified",
     });
   });
@@ -390,6 +440,7 @@ describe("pickHostAgent", () => {
     expect(picked.selection).toEqual({
       model: "gpt-5.6-sol",
       effort: "high",
+      executable: "codex",
       modelSource: "discovered",
     });
     // codex was probed twice (initial sweep + recheck); the catalog probe ran
@@ -419,6 +470,7 @@ describe("pickHostAgent", () => {
     expect(picked.selection).toEqual({
       model: "google/gemini-3-pro-preview",
       effort: "medium",
+      executable: "pi",
       modelSource: "discovered",
     });
   });
@@ -490,7 +542,102 @@ describe("pickHostAgent", () => {
     expect(picked.agent.name).toBe("claude-code");
     expect(picked.selection).toEqual({
       model: "claude-opus-4-8",
+      executable: "claude",
       modelSource: "manual-unverified",
+    });
+  });
+
+  it("pre-selects the persisted agent/model/effort when they are still valid (#27 F015)", async () => {
+    const { exec } = makeExec({ ...piReady(), ...codexReady() });
+    mockSelect
+      .mockResolvedValueOnce("codex") // agent picker
+      .mockResolvedValueOnce("gpt-5.6-terra") // model picker
+      .mockResolvedValueOnce("xhigh"); // effort picker
+
+    const picked = await Effect.runPromise(
+      pickHostAgent({
+        agents: listAgents(),
+        modelFlag: Option.none(),
+        effortFlag: Option.none(),
+        allowUnverified: false,
+        initialAgentName: "codex",
+        initialModel: "gpt-5.6-terra",
+        initialEffort: "xhigh",
+        exec,
+      }).pipe(Effect.provide(SilentDisplay.layer(displayRef()))),
+    );
+
+    // Agent picker opens on the persisted agent (codex), not the first ready
+    // entry (pi) — and so do the model/effort pickers on the persisted values.
+    expect(selectCall(0).initialValue).toBe("codex");
+    expect(selectCall(1).initialValue).toBe("gpt-5.6-terra");
+    expect(selectCall(2).initialValue).toBe("xhigh");
+    expect(picked.agent.name).toBe("codex");
+    expect(picked.selection).toEqual({
+      model: "gpt-5.6-terra",
+      effort: "xhigh",
+      executable: "codex",
+      modelSource: "discovered",
+    });
+  });
+
+  it("does not forward persisted model/effort to a different agent's pickers", async () => {
+    const { exec } = makeExec({ ...piReady(), ...codexReady() });
+    mockSelect
+      .mockResolvedValueOnce("pi") // user switches away from codex
+      .mockResolvedValueOnce("google/gemini-3-pro-preview")
+      .mockResolvedValueOnce("medium");
+
+    const picked = await Effect.runPromise(
+      pickHostAgent({
+        agents: listAgents(),
+        modelFlag: Option.none(),
+        effortFlag: Option.none(),
+        allowUnverified: false,
+        initialAgentName: "codex",
+        initialModel: "gpt-5.6-terra",
+        initialEffort: "xhigh",
+        exec,
+      }).pipe(Effect.provide(SilentDisplay.layer(displayRef()))),
+    );
+
+    // Pi's picker starts from ITS recommendation — codex's persisted model
+    // would be a meaningless preselection here.
+    expect(selectCall(1).initialValue).toBe("google/gemini-3-pro-preview");
+    expect(picked.agent.name).toBe("pi");
+    expect(picked.selection.model).toBe("google/gemini-3-pro-preview");
+  });
+
+  it("a persisted effort is only pre-selected when the newly chosen model offers it (F037)", async () => {
+    const { exec } = makeExec(codexReady());
+    mockSelect
+      .mockResolvedValueOnce("codex")
+      .mockResolvedValueOnce("gpt-5.6-terra") // terra: medium/xhigh only
+      .mockResolvedValueOnce("xhigh");
+
+    const picked = await Effect.runPromise(
+      pickHostAgent({
+        agents: listAgents(),
+        modelFlag: Option.none(),
+        effortFlag: Option.none(),
+        allowUnverified: false,
+        initialAgentName: "codex",
+        initialModel: "gpt-5.6-sol",
+        initialEffort: "low", // valid for sol, not for terra
+        exec,
+      }).pipe(Effect.provide(SilentDisplay.layer(displayRef()))),
+    );
+
+    // sol is still in the catalog → model picker pre-selects it. But once the
+    // user picks terra, "low" is incompatible — the effort picker opens on
+    // terra's own default instead of inheriting it.
+    expect(selectCall(1).initialValue).toBe("gpt-5.6-sol");
+    expect(selectCall(2).initialValue).toBe("xhigh");
+    expect(picked.selection).toEqual({
+      model: "gpt-5.6-terra",
+      effort: "xhigh",
+      executable: "codex",
+      modelSource: "discovered",
     });
   });
 });
@@ -547,6 +694,9 @@ describe("resolveDiscoveredSelection", () => {
       selection: {
         model: "custom-model",
         effort: "ultra",
+        // unauthenticated still fingerprinted the binary — the probed
+        // executable rides along with the unverified flag entry.
+        executable: "codex",
         modelSource: "manual-unverified",
       },
     });
@@ -588,7 +738,11 @@ describe("resolveDiscoveredSelection", () => {
     );
     expect(outcome).toEqual({
       kind: "selection",
-      selection: { model: "gpt-4-turbo", modelSource: "manual-unverified" },
+      selection: {
+        model: "gpt-4-turbo",
+        executable: "codex",
+        modelSource: "manual-unverified",
+      },
     });
   });
 
@@ -607,6 +761,7 @@ describe("resolveDiscoveredSelection", () => {
       selection: {
         model: "gpt-5.6-terra",
         effort: "low",
+        executable: "codex",
         modelSource: "manual-unverified",
       },
     });
@@ -658,6 +813,7 @@ describe("resolveDiscoveredSelection", () => {
       selection: {
         model: "grok-4.6",
         effort: "ultra",
+        executable: "grok",
         modelSource: "manual-unverified",
       },
     });
@@ -669,6 +825,7 @@ describe("resolveDiscoveredSelection", () => {
       selection: {
         model: "grok-4.6",
         effort: "high",
+        executable: "grok",
         modelSource: "discovered",
       },
     });
@@ -689,6 +846,7 @@ describe("resolveDiscoveredSelection", () => {
       selection: {
         model: "gpt-5.6-terra",
         effort: "xhigh",
+        executable: "codex",
         modelSource: "discovered",
       },
     });
@@ -704,9 +862,226 @@ describe("resolveDiscoveredSelection", () => {
       selection: {
         model: "gpt-5.6-sol",
         effort: "medium",
+        executable: "codex",
         modelSource: "discovered",
       },
     });
+  });
+
+  it("carries the probed executable alias into the selection (#27 F006)", async () => {
+    // Grok was fingerprinted under its `agent` alias — the selection must
+    // carry that name so it can be persisted as `agentExecutable`.
+    const report: AgentDiscoveryReport = {
+      agent: "grok",
+      executable: "agent",
+      state: "ready",
+      version: "1.0.30",
+      models: [{ id: "grok-4.6", displayName: "grok-4.6", effortChoices: [] }],
+      recommendedModel: "grok-4.6",
+    };
+    const outcome = await Effect.runPromise(
+      resolveDiscoveredSelection({
+        adapter: getDiscoveryAdapter("grok")!,
+        agentLabel: "Grok",
+        defaultModel: "grok-code-fast-1",
+        modelFlag: Option.none(),
+        effortFlag: Option.none(),
+        isInteractive: false,
+        allowUnverified: false,
+        initialReport: report,
+      }).pipe(Effect.provide(SilentDisplay.layer(displayRef()))),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        model: "grok-4.6",
+        executable: "agent",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("keeps the fingerprinted executable on the manual path after an unauthenticated report", async () => {
+    // `unauthenticated` means the product was identified — the probed
+    // executable name is real and stays attached to a manual selection.
+    const report: AgentDiscoveryReport = {
+      agent: "grok",
+      executable: "agent",
+      state: "unauthenticated",
+      models: [],
+      detail: "You are not authenticated.",
+    };
+    mockSelect.mockResolvedValueOnce("manual");
+    mockText.mockResolvedValueOnce("grok-4.6").mockResolvedValueOnce("");
+
+    const outcome = await Effect.runPromise(
+      resolveDiscoveredSelection({
+        adapter: getDiscoveryAdapter("grok")!,
+        agentLabel: "Grok",
+        defaultModel: "grok-code-fast-1",
+        modelFlag: Option.none(),
+        effortFlag: Option.none(),
+        isInteractive: true,
+        allowUnverified: false,
+        initialReport: report,
+      }).pipe(Effect.provide(SilentDisplay.layer(displayRef()))),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        model: "grok-4.6",
+        executable: "agent",
+        modelSource: "manual-unverified",
+      },
+    });
+  });
+
+  it("never persists a wrong-product executable name", async () => {
+    // The binary that answered as `grok` turned out to be an impostor — its
+    // name must not become `agentExecutable` for a manual selection.
+    const report: AgentDiscoveryReport = {
+      agent: "grok",
+      executable: "grok",
+      state: "wrong-product",
+      models: [],
+      fingerprint: "not-grok 9.9",
+      detail: "not-grok 9.9",
+    };
+    mockSelect.mockResolvedValueOnce("manual");
+    mockText.mockResolvedValueOnce("grok-4.6").mockResolvedValueOnce("");
+
+    const outcome = await Effect.runPromise(
+      resolveDiscoveredSelection({
+        adapter: getDiscoveryAdapter("grok")!,
+        agentLabel: "Grok",
+        defaultModel: "grok-code-fast-1",
+        modelFlag: Option.none(),
+        effortFlag: Option.none(),
+        isInteractive: true,
+        allowUnverified: false,
+        initialReport: report,
+      }).pipe(Effect.provide(SilentDisplay.layer(displayRef()))),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: { model: "grok-4.6", modelSource: "manual-unverified" },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Devin — family slugs vs aliases vs exact variant model_uids (F016, ADR 0021)
+// ---------------------------------------------------------------------------
+
+describe("resolveDiscoveredSelection — Devin selectors", () => {
+  it("--model <family slug> selects the family with no variant", async () => {
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "claude-opus-5" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("--model <family alias> resolves to the family slug, discovered", async () => {
+    // `devin --model opus` is advertised by the live catalog's `aliases`.
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "opus" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("--model <exact variant model_uid> keeps family and variant distinct", async () => {
+    // `claude-opus-5-high` is not a family — it picks the family AND the
+    // thinking level in one selector. The uid lands on `effort` so the
+    // provider can pass it back to --model unchanged.
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "claude-opus-5-high" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        effort: "claude-opus-5-high",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("--model <enum-style model_uid> resolves through the variant path too", async () => {
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "MODEL_GPT_5_2_XHIGH" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        executable: "devin",
+        model: "gpt-5.2",
+        effort: "MODEL_GPT_5_2_XHIGH",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("an explicit --effort still wins over a variant --model", async () => {
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), {
+        model: "claude-opus-5-high",
+        effort: "claude-opus-5-max",
+      }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        effort: "claude-opus-5-max",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("an unknown selector is still rejected with the catalog ids", async () => {
+    const err = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "bogus-9" }).pipe(Effect.flip),
+    );
+    expect(err).toBeInstanceOf(InitError);
+    expect(err.message).toContain("bogus-9");
+    expect(err.message).toContain("claude-opus-5");
+  });
+
+  it("a recommended model outside the catalog degrades to a real entry (F018)", async () => {
+    // `recommendedModel` surfaces raw CLI output — an off-catalog value must
+    // not crash the headless path on the effort lookup.
+    const report = await devinReport();
+    const ref = displayRef();
+    const outcome = await Effect.runPromise(
+      resolveDevin({ ...report, recommendedModel: "grok-next-beta" }, {}, ref),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        modelSource: "discovered",
+      },
+    });
+    expect(
+      statusMessages(entries(ref)).some((m) => m.includes("grok-next-beta")),
+    ).toBe(true);
   });
 });
 

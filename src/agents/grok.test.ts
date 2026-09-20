@@ -1,9 +1,13 @@
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { describe, expect, it } from "vitest";
 import { grok } from "./grok.js";
-import type { AgentCommandOptions } from "../AgentProvider.js";
+import {
+  TOOL_ARG_DISPLAY_MAX_CHARS,
+  type AgentCommandOptions,
+} from "../AgentProvider.js";
 import type { BindMountSandboxHandle } from "../SandboxProvider.js";
 import {
   encodeGrokSessionDir,
@@ -101,6 +105,60 @@ describe("grok factory", () => {
     expect(provider.buildInteractiveArgs!(opts(""))[0]).toBe("agent");
   });
 
+  // --- execPlatform: prompt delivery follows the exec shell, not the host ---
+
+  /** Extract the quoted --prompt-file path from a win32 command. */
+  const promptFileOf = (command: string): string => {
+    const match = /--prompt-file "([^"]+)"/.exec(command);
+    expect(match, `no quoted --prompt-file in: ${command}`).not.toBeNull();
+    return match![1]!;
+  };
+
+  const cleanupPromptFile = (path: string | undefined): void => {
+    if (path !== undefined && existsSync(path)) unlinkSync(path);
+  };
+
+  it("a win32 exec delivers the prompt through a real temp file, not /dev/stdin", () => {
+    const provider = grok("grok-4.6", { execPlatform: "win32" });
+    const prompt = "dịch tiếng Việt — multibyte ✓ and a newline\ninside";
+    const { command, stdin } = provider.buildPrintCommand(opts(prompt));
+    const promptPath = promptFileOf(command);
+    try {
+      // cmd.exe gets a real file path; /dev/stdin does not exist there.
+      expect(command).not.toContain("/dev/stdin");
+      expect(stdin).toBeUndefined();
+      // The file carries the exact UTF-8 prompt and is deleted by the
+      // command itself after Grok exits (success or failure — `&` always
+      // runs `del`).
+      expect(readFileSync(promptPath, "utf-8")).toBe(prompt);
+      expect(command).toContain(`& del "${promptPath}"`);
+    } finally {
+      cleanupPromptFile(promptPath);
+    }
+  });
+
+  it("a win32 exec still uses the discovered executable alias", () => {
+    const provider = grok("grok-4.6", {
+      execPlatform: "win32",
+      executable: "agent",
+    });
+    const { command } = provider.buildPrintCommand(opts("x"));
+    expect(command.startsWith("agent ")).toBe(true);
+    cleanupPromptFile(/--prompt-file "([^"]+)"/.exec(command)?.[1]);
+  });
+
+  it("a non-win32 execPlatform keeps the POSIX stdin device (container on Windows host)", () => {
+    // Docker/Podman on a Windows host exec through sh — callers pass a
+    // non-"win32" platform and get /dev/stdin + stdin delivery back.
+    for (const execPlatform of ["linux", "darwin"]) {
+      const provider = grok("grok-4.6", { execPlatform });
+      const { command, stdin } = provider.buildPrintCommand(opts("x"));
+      expect(command).toContain("--prompt-file /dev/stdin");
+      expect(command).not.toContain("& del ");
+      expect(stdin).toBe("x");
+    }
+  });
+
   it("buildInteractiveArgs passes model, effort, permission mode and prompt", () => {
     const provider = grok("grok-4.5", { effort: "high" });
     const args = provider.buildInteractiveArgs!(opts("fix the bug"));
@@ -165,6 +223,40 @@ describe("grok parseStreamLine", () => {
     expect(event).toMatchObject({ name: "scheduler_create" });
     if (event?.type === "tool_call") {
       expect(event.args).toContain("cron");
+    }
+  });
+
+  it("bounds an oversized mapped rawInput field with a visible ellipsis", () => {
+    const provider = grok("grok-4.6");
+    const command = `echo ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "tool_call",
+      toolCallId: "call-big-1",
+      toolName: "run_terminal_command",
+      rawInput: { command },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "run_terminal_command",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
+    ]);
+  });
+
+  it("bounds the JSON-dump fallback for unmapped tools", () => {
+    const provider = grok("grok-4.6");
+    const line = JSON.stringify({
+      type: "tool_call",
+      toolCallId: "call-big-2",
+      toolName: "scheduler_create",
+      rawInput: { cron: "* * * * *", prompt: "y".repeat(1000) },
+    });
+    const [event] = provider.parseStreamLine(line);
+    expect(event?.type).toBe("tool_call");
+    if (event?.type === "tool_call") {
+      expect(event.args.length).toBe(TOOL_ARG_DISPLAY_MAX_CHARS + 1);
+      expect(event.args.endsWith("…")).toBe(true);
     }
   });
 

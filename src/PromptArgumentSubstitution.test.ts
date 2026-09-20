@@ -140,6 +140,26 @@ describe("PromptArgumentSubstitution", () => {
     expect(result).toBe("Output: !\x01`gh issue view 123`");
   });
 
+  it("does not mark shell expressions inside HTML comments", async () => {
+    const { layer } = setup();
+    const result = await run(
+      "<!-- Example: !`git log --oneline -10` -->\nLive: !`echo hi`",
+      {},
+      layer,
+    );
+    // The comment example stays unmarked — inert documentation — while the
+    // live block outside the comment is marked for the preprocessor.
+    expect(result).toBe(
+      "<!-- Example: !`git log --oneline -10` -->\nLive: !\x01`echo hi`",
+    );
+  });
+
+  it("treats an unclosed HTML comment as commenting out the rest of the prompt", async () => {
+    const { layer } = setup();
+    const result = await run("Intro\n<!-- !`cmd`\nmore: !`cmd2`", {}, layer);
+    expect(result).toBe("Intro\n<!-- !`cmd`\nmore: !`cmd2`");
+  });
+
   it("replaces {{ KEY }} with spaces inside braces", async () => {
     const { layer } = setup();
     const result = await run("Hello {{ NAME }}", { NAME: "world" }, layer);

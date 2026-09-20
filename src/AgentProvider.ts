@@ -50,6 +50,19 @@ export const TOOL_ARG_FIELDS: Record<string, string> = {
 };
 
 /**
+ * Tool-call args render inline in the terminal, the run log, and forwarded
+ * `toolCall` stream events. Bound every arg string — allowlisted field values
+ * and JSON-dump fallbacks alike — so one oversized or unfamiliar argument
+ * cannot flood output or memory. Truncation stays visible via the ellipsis.
+ */
+export const TOOL_ARG_DISPLAY_MAX_CHARS = 300;
+
+export const boundToolCallArgs = (args: string): string =>
+  args.length > TOOL_ARG_DISPLAY_MAX_CHARS
+    ? `${args.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`
+    : args;
+
+/**
  * Extract an error message from a parsed JSON error event.
  * Handles { error: "string" }, { error: { message: "string" } },
  * { error: { data: { message: "string" } } }, and { message: "string" }.
@@ -96,7 +109,7 @@ const parseStreamJsonLine = (line: string): ParsedStreamEvent[] => {
           events.push({
             type: "tool_call",
             name: block.name,
-            args: argValue,
+            args: boundToolCallArgs(argValue),
           });
         }
       }
@@ -151,7 +164,13 @@ const parseCursorToolCallStarted = (
     | { args?: { path?: unknown } }
     | undefined;
   if (readToolCall?.args && typeof readToolCall.args.path === "string") {
-    return [{ type: "tool_call", name: "Read", args: readToolCall.args.path }];
+    return [
+      {
+        type: "tool_call",
+        name: "Read",
+        args: boundToolCallArgs(readToolCall.args.path),
+      },
+    ];
   }
 
   const writeToolCall = tc.writeToolCall as
@@ -159,7 +178,11 @@ const parseCursorToolCallStarted = (
     | undefined;
   if (writeToolCall?.args && typeof writeToolCall.args.path === "string") {
     return [
-      { type: "tool_call", name: "Write", args: writeToolCall.args.path },
+      {
+        type: "tool_call",
+        name: "Write",
+        args: boundToolCallArgs(writeToolCall.args.path),
+      },
     ];
   }
 
@@ -171,13 +194,19 @@ const parseCursorToolCallStarted = (
         const parsedArgs = JSON.parse(rawArgs) as Record<string, unknown>;
         if (typeof parsedArgs.command === "string") {
           return [
-            { type: "tool_call", name: "Bash", args: parsedArgs.command },
+            {
+              type: "tool_call",
+              name: "Bash",
+              args: boundToolCallArgs(parsedArgs.command),
+            },
           ];
         }
       } catch {
         // Use raw arguments string for display.
       }
-      return [{ type: "tool_call", name: fn.name, args: rawArgs }];
+      return [
+        { type: "tool_call", name: fn.name, args: boundToolCallArgs(rawArgs) },
+      ];
     }
     return [{ type: "tool_call", name: fn.name, args: "" }];
   }
@@ -566,15 +595,24 @@ const parsePiStreamLine = (line: string): ParsedStreamEvent[] => {
       return [];
     }
     if (obj.type === "tool_execution_start") {
-      const toolName = obj.toolName;
-      if (typeof toolName !== "string") return [];
+      const rawName = obj.toolName;
+      if (typeof rawName !== "string") return [];
+      // Pi emits lowercase "bash" for its built-in shell tool; normalise to
+      // the shared allowlist entry (same as the Copilot parser).
+      const toolName = rawName === "bash" ? "Bash" : rawName;
       const argField = TOOL_ARG_FIELDS[toolName];
       if (argField === undefined) return [];
       const args = obj.args as Record<string, unknown> | undefined;
       if (!args) return [];
       const argValue = args[argField];
       if (typeof argValue !== "string") return [];
-      return [{ type: "tool_call", name: toolName, args: argValue }];
+      return [
+        {
+          type: "tool_call",
+          name: toolName,
+          args: boundToolCallArgs(argValue),
+        },
+      ];
     }
     // Pi emits agent_error / error events on stdout (not stderr) for auth
     // failures, rate limits, and API errors. Capture them as result events so
@@ -663,6 +701,9 @@ export const pi = (
 
   buildInteractiveArgs({ prompt }: AgentCommandOptions): string[] {
     const args = ["pi", "--model", model];
+    // `--thinking` is a global pi flag — apply the configured level so the
+    // TUI session uses the same reasoning choice as unattended runs (F056).
+    if (options?.thinking) args.push("--thinking", options.thinking);
     if (prompt) args.push(prompt);
     return args;
   },
@@ -732,7 +773,13 @@ const parseCodexStreamLine = (line: string): ParsedStreamEvent[] => {
       obj.item?.type === "command_execution" &&
       typeof obj.item.command === "string"
     ) {
-      return [{ type: "tool_call", name: "Bash", args: obj.item.command }];
+      return [
+        {
+          type: "tool_call",
+          name: "Bash",
+          args: boundToolCallArgs(obj.item.command),
+        },
+      ];
     }
 
     // Codex emits error events on stdout (not stderr) for auth failures,
@@ -939,7 +986,9 @@ const parseOpenCodeStreamLine = (line: string): ParsedStreamEvent[] => {
       const argValue = argField !== undefined ? input[argField] : undefined;
       const args =
         typeof argValue === "string" ? argValue : JSON.stringify(input);
-      return [{ type: "tool_call", name: part.tool, args }];
+      return [
+        { type: "tool_call", name: part.tool, args: boundToolCallArgs(args) },
+      ];
     }
 
     // OpenCode emits error events on stdout (not stderr) for auth failures,
@@ -956,6 +1005,24 @@ const parseOpenCodeStreamLine = (line: string): ParsedStreamEvent[] => {
   }
   return [];
 };
+
+/**
+ * OpenCode print mode passes the prompt as a positional argv argument; stdin
+ * is not documented for delivering the prompt to `opencode run`. Linux
+ * enforces a per-argument limit (~128 KiB, ARG_MAX stack). Stay slightly
+ * under so users get a clear error instead of spawn E2BIG — same guard as
+ * the Cursor, Copilot, and Devin providers.
+ */
+const OPENCODE_PRINT_PROMPT_MAX_BYTES = 120 * 1024;
+
+function assertOpenCodePrintPromptFitsArgv(prompt: string): void {
+  const n = Buffer.byteLength(prompt, "utf8");
+  if (n > OPENCODE_PRINT_PROMPT_MAX_BYTES) {
+    throw new Error(
+      `OpenCode print-mode prompt is ${n} bytes (max ${OPENCODE_PRINT_PROMPT_MAX_BYTES} bytes). The OpenCode CLI accepts the prompt only as a command-line argument; shorten the prompt or split the work. Other Sandcastle providers use stdin for large prompts.`,
+    );
+  }
+}
 
 /** Options for the opencode agent provider. */
 export interface OpenCodeOptions {
@@ -983,6 +1050,7 @@ export const opencode = (
     prompt,
     dangerouslySkipPermissions,
   }: AgentCommandOptions): PrintCommand {
+    assertOpenCodePrintPromptFitsArgv(prompt);
     const variantFlag = options?.variant
       ? ` --variant ${shellEscape(options.variant)}`
       : "";
@@ -1000,6 +1068,17 @@ export const opencode = (
   buildInteractiveArgs({ prompt }: AgentCommandOptions): string[] {
     const args = ["opencode", "--model", model];
     if (options?.agent) args.push("--agent", options.agent);
+    // OpenCode's TUI exposes no `--variant` flag (that flag exists only on
+    // `opencode run`). Emitting it would produce an invalid invocation, so a
+    // configured variant is reported as unsupported here instead of being
+    // silently dropped or passed as a flag the CLI would reject (F056).
+    if (options?.variant !== undefined) {
+      console.error(
+        `sandcastle: OpenCode interactive (TUI) has no --variant flag — ` +
+          `the configured variant "${options.variant}" applies only to ` +
+          "unattended `opencode run` invocations.",
+      );
+    }
     // The TUI's seed-prompt flag is `--prompt` (long form only); `-p` is the
     // `opencode run`/`attach` basic-auth password flag, not a prompt seed.
     // Pre-fills the textbox but does not auto-submit (sst/opencode#3937).
@@ -1083,7 +1162,13 @@ const parseCopilotStreamLine = (line: string): ParsedStreamEvent[] => {
       if (!args) return [];
       const argValue = args[argField];
       if (typeof argValue !== "string") return [];
-      return [{ type: "tool_call", name: toolName, args: argValue }];
+      return [
+        {
+          type: "tool_call",
+          name: toolName,
+          args: boundToolCallArgs(argValue),
+        },
+      ];
     }
 
     // Final assistant message → result. Each assistant turn emits one of

@@ -1,4 +1,5 @@
 import {
+  boundToolCallArgs,
   extractErrorMessage,
   shellEscape,
   type AgentCommandOptions,
@@ -55,16 +56,20 @@ const AGY_TOOL_ARG_FIELDS: Record<string, readonly string[]> = {
 };
 
 /** Best-effort display arg for a tool call: the mapped parameter when known,
- *  otherwise a compact JSON dump of the parameters object. */
+ *  otherwise a compact JSON dump of the parameters object. Every return path
+ *  is bounded so a `write_file`-sized payload cannot flood the terminal or
+ *  forwarded stream events. */
 const antigravityToolArgs = (toolName: string, parameters: unknown): string => {
   if (typeof parameters === "object" && parameters !== null) {
     const params = parameters as Record<string, unknown>;
     for (const field of AGY_TOOL_ARG_FIELDS[toolName] ?? []) {
       const value = params[field];
-      if (typeof value === "string" && value.length > 0) return value;
+      if (typeof value === "string" && value.length > 0) {
+        return boundToolCallArgs(value);
+      }
     }
     try {
-      return JSON.stringify(params);
+      return boundToolCallArgs(JSON.stringify(params));
     } catch {
       return "";
     }
@@ -189,7 +194,9 @@ const parseAntigravityStreamLine = (line: string): ParsedStreamEvent[] => {
         events.push({ type: "session_id", sessionId: r.conversation_id });
       }
       const response = typeof r.response === "string" ? r.response : "";
-      const error = typeof r.error === "string" ? r.error : "";
+      // `error` can be a string or a structured object ({message} /
+      // {data:{message}}) — extractErrorMessage covers all observed shapes.
+      const error = extractErrorMessage(r) ?? "";
       const resultText = response !== "" ? response : error;
       if (resultText !== "") {
         events.push({ type: "result", result: resultText });

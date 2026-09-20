@@ -258,6 +258,11 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // One agent merges all completed branches into the current branch,
   // resolving any conflicts and running tests to confirm everything works.
   //
+  // The merger — including its conflict resolution — runs in a dedicated
+  // integration worktree (`merge-to-head`), never in your active checkout;
+  // the integrated result merges back only after it succeeds. `copyToWorktree`
+  // reuses the host's node_modules so merge-time tests can run there.
+  //
   // The {{BRANCHES}} and {{ISSUES}} prompt arguments are lists that the agent
   // uses to know which branches to merge and which issues were worked on.
   // -------------------------------------------------------------------------
@@ -266,6 +271,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     sandbox: docker(),
     name: "merger",
     maxIterations: 1,
+    copyToWorktree,
+    // Merge in a dedicated integration worktree — the active checkout stays
+    // untouched until the merged result lands back on this branch.
+    branchStrategy: { type: "merge-to-head" },
     agent: sandcastle.claudeCode("claude-sonnet-4-6"),
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {

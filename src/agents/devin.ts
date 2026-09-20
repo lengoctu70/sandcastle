@@ -65,18 +65,21 @@ const stripAnsi = (line: string): string =>
 
 /**
  * Parse one line of `devin -p` stdout. Print mode emits plain text — no JSON
- * event stream exists — so every visible line maps to a `text` event. That
- * keeps `accumulatedOutput` aligned with stdout, which is what the
- * Orchestrator's completion-signal scan and stream forwarding consume. There
- * is no terminal `result` event to extract; the run's result falls back to
- * captured stdout (last-write-wins `resultText` stays empty by design).
- * Non-zero exits are surfaced by the Orchestrator from stderr/stdout —
- * nothing is swallowed here.
+ * event stream exists — so every visible line maps to a `text` event. The
+ * readline layer strips the line's `\n` before this runs, so the delimiter is
+ * restored here: without it `accumulatedOutput` and terminal `textChunk`
+ * writes join unrelated lines, and `TextDeltaBuffer` never sees its newline
+ * flush trigger. That keeps `accumulatedOutput` aligned with stdout, which is
+ * what the Orchestrator's completion-signal scan and stream forwarding
+ * consume. There is no terminal `result` event to extract; the run's result
+ * falls back to captured stdout (last-write-wins `resultText` stays empty by
+ * design). Non-zero exits are surfaced by the Orchestrator from
+ * stderr/stdout — nothing is swallowed here.
  */
 const parseDevinStreamLine = (line: string): ParsedStreamEvent[] => {
   const text = stripAnsi(line);
   if (text.length === 0) return [];
-  return [{ type: "text", text }];
+  return [{ type: "text", text: `${text}\n` }];
 };
 
 /** Options for the devin agent provider. */

@@ -11,6 +11,7 @@ import {
 import { isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 
+import { atomicWriteFile } from "./atomicFile.js";
 import type { GithubIssue } from "./githubIssues.js";
 import type {
   VerificationCommandResult,
@@ -29,7 +30,7 @@ import type {
  *
  * The module is Promise-based and Effect-free (like `githubIssues.ts`) so both
  * the run service and the CLI commands share one read/write path. Records are
- * machine-local bookkeeping — never issue-facing data — and the reader is
+ * host-local bookkeeping — never issue-facing data — and the reader is
  * deliberately tolerant: fields added later parse as absent, while the
  * essential identity/phase fields are validated so a truncated or hand-edited
  * file surfaces as `corrupt` rather than a half-populated state. Nothing in
@@ -64,6 +65,18 @@ const gitOrUndefined = async (
 export const RECOVERY_STATE_VERSION = 1;
 
 /**
+ * The durable post-landing states (#37/F013): which GitHub completion step
+ * is still outstanding after the code has reached the target branch.
+ * `landed-awaiting-report` → report not yet posted (close still pending
+ * after it); `landed-awaiting-close` → report posted, only the close is
+ * unfinished. "Fully complete" never appears on disk — the record is
+ * removed once report + close both succeed.
+ */
+export type RecoveryLandingState =
+  | "landed-awaiting-report"
+  | "landed-awaiting-close";
+
+/**
  * The durable record of one failed task. `version` and `retryCount` were added
  * for #19 — {@link parseRecoveryState} fills defaults so records written
  * before those fields existed still load.
@@ -87,7 +100,11 @@ export interface RecoveryState {
   readonly error: string;
   readonly verification: readonly VerificationCommandResult[];
   readonly integrationVerification?: readonly VerificationCommandResult[];
-  /** Commits the agent produced on the source branch. */
+  /**
+   * Commits the run produced — the agent's source-branch commits plus every
+   * commit the integration machinery created (merge commit, repair commits,
+   * deterministic merge completion), deduped by sha.
+   */
   readonly commits: readonly { readonly sha: string }[];
   /** Last captured agent session id — native resume material. */
   readonly sessionId?: string;
@@ -102,6 +119,33 @@ export interface RecoveryState {
   readonly retryCount: number;
   /** ISO timestamp of the failure that wrote this record. */
   readonly failedAt: string;
+  /**
+   * Post-landing GitHub completion state (#37/F013). Absent while the run
+   * stopped before landing — records written before this field existed
+   * parse as pre-landing, which they all are.
+   *
+   * Once the target branch carries the work, the remaining durable steps
+   * are GitHub-side (ADR 0023): post the completion report, then close the
+   * issue. `landed-awaiting-report` means the report still needs posting
+   * (and then the close); `landed-awaiting-close` means the report is
+   * posted and only the close remains. There is deliberately no persisted
+   * "fully complete" state — the record is deleted via
+   * {@link clearRecoveryState} once the issue is closed.
+   *
+   * Always written together with `landedSha` and `reportBody`; the parser
+   * rejects a landed record missing either (a half-populated post-landing
+   * record can never finish the GitHub phase, so it surfaces as corrupt
+   * rather than silently degrading to a re-implementation).
+   */
+  readonly landingState?: RecoveryLandingState;
+  /** The target branch's tip after landing — what the report announced. */
+  readonly landedSha?: string;
+  /**
+   * The exact completion-report body captured at landing time. A retry
+   * re-posts it verbatim instead of rebuilding it from artifacts (commits,
+   * worktree, integration base) that may already be cleaned up.
+   */
+  readonly reportBody?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,12 +167,19 @@ export const recoveryStatePath = (cwd: string, issueNumber: number): string =>
 
 const WORKFLOW_PHASES: ReadonlySet<string> = new Set([
   "preflight",
+  "planning",
   "implementation",
+  "review",
   "verification",
   "integration",
   "integration-verification",
   "landing",
   "reporting",
+]);
+
+const LANDING_STATES: ReadonlySet<string> = new Set([
+  "landed-awaiting-report",
+  "landed-awaiting-close",
 ]);
 
 export type ParseRecoveryResult =
@@ -172,13 +223,20 @@ const asVerificationResults = (
     ) {
       return undefined;
     }
+    const outputTail =
+      typeof obj["outputTail"] === "string" ? obj["outputTail"] : "";
     out.push({
       command: obj["command"],
       status,
       exitCode: typeof obj["exitCode"] === "number" ? obj["exitCode"] : null,
       durationMs: typeof obj["durationMs"] === "number" ? obj["durationMs"] : 0,
-      outputTail:
-        typeof obj["outputTail"] === "string" ? obj["outputTail"] : "",
+      outputTail,
+      // The fuller repair diagnostic — records written before the field
+      // existed fall back to the short tail, still the best evidence a
+      // retry's repair prompt can offer.
+      output: typeof obj["output"] === "string" ? obj["output"] : outputTail,
+      // Optional in the record shape — older recovery files simply lack it.
+      ...(obj["timedOut"] === true ? { timedOut: true as const } : {}),
     });
   }
   return out;
@@ -195,6 +253,7 @@ const asAttempts = (raw: unknown): WorkflowRunAttempts | undefined => {
     implementation: counter("implementation"),
     verificationRepair: counter("verificationRepair"),
     mergeConflictRepair: counter("mergeConflictRepair"),
+    integrationVerificationRepair: counter("integrationVerificationRepair"),
     integrationRebuild: counter("integrationRebuild"),
   };
 };
@@ -268,6 +327,27 @@ export const parseRecoveryState = (raw: unknown): ParseRecoveryResult => {
       detail: "trường `integrationVerification` không hợp lệ",
     };
   }
+  const landingState = obj["landingState"];
+  if (
+    landingState !== undefined &&
+    (typeof landingState !== "string" || !LANDING_STATES.has(landingState))
+  ) {
+    return { ok: false, detail: "trường `landingState` không hợp lệ" };
+  }
+  const landedSha = optionalString(obj["landedSha"]);
+  const reportBody = optionalString(obj["reportBody"]);
+  if (
+    landingState !== undefined &&
+    (landedSha === undefined || reportBody === undefined)
+  ) {
+    // A landed record without its report material can never finish the
+    // GitHub phase on retry — surface it as corrupt rather than degrade to
+    // a re-implementation.
+    return {
+      ok: false,
+      detail: "bản ghi đã merge thiếu trường `landedSha`/`reportBody`",
+    };
+  }
   const retryCount = obj["retryCount"];
   return {
     ok: true,
@@ -298,6 +378,11 @@ export const parseRecoveryState = (raw: unknown): ParseRecoveryResult => {
       ...(optionalString(obj["logFilePath"]) !== undefined
         ? { logFilePath: optionalString(obj["logFilePath"]) }
         : {}),
+      ...(landingState !== undefined
+        ? { landingState: landingState as RecoveryLandingState }
+        : {}),
+      ...(landedSha !== undefined ? { landedSha } : {}),
+      ...(reportBody !== undefined ? { reportBody } : {}),
       attempts,
       retryCount:
         typeof retryCount === "number" &&
@@ -414,8 +499,14 @@ export const listRecoveryStates = async (
 };
 
 /**
- * Persist a recovery record. Also keeps `recovery/` ignored by appending it to
- * the scaffolded `.sandcastle/.gitignore` — recovery state is machine-local.
+ * Persist a recovery record. The record is written through
+ * {@link atomicWriteFile} — a same-directory temp file, fsynced, then
+ * atomically renamed into place — so an interruption can never leave the
+ * sole durable record truncated or half-written, and a failed replacement
+ * leaves the previously written record intact (F064).
+ *
+ * Also keeps `recovery/` ignored by appending it to the scaffolded
+ * `.sandcastle/.gitignore` — recovery state is host-local.
  */
 export const writeRecoveryState = async (
   cwd: string,
@@ -423,10 +514,17 @@ export const writeRecoveryState = async (
 ): Promise<void> => {
   const dir = recoveryDir(cwd);
   await mkdir(dir, { recursive: true });
-  await writeFile(
-    recoveryStatePath(cwd, state.issue.number),
-    JSON.stringify(state, null, 2) + "\n",
-  );
+  const path = recoveryStatePath(cwd, state.issue.number);
+  try {
+    await atomicWriteFile(path, JSON.stringify(state, null, 2) + "\n");
+  } catch (e) {
+    throw new Error(
+      `Không ghi được bản ghi phục hồi tại "${path}": ` +
+        `${e instanceof Error ? e.message : String(e)}. ` +
+        "Bản ghi cũ (nếu có) được giữ nguyên — kiểm tra quyền ghi và dung " +
+        "lượng ổ đĩa rồi chạy lại.",
+    );
+  }
   const gitignorePath = join(cwd, ".sandcastle", ".gitignore");
   try {
     const content = await readFile(gitignorePath, "utf-8");
@@ -453,6 +551,186 @@ export const clearRecoveryState = async (
 };
 
 // ---------------------------------------------------------------------------
+// Per-issue retry exclusion (F065)
+//
+// `sandcastle retry <N>` mutates the preserved worktree and the repository's
+// Git index — two concurrent retries for the same issue would collide on
+// both. The lock is a lock FILE at `.sandcastle/recovery/issue-<N>.lock`
+// created with `O_EXCL` (`wx`), which is atomic on every supported platform
+// (no lockfile dependency). The `.lock` suffix keeps it out of the
+// `listRecoveryStates` `.json` glob, so a held lock never surfaces as a
+// corrupt record.
+//
+// The file records the holder's pid + start time for diagnostics. A lock
+// whose recorded process is gone is treated as stale: it is re-inspected by
+// inode (to be sure it is still the same file) and removed, then acquisition
+// is retried once. A lock held by a live process — or one whose contents
+// cannot be attributed to a process at all — rejects the retry with a
+// {@link RetryLockHeldError} that names the lock file for manual cleanup;
+// an unattributable file is never silently deleted.
+// ---------------------------------------------------------------------------
+
+/** Absolute path of the per-issue retry lock file. */
+export const retryLockPath = (cwd: string, issueNumber: number): string =>
+  join(recoveryDir(cwd), `issue-${issueNumber}.lock`);
+
+/**
+ * Raised when another process already holds the retry lock for an issue —
+ * or when a leftover lock file cannot be attributed to a process. The
+ * message names the lock path so a stale file can be removed by hand.
+ */
+export class RetryLockHeldError extends Error {
+  readonly _tag: "RetryLockHeldError" = "RetryLockHeldError";
+  constructor(
+    readonly lockPath: string,
+    readonly issueNumber: number,
+    readonly holderDetail: string,
+  ) {
+    super(
+      `Đã có một tiến trình retry khác đang giữ khóa cho issue #${issueNumber} ` +
+        `(${holderDetail}) — chạy đồng thời hai lần retry trên cùng một ` +
+        "worktree sẽ làm hỏng Git index và commit. Đợi tiến trình kia xong; " +
+        `nếu nó đã dừng đột ngột, xóa tệp khóa \`${lockPath}\` rồi chạy lại ` +
+        `\`sandcastle retry ${issueNumber}\`.`,
+    );
+    this.name = "RetryLockHeldError";
+  }
+}
+
+/** A held retry lock. Call {@link RetryLock.release} exactly once. */
+export interface RetryLock {
+  /** Path of the lock file this process created. */
+  readonly path: string;
+  /**
+   * Remove the lock file — but only while it still holds THIS acquisition's
+   * payload, so a release can never delete a newer holder's lock.
+   */
+  readonly release: () => Promise<void>;
+}
+
+interface LockPayload {
+  readonly pid: number;
+  readonly startedAt?: string;
+}
+
+const parseLockPayload = (content: string): LockPayload | undefined => {
+  try {
+    const raw: unknown = JSON.parse(content);
+    if (
+      typeof raw === "object" &&
+      raw !== null &&
+      typeof (raw as Record<string, unknown>)["pid"] === "number"
+    ) {
+      const pid = (raw as Record<string, unknown>)["pid"] as number;
+      const startedAt = (raw as Record<string, unknown>)["startedAt"];
+      return {
+        pid,
+        ...(typeof startedAt === "string" ? { startedAt } : {}),
+      };
+    }
+  } catch {
+    // Unparseable — the holder cannot be identified.
+  }
+  return undefined;
+};
+
+/**
+ * Is `pid` a live process? Signal 0 probes existence without delivering a
+ * signal; EPERM means the process exists but is owned by someone else (still
+ * held), ESRCH means it is gone (stale lock).
+ */
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+const describeHolder = (payload: LockPayload | undefined): string =>
+  payload === undefined
+    ? "tệp khóa không đọc được tiến trình giữ"
+    : `pid ${payload.pid}` +
+      (payload.startedAt !== undefined
+        ? `, bắt đầu lúc ${payload.startedAt}`
+        : "");
+
+/**
+ * Acquire the per-issue retry lock. Resolves with a {@link RetryLock} once
+ * the lock file is created; rejects with {@link RetryLockHeldError} when
+ * another live process holds it, or with the raw filesystem error when the
+ * lock file cannot be created at all.
+ *
+ * This is an advisory lock: the stale-breaking path re-stats by inode before
+ * unlinking, which narrows — but cannot fully eliminate — the window where a
+ * lock is replaced between inspection and removal. Callers must treat
+ * acquisition as the single retry gate: acquire BEFORE mutating the worktree
+ * or Git index, and release when done (including on failure).
+ */
+export const acquireRetryLock = async (
+  cwd: string,
+  issueNumber: number,
+): Promise<RetryLock> => {
+  const dir = recoveryDir(cwd);
+  await mkdir(dir, { recursive: true });
+  const path = retryLockPath(cwd, issueNumber);
+  const payload =
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) +
+    "\n";
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // O_EXCL create — atomic cross-platform; fails EEXIST when held.
+      await writeFile(path, payload, { flag: "wx" });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+
+      const [content, st] = await Promise.all([
+        readFile(path, "utf-8").catch(() => undefined),
+        stat(path).catch(() => undefined),
+      ]);
+      const holder =
+        content !== undefined ? parseLockPayload(content) : undefined;
+
+      if (
+        attempt === 0 &&
+        holder !== undefined &&
+        !pidAlive(holder.pid) &&
+        st !== undefined
+      ) {
+        // Stale lock from a dead process. Re-stat and remove ONLY if it is
+        // still the exact file we inspected — if another process already
+        // broke it and wrote its own, the inode/mtime differ and the next
+        // loop iteration will see that live lock and refuse.
+        const again = await stat(path).catch(() => undefined);
+        if (
+          again !== undefined &&
+          again.ino === st.ino &&
+          again.mtimeMs === st.mtimeMs
+        ) {
+          await rm(path, { force: true }).catch(() => {});
+        }
+        continue;
+      }
+      throw new RetryLockHeldError(path, issueNumber, describeHolder(holder));
+    }
+
+    return {
+      path,
+      release: async () => {
+        const current = await readFile(path, "utf-8").catch(() => undefined);
+        // Gone already, or still ours → remove. Anything else means another
+        // holder replaced it — leave that file alone.
+        if (current === undefined || current === payload) {
+          await rm(path, { force: true }).catch(() => {});
+        }
+      },
+    };
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Artifact probing — worktree / branch / landing state on disk
 // ---------------------------------------------------------------------------
 
@@ -469,11 +747,31 @@ export interface RecoveryArtifacts {
   readonly worktreeUsable: boolean;
   /** `refs/heads/<targetBranch>` still resolves. */
   readonly targetBranchExists: boolean;
-  /** Commits on the source branch that are not on the target branch. */
+  /**
+   * How the `target..source` rev-list comparison ended — kept separate from
+   * the commit list itself so a FAILED comparison is never conflated with an
+   * empty range (F030):
+   * - `"ok"` — the comparison ran; `preservedCommits` is authoritative
+   *   (including an empty list = genuinely zero unmerged commits).
+   * - `"target-missing"` — the recorded target branch no longer resolves
+   *   (deleted or renamed), so nothing can be said about unmerged commits.
+   * - `"source-missing"` — the source branch is gone; nothing to compare.
+   * - `"unknown"` — `git rev-list` itself failed for another reason.
+   */
+  readonly comparison: "ok" | "target-missing" | "source-missing" | "unknown";
+  /**
+   * Commits on the source branch that are not on the target branch. Only
+   * meaningful when {@link comparison} is `"ok"` — it is `[]` whenever the
+   * comparison could not run, which must never be read as "no unmerged work".
+   */
   readonly preservedCommits: readonly string[];
   /**
-   * The source branch has no commits the target lacks — the work either
-   * already landed elsewhere or was never committed. A stale signal.
+   * The comparison ran cleanly, the `target..source` range is empty, AND the
+   * run recorded commits — i.e. work the run produced is absent from the
+   * range, so it either already landed elsewhere or the branch was reset.
+   * Deliberately `false` when the comparison could not run (unknown ≠ empty,
+   * F030) and when the run never produced a commit at all (incomplete ≠
+   * landed, F072).
    */
   readonly landedOrEmpty: boolean;
 }
@@ -511,29 +809,47 @@ export const probeRecoveryArtifacts = async (
     }
   }
 
-  const preservedCommits = branchExists
-    ? ((
-        await gitOrUndefined(
-          [
-            "rev-list",
-            "--reverse",
-            `${state.targetBranch}..${state.sourceBranch}`,
-          ],
-          cwd,
-        )
-      )
-        ?.split("\n")
+  // The comparison result is tracked separately from the commit list: a
+  // missing target branch or a failed `rev-list` is UNKNOWN state, not an
+  // empty range — reporting it as `[]` would let `landedOrEmpty` and the
+  // discard prompt claim "0 unmerged commits" while real work exists (F030).
+  let comparison: RecoveryArtifacts["comparison"];
+  let preservedCommits: readonly string[] = [];
+  if (!branchExists) {
+    comparison = "source-missing";
+  } else if (!targetBranchExists) {
+    comparison = "target-missing";
+  } else {
+    const revList = await gitOrUndefined(
+      ["rev-list", "--reverse", `${state.targetBranch}..${state.sourceBranch}`],
+      cwd,
+    );
+    if (revList === undefined) {
+      comparison = "unknown";
+    } else {
+      comparison = "ok";
+      preservedCommits = revList
+        .split("\n")
         .map((l) => l.trim())
-        .filter((l) => l.length > 0) ?? [])
-    : [];
+        .filter((l) => l.length > 0);
+    }
+  }
 
   return {
     branchExists,
     worktreeExists,
     worktreeUsable,
     targetBranchExists,
+    comparison,
     preservedCommits,
-    landedOrEmpty: branchExists && preservedCommits.length === 0,
+    // "Landed elsewhere" is only provable when the comparison ran AND the
+    // run actually produced commits — an empty range on a run that never
+    // committed (e.g. an implementation-phase crash, F072) is incomplete
+    // work, not landed work.
+    landedOrEmpty:
+      comparison === "ok" &&
+      preservedCommits.length === 0 &&
+      state.commits.length > 0,
   };
 };
 

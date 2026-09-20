@@ -4,7 +4,10 @@
  * Headless runs invoke `grok --output-format streaming-json` with the prompt
  * delivered on stdin via `--prompt-file /dev/stdin` — Grok's `-p -` does NOT
  * read stdin (`-` is treated as a literal prompt), so the prompt-file indirection
- * is load-bearing for large prompts and shell-safety alike.
+ * is load-bearing for large prompts and shell-safety alike. `/dev/stdin` only
+ * exists under POSIX exec shells; when the command will run through cmd.exe
+ * (host mode on Windows) the prompt is written to a temporary file instead
+ * and that real path is passed to `--prompt-file` (see `execPlatform`).
  *
  * Stream events are ACP-style session updates (`text`, `thought`, `tool_call`,
  * `tool_call_update`, `usage`, `end`). `end` carries the session id and total
@@ -22,9 +25,12 @@
  * hosts where only that entrypoint is on PATH.
  */
 
+import { writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import {
+  boundToolCallArgs,
   extractErrorMessage,
   readSandboxFile,
   shellEscape,
@@ -67,19 +73,14 @@ const GROK_TOOL_ARG_FIELDS: Record<string, string> = {
   ask_user_question: "question",
 };
 
-/** Display args are rendered inline — bound the JSON-dump fallback so a
- *  `write`-sized payload cannot flood the log. */
-const TOOL_ARG_DUMP_MAX_CHARS = 300;
-
+/** Display args are rendered inline — bound mapped fields and the JSON-dump
+ *  fallback alike so a `write`-sized payload cannot flood the log. */
 const grokToolCallArgs = (toolName: string, rawInput: unknown): string => {
   if (!isRecord(rawInput)) return "";
   const field = GROK_TOOL_ARG_FIELDS[toolName];
   const value = field !== undefined ? rawInput[field] : undefined;
-  if (typeof value === "string") return value;
-  const dump = JSON.stringify(rawInput);
-  return dump.length > TOOL_ARG_DUMP_MAX_CHARS
-    ? `${dump.slice(0, TOOL_ARG_DUMP_MAX_CHARS)}…`
-    : dump;
+  if (typeof value === "string") return boundToolCallArgs(value);
+  return boundToolCallArgs(JSON.stringify(rawInput));
 };
 
 /**
@@ -312,6 +313,18 @@ export interface GrokOptions {
    */
   readonly executable?: string;
   /**
+   * Platform of the shell that will interpret the print command — defaults
+   * to `process.platform`. Only the `"win32"` vs POSIX distinction matters:
+   * a `cmd.exe` exec has no `/dev/stdin`, so the prompt is materialized into
+   * a temporary file and `--prompt-file` gets a real path; every POSIX shell
+   * (POSIX hosts and Linux containers alike) keeps the stdin device.
+   *
+   * Container sandboxes always exec through `sh`, even on a Windows host —
+   * pass `"linux"` (or any non-`"win32"` value) when this provider will run
+   * inside Docker/Podman on Windows, where a host temp path would not exist.
+   */
+  readonly execPlatform?: string;
+  /**
    * Maps directly to Grok's `--permission-mode` flag. When set, replaces the
    * default `--always-approve` Sandcastle passes on AFK runs. Use `"auto"` for
    * AI-mediated per-tool approve/deny on unsandboxed host runs.
@@ -366,10 +379,29 @@ export const grok = (
         ? ` --resume ${shellEscape(resumeSession)}`
         : "";
       const forkFlag = resumeSession && forkSession ? " --fork-session" : "";
+      const commandBase = `${executable} --output-format streaming-json --model ${shellEscape(model)}${effortFlag}${permissionFlag}${resumeFlag}${forkFlag}`;
+      const execPlatform = options?.execPlatform ?? process.platform;
+      if (execPlatform === "win32") {
+        // cmd.exe has no /dev/stdin. Write the prompt to a temp file on the
+        // host (the command runs on this machine) and hand Grok the real
+        // path; `& del` removes it after Grok exits whether it succeeded or
+        // failed. cmd.exe quoting uses double quotes — POSIX shellEscape
+        // single-quotes do not apply.
+        const promptPath = join(
+          tmpdir(),
+          `sandcastle-grok-prompt-${process.pid}-${Date.now()}-${Math.random()
+            .toString(36)
+            .slice(2)}.txt`,
+        );
+        writeFileSync(promptPath, prompt, { encoding: "utf-8", mode: 0o600 });
+        return {
+          command: `${commandBase} --prompt-file "${promptPath}" & del "${promptPath}"`,
+        };
+      }
       return {
         // `-p -` does not read stdin on Grok — `-` becomes a literal prompt.
         // `--prompt-file /dev/stdin` is the verified stdin delivery path.
-        command: `${executable} --output-format streaming-json --model ${shellEscape(model)}${effortFlag}${permissionFlag}${resumeFlag}${forkFlag} --prompt-file /dev/stdin`,
+        command: `${commandBase} --prompt-file /dev/stdin`,
         stdin: prompt,
       };
     },

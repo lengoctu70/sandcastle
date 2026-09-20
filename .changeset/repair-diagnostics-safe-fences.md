@@ -1,0 +1,5 @@
+---
+"@lengoctu70/sandcastle": patch
+---
+
+Repair agents now receive complete, instruction-safe verification evidence (F035/F061). `VerificationCommandResult` gains an `output` channel alongside the report-oriented `outputTail`: the combined stdout/stderr is bounded to 64KiB with head+tail preservation, so the root compiler or test error — usually emitted first, previously cut by the 4,000-char tail — reaches the repair prompt verbatim while GitHub reports keep their shorter bounded summary. The repair, merge-conflict, and resume prompts now wrap captured diagnostics in a fence one backtick longer than any backtick run inside the content (CommonMark's longer-fence rule), so diagnostic text containing Markdown fences, XML-like tags, shell text, or instruction-shaped lines can never close its boundary and become prompt structure; the same helper protects the fenced blocks in the Vietnamese completion and failure reports. Recovery records written before the `output` field existed parse it as the old `outputTail` value, so retries still offer the best available diagnostic.

@@ -25,8 +25,8 @@ import {
   pi as piFactory,
   DEFAULT_MODEL,
 } from "./AgentProvider.js";
-import type { SandboxService } from "./SandboxFactory.js";
-import type { DockerError, SandboxError } from "./errors.js";
+import type { ExecResult, SandboxService } from "./SandboxFactory.js";
+import type { DockerError, ExecError, SandboxError } from "./errors.js";
 import { AgentError, AgentIdleTimeoutError } from "./errors.js";
 import { SandboxFactory } from "./SandboxFactory.js";
 import { encodeProjectPath } from "./SessionStore.js";
@@ -3870,8 +3870,8 @@ describe("Orchestrator signal (AbortSignal)", () => {
 describe("Orchestrator completion timeout (hanging process)", () => {
   /**
    * Build a mock sandbox layer where the `claude` exec emits the given lines
-   * via `onLine` and then *never resolves*. Used to simulate a hanging child
-   * process keeping stdout open after the agent's logical turn ends.
+   * via `onLine` and then hangs until the invocation aborts it — simulating a
+   * child process keeping stdout open after the agent's logical turn ends.
    */
   const makeHangingClaudeAgentLayer = (
     sandboxDir: string,
@@ -3882,13 +3882,18 @@ describe("Orchestrator completion timeout (hanging process)", () => {
       exec: (command, options) => {
         if (command.startsWith("claude ") && options?.onLine) {
           const onLine = options.onLine;
-          return Effect.gen(function* () {
+          return Effect.async<ExecResult, ExecError>((resume) => {
             for (const line of lines) {
               onLine(line);
             }
-            // Never resolve — simulate a hanging child holding stdout open.
-            yield* Effect.never;
-            return { stdout: "", stderr: "", exitCode: 0 };
+            // Hang like a descendant holding stdout open until the
+            // invocation aborts the exec — the same settle-on-abort
+            // contract the no-sandbox provider implements.
+            const signal = options.signal;
+            const onAbort = () =>
+              resume(Effect.succeed({ stdout: "", stderr: "", exitCode: 0 }));
+            if (signal?.aborted) onAbort();
+            else signal?.addEventListener("abort", onAbort, { once: true });
           });
         }
         return real.exec(command, options);
@@ -4018,9 +4023,16 @@ describe("Orchestrator completion timeout (hanging process)", () => {
                     "Plan ready. <promise>COMPLETE</promise>\nTRAILING_TOKEN",
                 }),
               );
-              // Hang forever after trailing output.
-              yield* Effect.never;
-              return { stdout: "", stderr: "", exitCode: 0 };
+              // Hang after trailing output until the invocation aborts.
+              return yield* Effect.async<ExecResult, ExecError>((resume) => {
+                const signal = options.signal;
+                const onAbort = () =>
+                  resume(
+                    Effect.succeed({ stdout: "", stderr: "", exitCode: 0 }),
+                  );
+                if (signal?.aborted) onAbort();
+                else signal?.addEventListener("abort", onAbort, { once: true });
+              });
             });
           }
           return real.exec(command, options);
@@ -4123,5 +4135,150 @@ describe("Orchestrator completion timeout (hanging process)", () => {
     expect(
       warnEntries.some((e) => /hang|completion timeout/i.test(e.message)),
     ).toBe(true);
+  }, 10_000);
+
+  it("keeps a completion signal seen in an earlier turn when a later result event drops it", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "orch-signal-accum-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    // The completion signal arrives in an earlier streamed message; the
+    // terminal result event does not repeat it. Detection must accumulate
+    // across the whole conversation — re-scanning only the final result
+    // text would miss it and run all 5 iterations.
+    const lines = [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "text",
+              text: "Work finished. <promise>COMPLETE</promise>",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "result",
+        result: "Final summary without the marker.",
+      }),
+    ];
+
+    const { factoryLayer } = makeTestSandboxFactory(hostDir, (dir) => {
+      const real = makeLocalSandbox(dir);
+      return {
+        exec: (command, options) => {
+          if (command.startsWith("claude ") && options?.onLine) {
+            const onLine = options.onLine;
+            return Effect.gen(function* () {
+              for (const line of lines) {
+                onLine(line);
+              }
+              return {
+                stdout: lines.join("\n"),
+                stderr: "",
+                exitCode: 0,
+              };
+            });
+          }
+          return real.exec(command, options);
+        },
+        copyIn: real.copyIn,
+        copyFileOut: real.copyFileOut,
+      };
+    });
+
+    const result = await Effect.runPromise(
+      orchestrate({
+        provider: testProvider,
+        hostRepoDir: hostDir,
+        iterations: 5,
+        prompt: "do some work",
+      }).pipe(Effect.provide(Layer.merge(factoryLayer, testDisplayLayer))),
+    );
+
+    expect(result.iterations.length).toBe(1);
+    expect(result.completionSignal).toBe("<promise>COMPLETE</promise>");
+  });
+
+  it("does not run lifecycle git operations until the timed-out exec settles", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "orch-teardown-order-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    // A fake agent that emits the completion signal, then hangs like a
+    // descendant holding stdout open. It only unwinds when the invocation's
+    // abort signal fires, recording teardown ordering against every
+    // subsequent sandbox.exec git command.
+    const events: string[] = [];
+    const { factoryLayer } = makeTestSandboxFactory(hostDir, (dir) => {
+      const real = makeLocalSandbox(dir);
+      return {
+        exec: (command, options) => {
+          if (command.startsWith("claude ") && options?.onLine) {
+            const onLine = options.onLine;
+            return Effect.async<ExecResult, ExecError>((resume) => {
+              events.push("agent:start");
+              onLine(
+                JSON.stringify({
+                  type: "assistant",
+                  message: {
+                    content: [
+                      {
+                        type: "text",
+                        text: "Done. <promise>COMPLETE</promise>",
+                      },
+                    ],
+                  },
+                }),
+              );
+              const signal = options.signal;
+              const onAbort = () => {
+                events.push("agent:aborted");
+                // Settle asynchronously — teardown takes a beat, exactly the
+                // window in which Git ops must not begin.
+                setTimeout(() => {
+                  events.push("agent:settled");
+                  resume(
+                    Effect.succeed({ stdout: "", stderr: "", exitCode: 0 }),
+                  );
+                }, 25);
+              };
+              if (signal?.aborted) onAbort();
+              else signal?.addEventListener("abort", onAbort, { once: true });
+            });
+          }
+          if (command.startsWith("git ")) events.push(`exec:${command}`);
+          return real.exec(command, options);
+        },
+        copyIn: real.copyIn,
+        copyFileOut: real.copyFileOut,
+      };
+    });
+
+    const result = await Effect.runPromise(
+      orchestrate({
+        provider: testProvider,
+        hostRepoDir: hostDir,
+        iterations: 1,
+        prompt: "do some work",
+        completionTimeoutSeconds: 0.2,
+        idleTimeoutSeconds: 30,
+      }).pipe(Effect.provide(Layer.merge(factoryLayer, testDisplayLayer))),
+    );
+
+    expect(result.completionSignal).toBe("<promise>COMPLETE</promise>");
+    const settledIdx = events.indexOf("agent:settled");
+    // The completion timeout aborted the invocation and the aborted exec
+    // settled — before the lifecycle ran its first post-agent git command.
+    expect(settledIdx).toBeGreaterThan(-1);
+    expect(events.indexOf("agent:aborted")).toBeLessThan(settledIdx);
+    const detachIdx = events.indexOf("exec:git checkout --detach");
+    expect(detachIdx).toBeGreaterThan(settledIdx);
+    // And nothing exec'd through the sandbox while the agent was still up.
+    const duringExec = events
+      .slice(events.indexOf("agent:start") + 1, settledIdx)
+      .filter((e) => e.startsWith("exec:"));
+    expect(duringExec).toEqual([]);
   }, 10_000);
 });

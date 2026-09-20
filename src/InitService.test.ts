@@ -1,5 +1,6 @@
 import { NodeFileSystem } from "@effect/platform-node";
-import { Effect } from "effect";
+import { Effect, Ref } from "effect";
+import { execSync } from "node:child_process";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,9 +24,15 @@ import type {
   ScaffoldOptions,
 } from "./InitService.js";
 import { SANDBOX_REPO_DIR } from "./SandboxFactory.js";
-import { SKELETON_PROMPT } from "./templates.js";
+import { SilentDisplay, type DisplayEntry } from "./Display.js";
+import { substitutePromptArgs } from "./PromptArgumentSubstitution.js";
+import { preprocessPrompt, SHELL_BLOCK_MARKER } from "./PromptPreprocessor.js";
+import { makeLocalSandbox } from "./testSandbox.js";
 
 const makeDir = () => mkdtemp(join(tmpdir(), "init-service-"));
+
+const silentDisplayLayer = () =>
+  SilentDisplay.layer(Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]));
 
 const claudeCodeAgent = getAgent("claude-code")!;
 const piAgent = getAgent("pi")!;
@@ -182,7 +189,7 @@ describe("InitService scaffold", () => {
     );
   });
 
-  it("includes .env, logs/, and worktrees/ in .gitignore but not patches/", async () => {
+  it("includes .env, logs/, worktrees/, and recovery/ in .gitignore but not patches/", async () => {
     const dir = await makeDir();
     await runScaffold(dir);
 
@@ -193,6 +200,9 @@ describe("InitService scaffold", () => {
     expect(gitignore).toContain(".env");
     expect(gitignore).toContain("logs/");
     expect(gitignore).toContain("worktrees/");
+    // `recovery/` must be ignored from the first scaffold — the first
+    // workflow failure creates it and must not dirty a tracked file.
+    expect(gitignore).toContain("recovery/");
     expect(gitignore).not.toContain("patches/");
   });
 
@@ -243,7 +253,7 @@ describe("InitService scaffold", () => {
     expect(dockerfile).not.toContain("pnpm");
   });
 
-  it("skeleton prompt contains section headers and hints", async () => {
+  it("skeleton prompt contains section headers and inert comment hints", async () => {
     const dir = await makeDir();
     await runScaffold(dir);
 
@@ -252,8 +262,15 @@ describe("InitService scaffold", () => {
       "utf-8",
     );
     expect(prompt).toContain("# ");
-    expect(prompt).toContain("!`");
     expect(prompt).toContain("<promise>COMPLETE</promise>");
+    // The `!`...`` usage examples only appear inside HTML comments — they
+    // are documentation and must never be marked for shell execution.
+    const substituted = await Effect.runPromise(
+      substitutePromptArgs(prompt, {}).pipe(
+        Effect.provide(silentDisplayLayer()),
+      ),
+    );
+    expect(substituted).not.toContain(SHELL_BLOCK_MARKER);
   });
 
   it("blank template produces skeleton prompt and main.mts", async () => {
@@ -262,11 +279,44 @@ describe("InitService scaffold", () => {
 
     const configDir = join(dir, ".sandcastle");
     const prompt = await readFile(join(configDir, "prompt.md"), "utf-8");
-    expect(prompt).toContain("!`");
+    // `!`...`` examples live inside <!-- --> comments — inert at run time.
+    expect(prompt).toContain("<!--");
+    const substituted = await Effect.runPromise(
+      substitutePromptArgs(prompt, {}).pipe(
+        Effect.provide(silentDisplayLayer()),
+      ),
+    );
+    expect(substituted).not.toContain(SHELL_BLOCK_MARKER);
     expect(prompt).toContain("<promise>COMPLETE</promise>");
 
     const { access } = await import("node:fs/promises");
     await expect(access(join(configDir, "main.mts"))).resolves.toBeUndefined();
+  });
+
+  it("blank prompt expands without executing anything in an unborn repository", async () => {
+    // makeLocalSandbox runs `sh -c` — POSIX-only.
+    if (process.platform === "win32") return;
+    const dir = await makeDir();
+    // `git init` with no commits: an unborn HEAD. `git log` exits 128 here,
+    // so if a comment example were marked as a shell block, expansion would
+    // fail the run with PromptError.
+    execSync("git init", { cwd: dir, stdio: "ignore" });
+    await runScaffold(dir, { templateName: "blank" });
+
+    const prompt = await readFile(
+      join(dir, ".sandcastle", "prompt.md"),
+      "utf-8",
+    );
+    const layer = silentDisplayLayer();
+    const marked = await Effect.runPromise(
+      substitutePromptArgs(prompt, {}).pipe(Effect.provide(layer)),
+    );
+    const expanded = await Effect.runPromise(
+      preprocessPrompt(marked, makeLocalSandbox(dir), dir).pipe(
+        Effect.provide(layer),
+      ),
+    );
+    expect(expanded).toBe(prompt);
   });
 
   it("blank template main.mts imports from @lengoctu70/sandcastle", async () => {
@@ -378,11 +428,55 @@ describe("InitService scaffold", () => {
       join(dir, ".sandcastle", "main.mts"),
       "utf-8",
     );
-    expect(mainTs).toContain('grok("grok-4.6", { effort: "high" })');
+    // The default sandbox provider is docker — a container always execs
+    // through POSIX `sh`, so grok's execPlatform is pinned to "linux".
+    expect(mainTs).toContain(
+      'grok("grok-4.6", { effort: "high", execPlatform: "linux" })',
+    );
     const settings = JSON.parse(
       await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
     );
     expect(settings.effort).toBe("high");
+  });
+
+  it("pins execPlatform linux in the generated grok() call for container sandboxes", async () => {
+    // A Windows host running a docker/podman sandbox would otherwise
+    // default Grok's execPlatform to "win32" — passing a host temp path to
+    // --prompt-file that does not exist inside the container.
+    for (const providerName of ["docker", "podman"]) {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        agent: grokAgent,
+        model: "grok-4.6",
+        sandboxProvider: getSandboxProvider(providerName),
+      });
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain(
+        `grok("grok-4.6", { execPlatform: "linux" })`,
+      );
+    }
+  });
+
+  it("leaves grok's execPlatform unpinned for host mode", async () => {
+    // Host mode runs the agent through the host's own shell — on Windows
+    // that IS cmd.exe, so the provider must keep its process.platform
+    // default (temp prompt file + `& del`) rather than a POSIX pin.
+    const dir = await makeDir();
+    await runScaffold(dir, {
+      agent: grokAgent,
+      model: "grok-4.6",
+      sandboxProvider: getSandboxProvider("host"),
+      settings: { sandbox: "host" },
+    });
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain('grok("grok-4.6")');
+    expect(mainTs).not.toContain("execPlatform");
   });
 
   it("injects the selected effort into the generated pi() call as thinking", async () => {
@@ -1154,6 +1248,18 @@ describe("InitService scaffold", () => {
       await writeFile(join(dir, "go.mod"), "module example.com/x\n");
       expect(await runDetect(dir)).toEqual(["go test ./..."]);
     });
+
+    it("reads scripts from a package.json with a UTF-8 BOM", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        "\uFEFF" +
+          JSON.stringify({
+            scripts: { typecheck: "tsc --noEmit", test: "vitest" },
+          }),
+      );
+      expect(await runDetect(dir)).toEqual(["npm run typecheck", "npm test"]);
+    });
   });
 
   // ---------------------------------------------------------------------
@@ -1285,6 +1391,143 @@ describe("InitService scaffold", () => {
       expect(await readFile(join(dir, "package.json"), "utf-8")).toBe(
         "not valid json{{{",
       );
+    });
+
+    it("accepts a UTF-8 BOM and preserves it on rewrite", async () => {
+      const dir = await makeDir();
+      const original =
+        "\uFEFF" +
+        JSON.stringify(
+          { name: "bom-project", scripts: { test: "vitest" } },
+          null,
+          2,
+        ) +
+        "\n";
+      await writeFile(join(dir, "package.json"), original);
+
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "added" });
+      const rewritten = await readFile(join(dir, "package.json"), "utf-8");
+      expect(rewritten.startsWith("\uFEFF")).toBe(true);
+      const pkg = JSON.parse(rewritten.slice(1)) as {
+        name?: string;
+        scripts?: Record<string, string>;
+      };
+      expect(pkg.name).toBe("bom-project");
+      expect(pkg.scripts).toEqual({
+        test: "vitest",
+        sandcastle: SANDCASTLE_SCRIPT_COMMAND,
+      });
+    });
+
+    it("preserves CRLF line endings on rewrite", async () => {
+      const dir = await makeDir();
+      const original =
+        '{\r\n  "name": "crlf-project",\r\n  "scripts": {\r\n    "test": "vitest"\r\n  }\r\n}\r\n';
+      await writeFile(join(dir, "package.json"), original);
+
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "added" });
+      const rewritten = await readFile(join(dir, "package.json"), "utf-8");
+      // Every line break is CRLF — no bare LF introduced.
+      expect(rewritten.replaceAll("\r\n", "")).not.toContain("\n");
+      const pkg = JSON.parse(rewritten) as {
+        name?: string;
+        scripts?: Record<string, string>;
+      };
+      expect(pkg.name).toBe("crlf-project");
+      expect(pkg.scripts).toEqual({
+        test: "vitest",
+        sandcastle: SANDCASTLE_SCRIPT_COMMAND,
+      });
+    });
+
+    it("keeps LF line endings LF-only on rewrite", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({ scripts: { test: "vitest" } }, null, 2) + "\n",
+      );
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "added" });
+      const rewritten = await readFile(join(dir, "package.json"), "utf-8");
+      expect(rewritten).not.toContain("\r");
+    });
+
+    it("adds a scripts block to a package.json that has none", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({ name: "no-scripts", version: "0.1.0" }, null, 2),
+      );
+      const outcome = await runEnsure(dir);
+      expect(outcome).toEqual({ kind: "added" });
+      const pkg = await readPkg(dir);
+      expect(pkg.scripts).toEqual({
+        sandcastle: SANDCASTLE_SCRIPT_COMMAND,
+      });
+      expect((pkg as { name?: string }).name).toBe("no-scripts");
+    });
+
+    it.each([
+      { label: "an array", scripts: ["echo a", "echo b"] },
+      { label: "a string", scripts: "npm test" },
+      { label: "null", scripts: null },
+      { label: "a number", scripts: 3 },
+    ])(
+      "reports and preserves malformed scripts ($label)",
+      async ({ scripts }) => {
+        const dir = await makeDir();
+        const original = JSON.stringify({ name: "x", scripts }, null, 2);
+        await writeFile(join(dir, "package.json"), original);
+        const outcome = await runEnsure(dir);
+        expect(outcome).toEqual({ kind: "malformed-scripts" });
+        // Byte-identical — reported, never coerced or overwritten.
+        expect(await readFile(join(dir, "package.json"), "utf-8")).toBe(
+          original,
+        );
+      },
+    );
+
+    it("reports a conflict for a non-string sandcastle entry rather than overwriting it", async () => {
+      const dir = await makeDir();
+      const original = JSON.stringify(
+        { scripts: { sandcastle: 42, test: "vitest" } },
+        null,
+        2,
+      );
+      await writeFile(join(dir, "package.json"), original);
+      const outcome = await runEnsure(dir, { resolution: "ask" });
+      expect(outcome).toEqual({ kind: "conflict", existing: "42" });
+      expect(await readFile(join(dir, "package.json"), "utf-8")).toBe(original);
+    });
+
+    it("keeps a non-string sandcastle entry when resolution is keep", async () => {
+      const dir = await makeDir();
+      const original = JSON.stringify(
+        { scripts: { sandcastle: { run: "echo hi" } } },
+        null,
+        2,
+      );
+      await writeFile(join(dir, "package.json"), original);
+      const outcome = await runEnsure(dir, { resolution: "keep" });
+      expect(outcome).toEqual({ kind: "kept-existing" });
+      expect(await readFile(join(dir, "package.json"), "utf-8")).toBe(original);
+    });
+
+    it("overwrites a non-string sandcastle entry only when resolution is overwrite", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        JSON.stringify({ scripts: { sandcastle: [1, 2], test: "vitest" } }),
+      );
+      const outcome = await runEnsure(dir, { resolution: "overwrite" });
+      expect(outcome).toEqual({ kind: "overwritten" });
+      const pkg = await readPkg(dir);
+      expect(pkg.scripts).toEqual({
+        sandcastle: SANDCASTLE_SCRIPT_COMMAND,
+        test: "vitest",
+      });
     });
   });
 
@@ -2958,6 +3201,17 @@ describe("InitService scaffold", () => {
 
       expect(result.mainFilename).toBe("main.mts");
     });
+
+    it("scaffolds main.ts when package.json has a UTF-8 BOM and type: module", async () => {
+      const dir = await makeDir();
+      await writeFile(
+        join(dir, "package.json"),
+        "\uFEFF" + JSON.stringify({ name: "test", type: "module" }),
+      );
+      const result = await runScaffold(dir);
+
+      expect(result.mainFilename).toBe("main.ts");
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -3227,6 +3481,36 @@ describe("InitService scaffold", () => {
         }
         // planner + per-issue implementer/createSandbox + merger
         expect(mainTs.match(/sandbox: noSandbox\(\)/g)).toHaveLength(3);
+      },
+    );
+
+    it.each(["parallel-planner", "parallel-planner-with-review"])(
+      "host %s merger runs in a dedicated integration worktree, never the active checkout (#32)",
+      async (templateName) => {
+        const dir = await makeDir();
+        await runScaffold(dir, {
+          sandboxProvider: hostProvider,
+          templateName,
+        });
+
+        const mainTs = await readFile(
+          join(dir, ".sandcastle", "main.mts"),
+          "utf-8",
+        );
+        // The merger's run() call — including its conflict repair — must pin
+        // merge-to-head explicitly: the no-sandbox runtime default is `head`,
+        // which would merge inside the user's active checkout (F026/ADR 0021).
+        const mergerName = mainTs.indexOf('name: "merger"');
+        expect(mergerName).toBeGreaterThan(-1);
+        const callStart = mainTs.lastIndexOf("sandcastle.run({", mergerName);
+        const callEnd = mainTs.indexOf("});", mergerName);
+        const mergerCall = mainTs.slice(callStart, callEnd);
+        expect(mergerCall).toContain("sandbox: noSandbox()");
+        expect(mergerCall).toContain(
+          'branchStrategy: { type: "merge-to-head" }',
+        );
+        expect(mergerCall).toContain("copyToWorktree");
+        expect(mergerCall).not.toContain('type: "head"');
       },
     );
 

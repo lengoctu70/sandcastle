@@ -1314,3 +1314,132 @@ describe("worktree.createSandbox()", () => {
     };
   });
 });
+
+// ---------------------------------------------------------------------------
+// F027 (#31): TARGET_BRANCH must always name the host's active branch — the
+// merge target — never the worktree's own source branch. Both the run() and
+// interactive() template-substitution paths resolve it from the host repo.
+// ---------------------------------------------------------------------------
+
+describe("prompt built-in args TARGET_BRANCH / SOURCE_BRANCH (#31, F027)", () => {
+  const PROMPT_TEMPLATE = "TARGET={{TARGET_BRANCH}}|SOURCE={{SOURCE_BRANCH}}";
+
+  /** Bind-mount provider whose exec captures the claude print-mode stdin. */
+  const makePromptCapturingRunProvider = (captured: {
+    stdin?: string;
+  }): SandboxProvider =>
+    createBindMountSandboxProvider({
+      name: "test-prompt-args",
+      create: async (options) => {
+        const handle: BindMountSandboxHandle = {
+          worktreePath: options.worktreePath,
+          exec: async (command, execOptions) => {
+            if (command.startsWith("claude ")) {
+              captured.stdin = execOptions?.stdin ?? "";
+              const streamOutput = toStreamJson("done");
+              if (execOptions?.onLine) {
+                for (const line of streamOutput.split("\n")) {
+                  execOptions.onLine(line);
+                }
+              }
+              return { stdout: streamOutput, stderr: "", exitCode: 0 };
+            }
+            const result = execSync(command, {
+              cwd: execOptions?.cwd ?? options.worktreePath,
+              encoding: "utf-8",
+              stdio: ["pipe", "pipe", "pipe"],
+            });
+            return { stdout: result, stderr: "", exitCode: 0 };
+          },
+          copyFileIn: async () => {},
+          copyFileOut: async () => {},
+          close: async () => {},
+        };
+        return handle;
+      },
+    });
+
+  it("run(): TARGET_BRANCH is the host branch, SOURCE_BRANCH the worktree branch", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "ws-run-args-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+    const promptFile = join(hostDir, "prompt.md");
+    await writeFile(promptFile, PROMPT_TEMPLATE);
+
+    const captured: { stdin?: string } = {};
+    const sandbox = makePromptCapturingRunProvider(captured);
+
+    const ws = await createWorktree({
+      branchStrategy: { type: "branch", branch: "feature-sub" },
+      cwd: hostDir,
+    });
+
+    try {
+      await ws.run({
+        agent: claudeCode("claude-opus-4-8"),
+        sandbox,
+        promptFile,
+        maxIterations: 1,
+      });
+
+      expect(captured.stdin).toContain("TARGET=main");
+      expect(captured.stdin).toContain("SOURCE=feature-sub");
+    } finally {
+      await ws.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
+  it("interactive(): TARGET_BRANCH is the host branch, SOURCE_BRANCH the worktree branch", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "ws-interactive-args-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+    const promptFile = join(hostDir, "prompt.md");
+    await writeFile(promptFile, PROMPT_TEMPLATE);
+
+    const receivedArgs: string[] = [];
+    const provider = createBindMountSandboxProvider({
+      name: "test-interactive-args",
+      create: async (options) => {
+        const handle: BindMountSandboxHandle = {
+          worktreePath: options.worktreePath,
+          exec: async (command, execOptions) => {
+            const result = execSync(command, {
+              cwd: execOptions?.cwd ?? options.worktreePath,
+              encoding: "utf-8",
+              stdio: ["pipe", "pipe", "pipe"],
+            });
+            return { stdout: result, stderr: "", exitCode: 0 };
+          },
+          interactiveExec: async (args) => {
+            receivedArgs.push(...args);
+            return { exitCode: 0 };
+          },
+          copyFileIn: async () => {},
+          copyFileOut: async () => {},
+          close: async () => {},
+        };
+        return handle;
+      },
+    });
+
+    const ws = await createWorktree({
+      branchStrategy: { type: "branch", branch: "interactive-sub" },
+      cwd: hostDir,
+    });
+
+    try {
+      await ws.interactive({
+        agent: claudeCode("claude-opus-4-8"),
+        sandbox: provider,
+        promptFile,
+      });
+
+      const promptArg = receivedArgs.find((a) => a.includes("TARGET="));
+      expect(promptArg).toBe("TARGET=main|SOURCE=interactive-sub");
+    } finally {
+      await ws.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+});

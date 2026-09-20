@@ -1,7 +1,14 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import type { FileSystem } from "@effect/platform";
 import { Cause, Effect, Exit } from "effect";
-import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -19,6 +26,7 @@ import {
   projectSettingsPath,
   saveProjectSettings,
   updateProjectSettings,
+  updateProjectSettingsAsync,
 } from "./ProjectSettings.js";
 import {
   ProjectSettingsIoError,
@@ -61,6 +69,7 @@ const fullSettings = (): ProjectSettings =>
     agent: "claude-code",
     model: "claude-opus-4-8",
     effort: "max",
+    agentExecutable: "claude",
     modelSource: "discovered",
     workflow: "parallel-planner-with-review",
     sandbox: "host",
@@ -113,6 +122,7 @@ describe("ProjectSettings round-trip", () => {
     expect(loaded).toEqual(settings);
     const raw = await readFile(projectSettingsPath(dir), "utf-8");
     expect(raw).not.toContain('"effort"');
+    expect(raw).not.toContain('"agentExecutable"');
     expect(raw).not.toContain('"roleOverrides"');
     // Manual entry is the honest default — never claimed as discovered.
     expect(loaded.modelSource).toBe("manual-unverified");
@@ -130,6 +140,26 @@ describe("ProjectSettings round-trip", () => {
     const second = await readFile(projectSettingsPath(dir), "utf-8");
 
     expect(second).toBe(first);
+  });
+
+  it("round-trips agentExecutable — the probed executable alias (#27)", async () => {
+    const dir = await makeDir();
+    const settings = makeProjectSettings({
+      agent: "grok",
+      model: "grok-4.6",
+      agentExecutable: "agent",
+      modelSource: "discovered",
+      workflow: "simple-loop",
+      sandbox: "host",
+      issueTracker: "github-issues",
+    });
+
+    await run(saveProjectSettings(dir, settings));
+    const loaded = await run(loadProjectSettings(dir));
+
+    expect(loaded).toEqual(settings);
+    const raw = await readFile(projectSettingsPath(dir), "utf-8");
+    expect(raw).toContain('"agentExecutable": "agent"');
   });
 });
 
@@ -197,6 +227,26 @@ describe("scaffold writes initial settings", () => {
 
     const loaded = await run(loadProjectSettings(dir));
     expect(loaded.sandbox).toBe("host");
+  });
+
+  it("persists the probed executable alias from scaffold settings overrides", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, {
+      agent: getAgent("grok")!,
+      model: "grok-4.6",
+      settings: { agentExecutable: "agent", sandbox: "host" },
+    });
+
+    const loaded = await run(loadProjectSettings(dir));
+    expect(loaded.agent).toBe("grok");
+    expect(loaded.agentExecutable).toBe("agent");
+    // And the generated main passes it to the grok() factory options. The
+    // scaffold's codegen provider is docker (the ScaffoldOptions default),
+    // so the container-exec pin rides along too.
+    const main = await readFile(join(dir, ".sandcastle", "main.mts"), "utf-8");
+    expect(main).toContain(
+      'grok("grok-4.6", { executable: "agent", execPlatform: "linux" })',
+    );
   });
 
   it("defaults parallelism to 2 for parallel workflows and 1 otherwise", async () => {
@@ -437,6 +487,147 @@ describe("updateProjectSettings", () => {
         );
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Atomic persistence + serialized updates (F024)
+// ---------------------------------------------------------------------------
+
+describe("settings durability (F024)", () => {
+  it("a failed replacement preserves the previous document, reports the write path, and cleans up temp files", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+    const before = await readFile(projectSettingsPath(dir), "utf-8");
+
+    const sandDir = join(dir, ".sandcastle");
+    await chmod(sandDir, 0o555);
+    // Probe — as root (or without POSIX perms) the dir stays writable and
+    // the fault cannot be injected; stand down rather than assert nothing.
+    const writable = await writeFile(join(sandDir, ".probe"), "x").then(
+      () => true,
+      () => false,
+    );
+    try {
+      if (writable) return;
+
+      const err = await failureOf(
+        saveProjectSettings(dir, { ...fullSettings(), model: "lost-write" }),
+      );
+      expect(err).toBeInstanceOf(ProjectSettingsIoError);
+      const ioErr = err as ProjectSettingsIoError;
+      expect(ioErr.settingsPath).toBe(projectSettingsPath(dir));
+      expect(ioErr.operation).toBe("write");
+      // The diagnostic says the old document survived.
+      expect(ioErr.message).toContain("được giữ nguyên");
+
+      // The prior valid document is byte-for-byte intact; no temp litter.
+      expect(await readFile(projectSettingsPath(dir), "utf-8")).toBe(before);
+      const names = await readdir(sandDir);
+      expect(names.filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      await chmod(sandDir, 0o755).catch(() => {});
+    }
+  });
+
+  it("readers only ever observe a complete document while saves replace it", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+    let done = false;
+
+    const writer = (async () => {
+      for (let i = 0; i < 30; i++) {
+        await run(
+          saveProjectSettings(dir, {
+            ...fullSettings(),
+            model: `model-${i}`,
+            verificationCommands: [`cmd-${i}`, "y".repeat(64 * 1024)],
+          }),
+        );
+      }
+      done = true;
+    })();
+    const reader = (async () => {
+      let reads = 0;
+      while (!done) {
+        // Must never throw malformed — every observed file is complete.
+        const loaded = await run(loadProjectSettings(dir));
+        expect(
+          loaded.model.startsWith("model-") ||
+            loaded.model === "claude-opus-4-8",
+        ).toBe(true);
+        reads++;
+      }
+      expect(reads).toBeGreaterThan(0);
+    })();
+
+    await Promise.all([writer, reader]);
+    expect(
+      (await readdir(join(dir, ".sandcastle"))).filter((n) =>
+        n.endsWith(".tmp"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("serializes concurrent read-modify-writes across the Effect and Promise seams — no lost update", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+
+    let done = false;
+    const reader = (async () => {
+      while (!done) {
+        // Concurrent readers during the storm always parse a full document.
+        await loadProjectSettingsAsync(dir);
+      }
+    })();
+
+    // Eight updates racing on eight DISTINCT fields — if any load→save pair
+    // interleaved, one side's patch would be silently dropped.
+    await Promise.all([
+      run(updateProjectSettings(dir, { model: "claude-sonnet-4-6" })),
+      updateProjectSettingsAsync(dir, { effort: "low" }),
+      run(updateProjectSettings(dir, { parallelism: 2 })),
+      updateProjectSettingsAsync(dir, {
+        verificationCommands: ["make check"],
+      }),
+      run(updateProjectSettings(dir, { verificationStatus: "failed" })),
+      updateProjectSettingsAsync(dir, { workflow: "blank" }),
+      run(updateProjectSettings(dir, { issueTracker: "beads" })),
+      updateProjectSettingsAsync(dir, { agent: "pi" }),
+    ]);
+    done = true;
+    await reader;
+
+    const loaded = await run(loadProjectSettings(dir));
+    expect(loaded).toMatchObject({
+      agent: "pi",
+      model: "claude-sonnet-4-6",
+      effort: "low",
+      workflow: "blank",
+      verificationCommands: ["make check"],
+      verificationStatus: "failed",
+      parallelism: 2,
+      issueTracker: "beads",
+    });
+  });
+
+  it("a failed update inside the serialized chain does not wedge later updates", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+
+    // One update fails validation; the NEXT queued update must still run.
+    const [failed, ok] = await Promise.allSettled([
+      updateProjectSettingsAsync(dir, { parallelism: 99 }),
+      // Ensure ordering: the failing update is submitted first.
+      updateProjectSettingsAsync(dir, { model: "still-works" }),
+    ]);
+
+    expect(failed.status).toBe("rejected");
+    expect((failed as PromiseRejectedResult).reason).toBeInstanceOf(
+      ProjectSettingsValidationError,
+    );
+    expect(ok.status).toBe("fulfilled");
+    expect((await run(loadProjectSettings(dir))).model).toBe("still-works");
   });
 });
 

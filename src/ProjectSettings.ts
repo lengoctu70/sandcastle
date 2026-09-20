@@ -3,6 +3,8 @@ import { NodeFileSystem } from "@effect/platform-node";
 import { Cause, Effect, Exit } from "effect";
 import { join } from "node:path";
 
+import { atomicWriteFile } from "./atomicFile.js";
+
 /**
  * Durable, versioned project settings persisted at
  * `.sandcastle/settings.json` (ADR 0025/0026).
@@ -84,6 +86,13 @@ export interface ProjectSettings {
   readonly model: string;
   /** Optional reasoning effort / model variant the agent supports. */
   readonly effort?: string;
+  /**
+   * The executable name host-mode discovery actually probed for the selected
+   * agent (e.g. `"agent"` when Grok's CLI only answers under its alias).
+   * Persisted so `sandcastle run` invokes the same binary that was
+   * fingerprinted — the agent name alone can resolve to a different product.
+   */
+  readonly agentExecutable?: string;
   readonly modelSource: ModelSource;
   /** Workflow/template identifier chosen at init, e.g. `"simple-loop"`. */
   readonly workflow: string;
@@ -251,6 +260,8 @@ export interface InitialProjectSettings {
   readonly sandbox: SandboxProviderChoice;
   readonly issueTracker: string;
   readonly effort?: string;
+  /** The probed executable name for the agent, when discovery ran (host mode). */
+  readonly agentExecutable?: string;
   /** Defaults to `"manual-unverified"` — init must opt in to `"discovered"` only when it actually queried the agent's live catalog. */
   readonly modelSource?: ModelSource;
   /** Defaults to `[]`. */
@@ -272,6 +283,7 @@ export interface InitialProjectSettings {
  */
 export interface ProjectSettingsInitOverrides {
   readonly effort?: string;
+  readonly agentExecutable?: string;
   readonly modelSource?: ModelSource;
   readonly sandbox?: SandboxProviderChoice;
   readonly verificationCommands?: readonly string[];
@@ -291,6 +303,9 @@ export const makeProjectSettings = (
   agent: init.agent,
   model: init.model,
   ...(init.effort !== undefined ? { effort: init.effort } : {}),
+  ...(init.agentExecutable !== undefined
+    ? { agentExecutable: init.agentExecutable }
+    : {}),
   modelSource: init.modelSource ?? "manual-unverified",
   workflow: init.workflow,
   sandbox: init.sandbox,
@@ -323,8 +338,8 @@ export interface RoleOverrideUpdate {
  * Partial update applied by {@link updateProjectSettings}.
  *
  * - `undefined` leaves a field unchanged.
- * - `null` clears an optional field (`effort`) or removes a role's override
- *   entry inside `roleOverrides`.
+ * - `null` clears an optional field (`effort`, `agentExecutable`) or removes a
+ *   role's override entry inside `roleOverrides`.
  * - `verificationCommands` and each role-override entry replace wholesale
  *   (per-key `null` clears inside a role entry).
  * - `version` is never updatable.
@@ -333,6 +348,7 @@ export interface ProjectSettingsUpdate {
   readonly agent?: string;
   readonly model?: string;
   readonly effort?: string | null;
+  readonly agentExecutable?: string | null;
   readonly modelSource?: ModelSource;
   readonly workflow?: string;
   readonly sandbox?: SandboxProviderChoice;
@@ -415,6 +431,7 @@ const SETTINGS_FIELDS = [
   "agent",
   "model",
   "effort",
+  "agentExecutable",
   "modelSource",
   "workflow",
   "sandbox",
@@ -451,6 +468,15 @@ const validateSettings = (
   let effort: string | undefined;
   if (raw["effort"] !== undefined) {
     effort = requireString(raw["effort"], "effort", fail);
+  }
+
+  let agentExecutable: string | undefined;
+  if (raw["agentExecutable"] !== undefined) {
+    agentExecutable = requireString(
+      raw["agentExecutable"],
+      "agentExecutable",
+      fail,
+    );
   }
 
   const modelSource = raw["modelSource"];
@@ -534,6 +560,7 @@ const validateSettings = (
     agent,
     model,
     ...(effort !== undefined ? { effort } : {}),
+    ...(agentExecutable !== undefined ? { agentExecutable } : {}),
     modelSource: modelSource as ModelSource,
     workflow,
     sandbox: sandbox as SandboxProviderChoice,
@@ -648,6 +675,11 @@ export const loadProjectSettings = (
 /**
  * Write `.sandcastle/settings.json` (creating `.sandcastle/` if needed).
  *
+ * The document is written through {@link atomicWriteFile} — a same-directory
+ * temp file, fsynced, then atomically renamed into place — so readers either
+ * see the complete previous document or the complete new one, and a failed
+ * replacement leaves the old file intact (F024).
+ *
  * Only ever touches the settings file — generated prompts, workflow code, and
  * `.env*` are never rewritten here.
  */
@@ -674,13 +706,16 @@ export const saveProjectSettings = (
           (e) => new ProjectSettingsIoError(path, "write", e.message),
         ),
       );
-    yield* fs
-      .writeFileString(path, serialized)
-      .pipe(
-        Effect.mapError(
-          (e) => new ProjectSettingsIoError(path, "write", e.message),
+    yield* Effect.tryPromise({
+      try: () => atomicWriteFile(path, serialized),
+      catch: (e) =>
+        new ProjectSettingsIoError(
+          path,
+          "write",
+          `${e instanceof Error ? e.message : String(e)} ` +
+            "— tệp cấu hình cũ (nếu có) được giữ nguyên",
         ),
-      );
+    });
   });
 
 const mergeRoleOverride = (
@@ -734,6 +769,12 @@ const applyUpdate = (
     next.effort = update.effort;
   }
 
+  if (update.agentExecutable === null) {
+    delete next.agentExecutable;
+  } else if (update.agentExecutable !== undefined) {
+    next.agentExecutable = update.agentExecutable;
+  }
+
   if (update.roleOverrides !== undefined) {
     const merged: Record<string, RoleOverride> = {
       ...(settings.roleOverrides ?? {}),
@@ -758,8 +799,50 @@ const applyUpdate = (
 };
 
 /**
+ * Per-repo serialization for settings read-modify-write (F024). Every
+ * in-process {@link updateProjectSettings} — Effect or Promise seam — chains
+ * onto the previous update for the same `repoDir`, so each patch applies on
+ * top of the last fully-written document instead of racing an interleaved
+ * load→save pair that silently drops one side's update (e.g. parallel queue
+ * workers persisting `verificationStatus`). Same promise-chain pattern as
+ * `createWorkflowRunLock`; an entry is dropped once the chain settles so the
+ * map never accumulates dead repos.
+ */
+const settingsUpdateChains = new Map<string, Promise<void>>();
+
+const runSerializedSettingsUpdate = <A>(
+  repoDir: string,
+  fn: () => Promise<A>,
+): Promise<A> => {
+  const tail = settingsUpdateChains.get(repoDir) ?? Promise.resolve();
+  const result = tail.then(fn);
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  settingsUpdateChains.set(repoDir, settled);
+  void settled.then(() => {
+    if (settingsUpdateChains.get(repoDir) === settled) {
+      settingsUpdateChains.delete(repoDir);
+    }
+  });
+  return result;
+};
+
+const isProjectSettingsError = (e: unknown): e is ProjectSettingsError =>
+  e instanceof ProjectSettingsNotFoundError ||
+  e instanceof ProjectSettingsMalformedError ||
+  e instanceof ProjectSettingsUnsupportedVersionError ||
+  e instanceof ProjectSettingsIoError ||
+  e instanceof ProjectSettingsValidationError;
+
+/**
  * Load, patch, and re-save `.sandcastle/settings.json`, returning the updated
  * settings. See {@link ProjectSettingsUpdate} for patch semantics.
+ *
+ * The whole read-modify-write runs inside a per-repo process lock
+ * ({@link runSerializedSettingsUpdate}) shared by the Effect and Promise
+ * seams — concurrent callers in one process cannot lose an update.
  */
 export const updateProjectSettings = (
   repoDir: string,
@@ -770,10 +853,31 @@ export const updateProjectSettings = (
   FileSystem.FileSystem
 > =>
   Effect.gen(function* () {
-    const current = yield* loadProjectSettings(repoDir);
-    const next = applyUpdate(current, update);
-    yield* saveProjectSettings(repoDir, next);
-    return next;
+    const fs = yield* FileSystem.FileSystem;
+    const rmw = Effect.gen(function* () {
+      const current = yield* loadProjectSettings(repoDir);
+      const next = applyUpdate(current, update);
+      yield* saveProjectSettings(repoDir, next);
+      return next;
+    }).pipe(Effect.provideService(FileSystem.FileSystem, fs));
+    return yield* Effect.tryPromise({
+      try: () =>
+        runSerializedSettingsUpdate(repoDir, async () => {
+          const exit = await Effect.runPromiseExit(rmw);
+          if (Exit.isSuccess(exit)) return exit.value;
+          // Squash back to the underlying settings error so callers keep the
+          // typed failure instead of a FiberFailure.
+          throw Cause.squash(exit.cause);
+        }),
+      catch: (e) =>
+        isProjectSettingsError(e)
+          ? e
+          : new ProjectSettingsIoError(
+              projectSettingsPath(repoDir),
+              "write",
+              e instanceof Error ? e.message : String(e),
+            ),
+    });
   });
 
 // ---------------------------------------------------------------------------

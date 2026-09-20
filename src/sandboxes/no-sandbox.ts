@@ -13,10 +13,10 @@
  * Process-tree teardown: every process spawned through the handle is tracked
  * for the handle's lifetime. On POSIX the shell is spawned `detached`, making
  * it a process-group leader, so `close()` — and cancellation, idle timeout,
- * and completion timeout, which all funnel through `close()` in the sandbox
- * lifecycle — can signal the whole group (shell, agent, and every descendant)
- * via `kill(-pgid)`. On Windows there are no process groups, so termination
- * shells out to `taskkill /PID <pid> /T /F` which walks the process tree.
+ * and completion timeout, which abort the exec's AbortSignal — can signal
+ * the whole group (shell, agent, and every descendant) via `kill(-pgid)`.
+ * On Windows there are no process groups, so termination shells out to
+ * `taskkill /PID <pid> /T /F` which walks the process tree.
  * `close()` sends SIGTERM first, then SIGKILLs whatever is still alive after
  * `terminationGraceMs`.
  */
@@ -39,6 +39,22 @@ import { registerShutdown } from "../shutdownRegistry.js";
 
 /** Default delay between SIGTERM and SIGKILL when tearing down a host process tree. */
 const DEFAULT_TERMINATION_GRACE_MS = 1_000;
+
+/**
+ * Map a child "close" event's `(code, signal)` pair to a truthful exit code.
+ * Signal termination (`code === null`) is never success: report the
+ * conventional `128 + n` (SIGKILL → 137, SIGTERM → 143), or 1 for any other
+ * signal.
+ */
+const exitCodeFromClose = (
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): number => {
+  if (code !== null) return code;
+  if (signal === "SIGKILL") return 137;
+  if (signal === "SIGTERM") return 143;
+  return 1;
+};
 
 export interface NoSandboxOptions {
   /** Environment variables injected by this provider. Merged at launch time. */
@@ -126,8 +142,10 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
      *     which point the probe fails with ESRCH and we skip.
      * POSIX, no pgid (interactive exec): signal only the direct child — its
      *   descendants share OUR process group, so a group signal would kill
-     *   Sandcastle itself. A child that re-grouped itself is covered by the
-     *   `-pid` attempt, which is a harmless ESRCH when no such group exists.
+     *   Sandcastle itself. There is deliberately no `kill(-pid)` fallback:
+     *   a non-detached child was never a group leader, so if it already
+     *   exited its pid may have been recycled as an unrelated group's pgid
+     *   and signalling it would kill unrelated host processes.
      * Windows: `taskkill /PID <pid> /T /F` kills the process and every
      *   descendant it started. `spawnSync` keeps it usable from the
      *   synchronous shutdown callback.
@@ -168,11 +186,6 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
         entry.proc.kill(signal);
       } catch {
         /* already exited */
-      }
-      try {
-        process.kill(-pid, signal);
-      } catch {
-        /* ESRCH — expected for non-detached children */
       }
     };
 
@@ -297,7 +310,15 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
             }
           }
 
+          // The child may exit while the prompt is still being written,
+          // surfacing as an EPIPE error on proc.stdin. Capture it instead of
+          // letting it crash the host as an unhandled stream error; the close
+          // handler folds it into a non-zero invocation result.
+          let stdinError: Error | undefined;
           if (opts?.stdin !== undefined) {
+            proc.stdin!.on("error", (error: Error) => {
+              stdinError = error;
+            });
             proc.stdin!.write(opts.stdin);
             proc.stdin!.end();
           }
@@ -305,6 +326,26 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
           proc.on("error", (error) => {
             reject(new Error(`exec failed: ${error.message}`));
           });
+
+          const finish = (
+            stdout: string,
+            stderr: string,
+            code: number | null,
+            signal: NodeJS.Signals | null,
+          ): void => {
+            const exitCode = exitCodeFromClose(code, signal);
+            resolve({
+              stdout,
+              stderr:
+                stdinError === undefined
+                  ? stderr
+                  : `${stderr}\nstdin write failed: ${stdinError.message}`,
+              // A prompt that never reached the child is an invocation
+              // failure even when the child's own exit code was 0.
+              exitCode:
+                stdinError !== undefined && exitCode === 0 ? 1 : exitCode,
+            });
+          };
 
           if (opts?.onLine) {
             const onLine = opts.onLine;
@@ -318,12 +359,13 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
             proc.stderr!.on("data", (chunk: Buffer) => {
               stderrTail.push(chunk.toString());
             });
-            proc.on("close", (code) => {
-              resolve({
-                stdout: stdoutTail.toString(),
-                stderr: stderrTail.toString(),
-                exitCode: code ?? 0,
-              });
+            proc.on("close", (code, signal) => {
+              finish(
+                stdoutTail.toString(),
+                stderrTail.toString(),
+                code,
+                signal,
+              );
             });
           } else {
             const stdoutChunks: string[] = [];
@@ -334,12 +376,13 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
             proc.stderr!.on("data", (chunk: Buffer) => {
               stderrChunks.push(chunk.toString());
             });
-            proc.on("close", (code) => {
-              resolve({
-                stdout: stdoutChunks.join(""),
-                stderr: stderrChunks.join(""),
-                exitCode: code ?? 0,
-              });
+            proc.on("close", (code, signal) => {
+              finish(
+                stdoutChunks.join(""),
+                stderrChunks.join(""),
+                code,
+                signal,
+              );
             });
           }
         });
@@ -376,9 +419,12 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
             reject(new Error(`exec failed: ${error.message}`));
           });
 
-          proc.on("close", (code: number | null) => {
-            resolve({ exitCode: code ?? 0 });
-          });
+          proc.on(
+            "close",
+            (code: number | null, signal: NodeJS.Signals | null) => {
+              resolve({ exitCode: exitCodeFromClose(code, signal) });
+            },
+          );
         });
       },
 

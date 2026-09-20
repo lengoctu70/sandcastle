@@ -56,6 +56,15 @@ describe("detectPackageManager", () => {
     );
     expect(await detect(dir)).toBe("yarn");
   });
+
+  it("reads the packageManager field from a package.json with a UTF-8 BOM", async () => {
+    const dir = await makeDir();
+    await writeFile(
+      join(dir, "package.json"),
+      "\uFEFF" + JSON.stringify({ name: "test", packageManager: "pnpm@9.1.0" }),
+    );
+    expect(await detect(dir)).toBe("pnpm");
+  });
 });
 
 describe("addDependencyCommand", () => {
@@ -100,6 +109,15 @@ describe("hostHasDependency", () => {
       expect(await has(dir, "zod")).toBe(true);
     },
   );
+
+  it("reads dependencies from a package.json with a UTF-8 BOM", async () => {
+    const dir = await makeDir();
+    await writeFile(
+      join(dir, "package.json"),
+      "\uFEFF" + JSON.stringify({ name: "test", dependencies: { zod: "^3" } }),
+    );
+    expect(await has(dir, "zod")).toBe(true);
+  });
 });
 
 describe("getTemplateDependencies", () => {

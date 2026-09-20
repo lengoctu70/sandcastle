@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Effect } from "effect";
 import type {
   AgentDiscoveryAdapter,
@@ -18,12 +21,13 @@ import { DiscoveryError } from "./contract.js";
  *    `GitHub Copilot` product mark (the help banner/description carries it).
  * 3. Auth — the CLI exposes no login-status command. Its documented
  *    credential order is `COPILOT_GITHUB_TOKEN` → `GH_TOKEN` →
- *    `GITHUB_TOKEN` → OAuth token in the OS credential store → `gh` CLI
- *    fallback. Discovery can verify the env vars directly and the `gh`
- *    fallback via `gh auth status`; a token stored only in the OS keychain
- *    cannot be probed read-only, so that shape reports `unauthenticated`
- *    with `copilot login` guidance (a false negative the user resolves by
- *    logging in — never a false "ready").
+ *    `GITHUB_TOKEN` → OAuth token written by `copilot login` → `gh` CLI
+ *    fallback. Discovery verifies the env vars directly, then the native
+ *    login by reading `<COPILOT_HOME|~/.copilot>/config.json`'s documented
+ *    `loggedInUsers` application-state field — it records `copilot login`
+ *    accounts (`{host, login}`) whether the token went to the OS keychain
+ *    or the plaintext fallback, and contains no secret material itself.
+ *    The `gh` fallback is probed via `gh auth status`.
  * 4. Catalog — Copilot CLI has no model-list command (the model list is
  *    hydrated per-account inside the session UI), so the report is `ready`
  *    with an empty `models` catalog: init keeps the `--model` flag or
@@ -80,6 +84,9 @@ const firstNonEmptyLine = (text: string): string | undefined =>
     .map((line) => line.trim())
     .find((line) => line.length > 0);
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
 const stderrTail = (res: DiscoveryExecResult): string => {
   const tail = (res.stderr || res.stdout)
     .trim()
@@ -124,9 +131,50 @@ const baseReport = (
 });
 
 /**
- * Auth probe. Returns the env var name when a token is configured; otherwise
- * runs `gh auth status` — Copilot's documented lowest-priority credential
- * source — and reports whether a GitHub login is usable.
+ * Read the CLI's own login record. `copilot login` writes the OAuth token to
+ * the OS credential store (service `copilot-cli`) — or to `config.json` when
+ * the user opted into plaintext storage — and records the account in
+ * `config.json`'s `loggedInUsers` field (documented shape:
+ * `[{ host, login }]`; `lastLoggedInUser` marks the active entry). Only the
+ * non-secret `host`/`login` fields are read — token material is never
+ * surfaced, printed, or persisted.
+ */
+const probeNativeLogin = async (): Promise<
+  { readonly login?: string; readonly host?: string } | undefined
+> => {
+  const copilotHome = process.env.COPILOT_HOME?.trim();
+  const configDir =
+    copilotHome !== undefined && copilotHome.length > 0
+      ? copilotHome
+      : join(homedir(), ".copilot");
+  try {
+    const raw = await readFile(join(configDir, "config.json"), "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed)) return undefined;
+    const users = parsed["loggedInUsers"];
+    if (!Array.isArray(users) || users.length === 0) return undefined;
+    const active = isRecord(parsed["lastLoggedInUser"])
+      ? parsed["lastLoggedInUser"]
+      : users.find(isRecord);
+    if (!isRecord(active)) return {};
+    return {
+      ...(typeof active["login"] === "string" && active["login"].length > 0
+        ? { login: active["login"] }
+        : {}),
+      ...(typeof active["host"] === "string" && active["host"].length > 0
+        ? { host: active["host"] }
+        : {}),
+    };
+  } catch {
+    // Missing/malformed config.json is data — no native login recorded.
+    return undefined;
+  }
+};
+
+/**
+ * Auth probe, in the CLI's documented credential precedence: token env vars,
+ * then the account `copilot login` recorded in `config.json`, then the `gh`
+ * CLI fallback via `gh auth status`.
  */
 const probeAuth = (
   exec: DiscoveryExec,
@@ -146,6 +194,17 @@ const probeAuth = (
       return {
         authenticated: true as const,
         authDetail: `${envVar} (biến môi trường)`,
+      };
+    }
+    const native = yield* Effect.promise(probeNativeLogin);
+    if (native !== undefined) {
+      const account =
+        native.login !== undefined
+          ? ` (${native.login}${native.host !== undefined ? ` @ ${native.host}` : ""})`
+          : "";
+      return {
+        authenticated: true as const,
+        authDetail: `copilot login${account} (token trong credential store của hệ điều hành)`,
       };
     }
     const ghRes = yield* runProbe(exec, "gh", ["auth", "status"], {

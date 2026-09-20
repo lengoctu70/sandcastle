@@ -1,0 +1,3 @@
+Checking the worktree for pending changes…
+Running npm test to verify the fix
+All done. <promise>COMPLETE</promise>

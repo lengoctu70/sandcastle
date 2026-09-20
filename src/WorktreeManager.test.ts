@@ -24,6 +24,7 @@ import {
   pruneStale,
   remove,
   sanitizeName,
+  withWorktreeMutationLock,
 } from "./WorktreeManager.js";
 
 const execAsync = promisify(exec);
@@ -793,6 +794,66 @@ describe("WorktreeManager.pruneStale", () => {
     expect(s.isDirectory()).toBe(true);
 
     await run(remove(path));
+  });
+
+  it("never sweeps a half-created worktree — create/prune share one mutation mutex (#32)", async () => {
+    const repoDir = await setupRepo();
+    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+    const inflightPath = join(worktreesDir, "sibling-inflight");
+
+    // Deterministic barrier around the mutation seam: a sibling holds the
+    // worktree-mutation mutex with its directory on disk but not yet
+    // registered with git — the exact window `git worktree add` passes
+    // through mid-create, where an unsynchronized prune would call it an
+    // orphan and delete it.
+    let enteredInflight!: () => void;
+    let releaseInflight!: () => void;
+    const entered = new Promise<void>((r) => (enteredInflight = r));
+    const release = new Promise<void>((r) => (releaseInflight = r));
+
+    const inflight = Effect.runPromise(
+      withWorktreeMutationLock(
+        Effect.promise(async () => {
+          await mkdir(inflightPath);
+          enteredInflight();
+          await release;
+          // Register for real — `git worktree add` completing.
+          await execAsync(
+            `git worktree add -b sibling-branch "${inflightPath}" HEAD`,
+            { cwd: repoDir },
+          );
+        }),
+      ),
+    );
+
+    await entered;
+
+    // The concurrent prune must queue behind the whole critical section —
+    // it can never observe the exists-but-unregistered window.
+    let pruneSettled = false;
+    const prune = run(pruneStale(repoDir)).then((v) => {
+      pruneSettled = true;
+      return v;
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(pruneSettled).toBe(false);
+
+    releaseInflight();
+    await inflight;
+    await prune;
+
+    // The sibling's worktree survived: registered before the sweep ran,
+    // never deleted.
+    const s = await stat(inflightPath);
+    expect(s.isDirectory()).toBe(true);
+    const { stdout } = await execAsync("git worktree list --porcelain", {
+      cwd: repoDir,
+    });
+    expect(stdout).toContain(inflightPath);
+
+    await run(remove(inflightPath));
+    await execAsync("git branch -D sibling-branch", { cwd: repoDir });
   });
 });
 
