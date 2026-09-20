@@ -65,6 +65,18 @@ const gitOrUndefined = async (
 export const RECOVERY_STATE_VERSION = 1;
 
 /**
+ * The durable post-landing states (#37/F013): which GitHub completion step
+ * is still outstanding after the code has reached the target branch.
+ * `landed-awaiting-report` → report not yet posted (close still pending
+ * after it); `landed-awaiting-close` → report posted, only the close is
+ * unfinished. "Fully complete" never appears on disk — the record is
+ * removed once report + close both succeed.
+ */
+export type RecoveryLandingState =
+  | "landed-awaiting-report"
+  | "landed-awaiting-close";
+
+/**
  * The durable record of one failed task. `version` and `retryCount` were added
  * for #19 — {@link parseRecoveryState} fills defaults so records written
  * before those fields existed still load.
@@ -107,6 +119,33 @@ export interface RecoveryState {
   readonly retryCount: number;
   /** ISO timestamp of the failure that wrote this record. */
   readonly failedAt: string;
+  /**
+   * Post-landing GitHub completion state (#37/F013). Absent while the run
+   * stopped before landing — records written before this field existed
+   * parse as pre-landing, which they all are.
+   *
+   * Once the target branch carries the work, the remaining durable steps
+   * are GitHub-side (ADR 0023): post the completion report, then close the
+   * issue. `landed-awaiting-report` means the report still needs posting
+   * (and then the close); `landed-awaiting-close` means the report is
+   * posted and only the close remains. There is deliberately no persisted
+   * "fully complete" state — the record is deleted via
+   * {@link clearRecoveryState} once the issue is closed.
+   *
+   * Always written together with `landedSha` and `reportBody`; the parser
+   * rejects a landed record missing either (a half-populated post-landing
+   * record can never finish the GitHub phase, so it surfaces as corrupt
+   * rather than silently degrading to a re-implementation).
+   */
+  readonly landingState?: RecoveryLandingState;
+  /** The target branch's tip after landing — what the report announced. */
+  readonly landedSha?: string;
+  /**
+   * The exact completion-report body captured at landing time. A retry
+   * re-posts it verbatim instead of rebuilding it from artifacts (commits,
+   * worktree, integration base) that may already be cleaned up.
+   */
+  readonly reportBody?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +175,11 @@ const WORKFLOW_PHASES: ReadonlySet<string> = new Set([
   "integration-verification",
   "landing",
   "reporting",
+]);
+
+const LANDING_STATES: ReadonlySet<string> = new Set([
+  "landed-awaiting-report",
+  "landed-awaiting-close",
 ]);
 
 export type ParseRecoveryResult =
@@ -282,6 +326,27 @@ export const parseRecoveryState = (raw: unknown): ParseRecoveryResult => {
       detail: "trường `integrationVerification` không hợp lệ",
     };
   }
+  const landingState = obj["landingState"];
+  if (
+    landingState !== undefined &&
+    (typeof landingState !== "string" || !LANDING_STATES.has(landingState))
+  ) {
+    return { ok: false, detail: "trường `landingState` không hợp lệ" };
+  }
+  const landedSha = optionalString(obj["landedSha"]);
+  const reportBody = optionalString(obj["reportBody"]);
+  if (
+    landingState !== undefined &&
+    (landedSha === undefined || reportBody === undefined)
+  ) {
+    // A landed record without its report material can never finish the
+    // GitHub phase on retry — surface it as corrupt rather than degrade to
+    // a re-implementation.
+    return {
+      ok: false,
+      detail: "bản ghi đã merge thiếu trường `landedSha`/`reportBody`",
+    };
+  }
   const retryCount = obj["retryCount"];
   return {
     ok: true,
@@ -312,6 +377,11 @@ export const parseRecoveryState = (raw: unknown): ParseRecoveryResult => {
       ...(optionalString(obj["logFilePath"]) !== undefined
         ? { logFilePath: optionalString(obj["logFilePath"]) }
         : {}),
+      ...(landingState !== undefined
+        ? { landingState: landingState as RecoveryLandingState }
+        : {}),
+      ...(landedSha !== undefined ? { landedSha } : {}),
+      ...(reportBody !== undefined ? { reportBody } : {}),
       attempts,
       retryCount:
         typeof retryCount === "number" &&

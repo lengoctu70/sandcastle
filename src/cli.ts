@@ -1543,10 +1543,20 @@ const formatRecoveryEntry = async (
   }
   const s = entry.state;
   const probe = await probeRecoveryArtifacts(cwd, s);
+  const retrySuffix = s.retryCount > 0 ? ` — đã retry ${s.retryCount} lần` : "";
   const lines = [
     `• Issue #${s.issue.number} — ${s.issue.title}`,
-    `  Dừng ở bước "${PHASE_LABEL[s.failurePhase]}" lúc ${s.failedAt}` +
-      (s.retryCount > 0 ? ` — đã retry ${s.retryCount} lần` : ""),
+    s.landingState === undefined
+      ? `  Dừng ở bước "${PHASE_LABEL[s.failurePhase]}" lúc ${s.failedAt}${retrySuffix}`
+      : // Post-landing record (#37): the work is already on the target
+        // branch — what remains is a GitHub step, not a failure phase.
+        `  Đã merge vào \`${s.targetBranch}\`` +
+          (s.landedSha !== undefined ? ` (${s.landedSha.slice(0, 8)})` : "") +
+          ` — ${
+            s.landingState === "landed-awaiting-report"
+              ? "chờ đăng báo cáo hoàn thành rồi đóng issue"
+              : "báo cáo đã đăng — chờ đóng issue"
+          } lúc ${s.failedAt}${retrySuffix}`,
     `  Nhánh \`${s.sourceBranch}\`${probe.branchExists ? "" : " (đã mất)"}` +
       ` · Worktree \`${s.worktreePath ?? "—"}\`` +
       (s.worktreePath !== undefined && !probe.worktreeExists
@@ -1555,23 +1565,29 @@ const formatRecoveryEntry = async (
     `  Sửa tự động đã dùng: xác minh ${s.attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
       ` · xung đột merge ${s.attempts.mergeConflictRepair}/${MAX_MERGE_CONFLICT_REPAIR_ATTEMPTS}` +
       ` · dựng lại tích hợp ${s.attempts.integrationRebuild}/${MAX_TARGET_REBUILD_ATTEMPTS}`,
-    `  Lỗi: ${firstLineOf(s.error)}`,
+    `  ${s.landingState === undefined ? "Lỗi" : "Chi tiết"}: ${firstLineOf(s.error)}`,
   ];
-  const stale: string[] = [];
-  if (!probe.branchExists) stale.push("nhánh nguồn đã mất");
-  if (probe.landedOrEmpty) {
-    stale.push(
-      "nhánh không còn commit chưa merge (có thể đã merge ở nơi khác)",
+  if (s.landingState !== undefined) {
+    lines.push(
+      "  Retry chỉ hoàn tất các bước GitHub (đăng báo cáo/đóng issue) — không chạy lại agent hay merge lại.",
     );
+  } else {
+    const stale: string[] = [];
+    if (!probe.branchExists) stale.push("nhánh nguồn đã mất");
+    if (probe.landedOrEmpty) {
+      stale.push(
+        "nhánh không còn commit chưa merge (có thể đã merge ở nơi khác)",
+      );
+    }
+    if (
+      s.worktreePath !== undefined &&
+      !probe.worktreeExists &&
+      probe.branchExists
+    ) {
+      stale.push("worktree đã mất — retry sẽ dựng lại từ nhánh");
+    }
+    if (stale.length > 0) lines.push(`  ⚠ Lỗi thời: ${stale.join("; ")}.`);
   }
-  if (
-    s.worktreePath !== undefined &&
-    !probe.worktreeExists &&
-    probe.branchExists
-  ) {
-    stale.push("worktree đã mất — retry sẽ dựng lại từ nhánh");
-  }
-  if (stale.length > 0) lines.push(`  ⚠ Lỗi thời: ${stale.join("; ")}.`);
   return lines.join("\n");
 };
 
@@ -1719,6 +1735,13 @@ const discardCommand = Command.make(
         );
       }
       yield* d.text(`  • Bản ghi ${recoveryStatePath(cwd, issueNumber)}`);
+      if (state.landingState !== undefined) {
+        yield* d.text(
+          `  ⚠ Công việc đã merge vào \`${state.targetBranch}\` — xóa bản ghi sẽ ` +
+            `bỏ qua bước GitHub còn lại (${state.landingState === "landed-awaiting-report" ? "đăng báo cáo + đóng issue" : "đóng issue"}); ` +
+            "issue sẽ cần xử lý thủ công trên GitHub.",
+        );
+      }
 
       let confirmed = yes;
       if (!confirmed) {
