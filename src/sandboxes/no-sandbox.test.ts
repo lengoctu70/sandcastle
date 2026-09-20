@@ -504,6 +504,103 @@ describe("noSandbox", () => {
   });
 
   /**
+   * Invocation outcome truthfulness: stream errors, signal termination, and
+   * mid-teardown states must all surface as honest results — never a crash
+   * or a disguised success.
+   */
+  describe("invocation outcomes", () => {
+    itPosix(
+      "early child exit during stdin write resolves as a non-zero failure, not a crash",
+      async () => {
+        const handle = await noSandbox().create({
+          worktreePath: process.cwd(),
+          env: {},
+        });
+        // The child closes its stdin and exits immediately, so the prompt
+        // write fails with EPIPE. That must surface as an invocation
+        // failure — never an unhandled stream error.
+        const result = await handle.exec("exec 0<&-; exit 0", {
+          stdin: "x".repeat(1 << 20),
+          onLine: () => {},
+        });
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain("stdin write failed");
+      },
+    );
+
+    itPosix(
+      "early child exit during stdin write fails the non-streaming exec too",
+      async () => {
+        const handle = await noSandbox().create({
+          worktreePath: process.cwd(),
+          env: {},
+        });
+        const result = await handle.exec("exec 0<&-; exit 0", {
+          stdin: "x".repeat(1 << 20),
+        });
+        expect(result.exitCode).not.toBe(0);
+      },
+    );
+
+    itWindows(
+      "early child exit during stdin write does not crash",
+      async () => {
+        const handle = await noSandbox().create({
+          worktreePath: process.cwd(),
+          env: {},
+        });
+        // cmd.exe exits while a large prompt is still being written; the
+        // exec must resolve — never an unhandled EPIPE.
+        await expect(
+          handle.exec("exit 0", { stdin: "x".repeat(1 << 20) }),
+        ).resolves.toBeDefined();
+      },
+    );
+
+    itPosix("signal termination reports a non-zero exit code", async () => {
+      const handle = await noSandbox().create({
+        worktreePath: process.cwd(),
+        env: {},
+      });
+
+      const termResult = await handle.exec("kill -TERM $$");
+      expect(termResult.exitCode).toBe(143);
+      const killResult = await handle.exec("kill -KILL $$");
+      expect(killResult.exitCode).toBe(137);
+    });
+
+    itPosix(
+      "abort escalates to SIGKILL when the tree ignores SIGTERM",
+      async () => {
+        const dir = await mkdtemp(join(tmpdir(), "no-sandbox-abort-kill-"));
+        try {
+          const handle = await noSandbox({ terminationGraceMs: 100 }).create({
+            worktreePath: dir,
+            env: {},
+          });
+          const ac = new AbortController();
+          // TERM is ignored — only the escalated SIGKILL can reap it.
+          const execPromise = handle.exec(
+            `trap "" TERM; echo $$ > "${join(dir, "shell.pid")}"; sleep 60`,
+            { signal: ac.signal },
+          );
+          const pids = await waitForPids(dir, "shell.pid");
+          expect(pidAlive(pids["shell.pid"]!)).toBe(true);
+
+          ac.abort();
+          const result = await execPromise;
+          // Killed by SIGKILL — mapped to 137, never reported as success.
+          expect(result.exitCode).toBe(137);
+          await expectTreeDead(pids);
+          await handle.close();
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+
+  /**
    * End-to-end wiring: run()'s cancellation and timeout paths must reach the
    * no-sandbox handle's termination — nothing may be left running on the host.
    */
@@ -619,5 +716,70 @@ describe("noSandbox", () => {
         await rm(dir, { recursive: true, force: true });
       }
     });
+
+    itPosix(
+      "completion timeout kills a descendant that inherited the stdout pipe",
+      async () => {
+        const dir = await mkdtemp(join(tmpdir(), "no-sandbox-run-pipes-"));
+        await initRepo(dir);
+        try {
+          const result = await run({
+            // The leader emits the signal and exits; the backgrounded sleep
+            // holds the inherited stdout pipe open so "close" never fires —
+            // the classic ADR 0019 hang. The completion timeout must abort
+            // the exec and reap the whole tree before the run returns.
+            agent: shellAgent(
+              `echo "<promise>COMPLETE</promise>"; ` +
+                `sleep 60 & echo $! > "${join(dir, "sleeper.pid")}"; ` +
+                `exit 0`,
+            ),
+            sandbox: noSandbox({ terminationGraceMs: 100 }),
+            prompt: "work",
+            cwd: dir,
+            idleTimeoutSeconds: 30,
+            completionTimeoutSeconds: 0.2,
+            logging: { type: "file", path: join(dir, "run.log") },
+          });
+          expect(result.completionSignal).toBe("<promise>COMPLETE</promise>");
+          const pids = await waitForPids(dir, "sleeper.pid");
+          await expectTreeDead(pids);
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    itPosix(
+      "trailing output keeps resetting the completion silence window (ADR 0019)",
+      async () => {
+        const dir = await mkdtemp(join(tmpdir(), "no-sandbox-run-trail-"));
+        await initRepo(dir);
+        try {
+          const result = await run({
+            // Output lands every ~0.2s — each line inside the 0.4s silence
+            // window resets it, so the run exits naturally with everything
+            // captured instead of force-completing mid-stream.
+            agent: shellAgent(
+              `echo "<promise>COMPLETE</promise>"; ` +
+                `sleep 0.2; echo "TRAIL1"; ` +
+                `sleep 0.25; echo "TRAIL2"; ` +
+                `sleep 0.1`,
+            ),
+            sandbox: noSandbox({ terminationGraceMs: 100 }),
+            prompt: "work",
+            cwd: dir,
+            idleTimeoutSeconds: 30,
+            completionTimeoutSeconds: 0.4,
+            logging: { type: "file", path: join(dir, "run.log") },
+          });
+          expect(result.completionSignal).toBe("<promise>COMPLETE</promise>");
+          // Emitted after the first silence window would have expired —
+          // only present because each trailing line reset the timer.
+          expect(result.stdout).toContain("TRAIL2");
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      },
+    );
   });
 });
