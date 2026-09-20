@@ -279,6 +279,135 @@ console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <pr
   await chmod(shim, 0o755);
 };
 
+/**
+ * Fake `docker`/`podman` — the container-runtime process boundary (F062).
+ * Tracks the `-v host:sandbox` mounts each `run` registered for a container,
+ * then honors `exec -w <sandbox-cwd>` by running `sh -c <cmd>` on the HOST in
+ * the directory that mount maps the sandbox cwd to — so a test can see both
+ * that verification went through the runtime boundary AND which stage's
+ * worktree each invocation was bound to (the resolved host cwd is logged).
+ *
+ * Answers the exact subcommands Sandcastle issues:
+ * - `image inspect` → success (image exists, no USER check)
+ * - `ps` → empty output (no name collisions)
+ * - `run -d --name X ... -v host:sandbox ...` → records mounts under $FAKE_CTR_STATE
+ * - `exec [--user u] [-i] [-w cwd] X sh -c CMD` → `sh -c CMD` at the mapped
+ *   host cwd, piping our own stdin through; `--user 0:0` execs are no-ops
+ *   (file-mount parent setup — unused with no user mounts)
+ * - `cp A B` → cp on the host with `X:sandbox` args mapped like exec's cwd
+ * - `stop`/`rm`/`rm -f` → success, drops the recorded container
+ * Every call is logged as `<runtime> <args>` to $FAKE_CTR_LOG (the shared
+ * call log) so tests can assert invocation order and per-stage binding.
+ */
+const writeFakeContainerRuntime = async (dir: string, name: string) => {
+  const shim = join(dir, name);
+  await writeFile(
+    shim,
+    `#!/usr/bin/env node
+const fs = require("fs");
+const cp = require("child_process");
+const path = require("path");
+const runtime = path.basename(process.argv[1]);
+const args = process.argv.slice(2);
+const log = process.env.FAKE_CTR_LOG;
+const stateFile = process.env.FAKE_CTR_STATE;
+const append = (l) => { if (log) fs.appendFileSync(log, l + "\\n"); };
+const load = () =>
+  stateFile && fs.existsSync(stateFile)
+    ? JSON.parse(fs.readFileSync(stateFile, "utf-8"))
+    : { containers: {} };
+const save = (s) => { if (stateFile) fs.writeFileSync(stateFile, JSON.stringify(s)); };
+// Map a sandbox path to its host path via the container's recorded mounts
+// (longest-prefix wins, like nested bind mounts do).
+const mapPath = (c, p) => {
+  let best = null;
+  for (const sb of Object.keys(c.mounts)) {
+    if ((p === sb || p.startsWith(sb + "/")) && (best === null || sb.length > best.length)) best = sb;
+  }
+  return best === null ? null : c.mounts[best] + p.slice(best.length);
+};
+const cmd = args[0];
+if (cmd === "image" && args[1] === "inspect") { append(runtime + " image inspect"); process.exit(0); }
+if (cmd === "machine" && args[1] === "list") { append(runtime + " machine list"); console.log(JSON.stringify([{ Name: "fake", Running: true }])); process.exit(0); }
+if (cmd === "ps") { append(runtime + " ps"); process.exit(0); }
+if (cmd === "run") {
+  const name = args[args.indexOf("--name") + 1];
+  const mounts = {};
+  const env = {};
+  for (let i = 1; i < args.length - 1; i++) {
+    if (args[i] === "-v" || args[i] === "--volume") {
+      const parts = args[i + 1].split(":");
+      mounts[parts[1]] = parts[0];
+    } else if (args[i] === "-e") {
+      const kv = args[i + 1].split("=");
+      env[kv[0]] = kv.slice(1).join("=");
+    }
+  }
+  const s = load();
+  s.containers[name] = { mounts, env };
+  save(s);
+  append(runtime + " run " + name);
+  process.exit(0);
+}
+if (cmd === "exec") {
+  let i = 1, cwd, user;
+  while (i < args.length) {
+    if (args[i] === "--user") { user = args[i + 1]; i += 2; }
+    else if (args[i] === "-w" || args[i] === "--workdir") { cwd = args[i + 1]; i += 2; }
+    else if (args[i] === "-i" || args[i] === "-it" || args[i] === "-t") { i += 1; }
+    else break;
+  }
+  const name = args[i];
+  const rest = args.slice(i + 1);
+  const s = load();
+  const c = s.containers[name];
+  if (!c) { console.error(runtime + " exec: no such container " + name); process.exit(1); }
+  const hostCwd = cwd ? mapPath(c, cwd) : null;
+  append(runtime + " exec " + name + " -w " + (cwd ?? "") + " -> " + (hostCwd ?? "(none)") + " :: " + rest.join(" "));
+  if (user === "0:0") process.exit(0); // container-internal mkdir/chown setup — no-op here
+  // A sandbox path that maps to nothing can't exist inside the container.
+  if (cwd && hostCwd === null) { console.error(runtime + " exec: cwd " + cwd + " not mounted"); process.exit(1); }
+  let input;
+  try { input = fs.readFileSync(0); } catch { input = undefined; }
+  const r = cp.spawnSync(rest[0], rest.slice(1), {
+    cwd: hostCwd ?? process.cwd(),
+    env: { ...process.env, ...c.env },
+    input,
+    encoding: "utf-8",
+  });
+  if (r.error) { console.error(String(r.error)); process.exit(1); }
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  process.exit(r.status ?? 1);
+}
+if (cmd === "cp") {
+  const s = load();
+  const resolveArg = (a) => {
+    const idx = a.indexOf(":");
+    if (idx < 0) return a;
+    const c = s.containers[a.slice(0, idx)];
+    if (!c) return a;
+    const mapped = mapPath(c, a.slice(idx + 1));
+    return mapped ?? a;
+  };
+  append(runtime + " cp " + args[1] + " " + args[2]);
+  fs.cpSync(resolveArg(args[1]), resolveArg(args[2]), { recursive: true });
+  process.exit(0);
+}
+if (cmd === "stop" || cmd === "rm") {
+  append(runtime + " " + args.join(" "));
+  const s = load();
+  delete s.containers[args[args.length - 1]];
+  save(s);
+  process.exit(0);
+}
+console.error("unexpected " + runtime + " args: " + args.join(" "));
+process.exit(1);
+`,
+  );
+  await chmod(shim, 0o755);
+};
+
 interface FixtureEnv {
   readonly repoDir: string;
   readonly shimDir: string;
@@ -303,6 +432,9 @@ const makeFixture = async (
   await writeFakeGh(shimDir);
   await writeFakeClaude(shimDir);
   await writeFakeOpencode(shimDir);
+  // Container runtimes are always shimmed — inert until settings picks one.
+  await writeFakeContainerRuntime(shimDir, "docker");
+  await writeFakeContainerRuntime(shimDir, "podman");
 
   // A private HOME so the fake agent's session files — and the resume
   // precheck's `~/.claude/projects/*/id.jsonl` scan — stay inside the fixture.
@@ -322,6 +454,8 @@ const makeFixture = async (
     FAKE_AGENT_PROMPT: promptFile,
     FAKE_GH_AUTH: "1",
     FAKE_GH_LABEL: "1",
+    FAKE_CTR_LOG: logFile,
+    FAKE_CTR_STATE: join(repoDir, "containers.json"),
     ...envOverrides,
   };
   return { repoDir, shimDir, fakeHome, logFile, issuesFile, promptFile, env };
@@ -457,6 +591,57 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     expect(stdout).toContain("Hoàn thành issue #5");
     expect(stdout).toContain("đã được đóng");
   });
+
+  // F062 — verification must run inside the configured sandbox, bound to the
+  // worktree of the stage being verified (source → implementation worktree,
+  // integrated → integration worktree), never as bare host exec.
+  for (const runtime of ["docker", "podman"] as const) {
+    it(`${runtime} sandbox: verification runs inside the container, bound to each stage's worktree`, async () => {
+      if (process.platform === "win32") return; // fake runtime execs via sh
+      const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+      const verifyCmd = `echo VERIFYCMDMARK-$PWD >> "${logFile}"`;
+      await writeSettings(repoDir, {
+        agent: "opencode",
+        sandbox: runtime,
+        verificationCommands: [verifyCmd],
+      });
+
+      const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+      const log = await readLog(logFile);
+      // Both stages went through `<runtime> exec -w /home/agent/workspace`
+      // — inside the configured container, not on the host — and each exec
+      // resolved that sandbox cwd to ITS stage's worktree.
+      const verifyExecs = log.filter(
+        (l) => l.startsWith(`${runtime} exec`) && l.includes("VERIFYCMDMARK"),
+      );
+      expect(verifyExecs.length).toBe(2);
+      expect(verifyExecs[0]).toContain("/home/agent/workspace");
+      expect(verifyExecs[0]).toContain("sandcastle-issue-5");
+      expect(verifyExecs[0]).not.toContain("integrate");
+      expect(verifyExecs[1]).toContain("issue-5-integrate");
+
+      // The commands actually ran in those bound directories — $PWD records
+      // the worktree the mount mapping resolved to for each stage.
+      const marks = log.filter((l) => l.startsWith("VERIFYCMDMARK-"));
+      expect(marks.length).toBe(2);
+      expect(marks[0]).toContain("sandcastle-issue-5");
+      expect(marks[0]).not.toContain("integrate");
+      expect(marks[1]).toContain("issue-5-integrate");
+
+      // Three sandboxes across the run — agent + source verify + integrated
+      // verify — and every one was torn down afterwards.
+      const runs = log.filter((l) => l.startsWith(`${runtime} run`)).length;
+      const rms = log.filter((l) => l.startsWith(`${runtime} rm`)).length;
+      expect(runs).toBeGreaterThanOrEqual(3);
+      expect(rms).toBeGreaterThanOrEqual(runs);
+
+      expect(stdout).toContain("Hoàn thành issue #5");
+      expect(stdout).toContain("đã được đóng");
+      // Three sandbox lifecycles per run make this slower than the other
+      // CLI-seam tests; keep it comfortably above the 5s default under load.
+    }, 20_000);
+  }
 
   it("verification repair: feeds the failed command + output back and lands on retry", async () => {
     const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
