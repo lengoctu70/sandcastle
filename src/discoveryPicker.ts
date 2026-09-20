@@ -39,6 +39,13 @@ import type { ModelSource } from "./ProjectSettings.js";
 export interface DiscoveredSelection {
   readonly model: string;
   readonly effort?: string;
+  /**
+   * The executable name that answered the probe (e.g. `"agent"` when Grok's
+   * CLI only identifies under its alias). Present only when the report
+   * fingerprinted the product — `"ready"`/`"unauthenticated"` states — so a
+   * `wrong-product` impostor name is never persisted as `agentExecutable`.
+   */
+  readonly executable?: string;
   readonly modelSource: ModelSource;
 }
 
@@ -311,6 +318,11 @@ const buildEffortOptions = (
  * entry / safe stop — plus "pick another agent" when `offerBack` is set —
  * before anything is scaffolded. No cached or bundled list is ever presented
  * as a live result.
+ *
+ * `initialModel`/`initialEffort` carry the caller's current effective values
+ * (`sandcastle configure`): when they appear in the live catalog they
+ * pre-select the pickers, so reconfiguration starts from what is persisted
+ * rather than the catalog's recommendation.
  */
 export const resolveDiscoveredSelection = (params: {
   readonly adapter: AgentDiscoveryAdapter;
@@ -321,6 +333,10 @@ export const resolveDiscoveredSelection = (params: {
   readonly effortFlag: Option.Option<string>;
   readonly isInteractive: boolean;
   readonly allowUnverified: boolean;
+  /** Current effective model — pre-selected when it exists in the catalog. */
+  readonly initialModel?: string;
+  /** Current effective effort — pre-selected when the chosen model offers it. */
+  readonly initialEffort?: string;
   /**
    * A report the caller already fetched (e.g. the host picker's parallel
    * sweep) — used instead of probing again. Recheck retries still probe.
@@ -347,15 +363,29 @@ export const resolveDiscoveredSelection = (params: {
     const exec = params.exec ?? nodeDiscoveryExec;
     const offerBack = params.offerBack === true;
 
+    /**
+     * The probed executable is only worth persisting when the report's
+     * product identity was actually established — `ready` and
+     * `unauthenticated` both mean the fingerprint matched. A `wrong-product`
+     * report carries the impostor's name, and `not-installed`/`error` carry
+     * only the canonical guess, so those never feed `agentExecutable`.
+     */
+    const identifiedExecutable = (report: AgentDiscoveryReport) =>
+      report.state === "ready" || report.state === "unauthenticated"
+        ? report.executable
+        : undefined;
+
     const select = (
       model: string,
       effort: string | undefined,
       modelSource: ModelSource,
+      executable?: string,
     ): AgentSelectionOutcome => ({
       kind: "selection",
       selection: {
         model,
         ...(effort !== undefined ? { effort } : {}),
+        ...(executable !== undefined ? { executable } : {}),
         modelSource,
       },
     });
@@ -378,7 +408,14 @@ export const resolveDiscoveredSelection = (params: {
         if (allowUnverified) {
           const manual = manualFromFlags(modelFlag, effortFlag);
           if (manual.model !== undefined) {
-            return select(manual.model, manual.effort, "manual-unverified");
+            // A fingerprinted executable still rides along — e.g. Grok
+            // identified under its `agent` alias but not yet logged in.
+            return select(
+              manual.model,
+              manual.effort,
+              "manual-unverified",
+              identifiedExecutable(report),
+            );
           }
           return yield* Effect.fail(
             new InitError({
@@ -404,12 +441,21 @@ export const resolveDiscoveredSelection = (params: {
       }
       // "manual" — an explicitly unverified entry (ADR 0021). A passed
       // --model flag counts as the manual entry; otherwise prompt for it.
-      const selection = yield* promptManualEntry(
+      // A fingerprinted executable still rides along — e.g. Grok identified
+      // under its `agent` alias but not yet logged in.
+      const manualSelection = yield* promptManualEntry(
         agentLabel,
         modelFlag,
         effortFlag,
       );
-      return { kind: "selection", selection };
+      const executable = identifiedExecutable(report);
+      return {
+        kind: "selection",
+        selection:
+          executable !== undefined
+            ? { ...manualSelection, executable }
+            : manualSelection,
+      };
     }
 
     // --- state === "ready": pick from the live catalog ---
@@ -431,8 +477,11 @@ export const resolveDiscoveredSelection = (params: {
       const manual = manualFromFlags(modelFlag, effortFlag);
       return select(
         manual.model ?? defaultModel,
-        manual.effort,
+        // A catalog-less agent offers no effort pick at all — the current
+        // effective effort is the only honest carry-over (configure).
+        manual.effort ?? params.initialEffort,
         "manual-unverified",
+        report.executable,
       );
     }
 
@@ -452,15 +501,28 @@ export const resolveDiscoveredSelection = (params: {
         }
         // Explicit unverified acceptance — the flag model passes through but
         // is honestly marked, and the effort flag is never verified either.
+        // The fingerprinted executable is still real — keep it.
         const manual = manualFromFlags(modelFlag, effortFlag);
-        return select(manual.model!, manual.effort, "manual-unverified");
+        return select(
+          manual.model!,
+          manual.effort,
+          "manual-unverified",
+          report.executable,
+        );
       }
       model = requested;
     } else if (isInteractive) {
+      // The current effective model (configure) wins the preselection when
+      // the live catalog still offers it; the recommendation otherwise.
+      const initialModel =
+        params.initialModel !== undefined &&
+        catalog.some((m) => m.id === params.initialModel)
+          ? params.initialModel
+          : report.recommendedModel;
       const selected = yield* Effect.promise(() =>
         clack.select({
           message: `Chọn model cho ${agentLabel}:`,
-          initialValue: report.recommendedModel,
+          initialValue: initialModel,
           options: buildModelOptions(catalog, report.recommendedModel),
         }),
       );
@@ -509,10 +571,18 @@ export const resolveDiscoveredSelection = (params: {
       effort = requested;
     } else if (chosenModel.effortChoices.length > 0) {
       if (isInteractive) {
+        // Same guard as the model pick: the persisted effort pre-selects
+        // only when the *newly chosen* model still offers it — an effort the
+        // new model does not list can never ride along silently (F037).
+        const initialEffort =
+          params.initialEffort !== undefined &&
+          chosenModel.effortChoices.some((e) => e.id === params.initialEffort)
+            ? params.initialEffort
+            : chosenModel.defaultEffort;
         const selected = yield* Effect.promise(() =>
           clack.select({
             message: `Chọn effort cho ${model}:`,
-            initialValue: chosenModel.defaultEffort,
+            initialValue: initialEffort,
             options: buildEffortOptions(chosenModel),
           }),
         );
@@ -529,6 +599,7 @@ export const resolveDiscoveredSelection = (params: {
       model,
       effort,
       modelVerified ? "discovered" : "manual-unverified",
+      report.executable,
     );
   });
 
@@ -617,6 +688,20 @@ export const pickHostAgent = (params: {
   readonly modelFlag: Option.Option<string>;
   readonly effortFlag: Option.Option<string>;
   readonly allowUnverified: boolean;
+  /**
+   * Current effective agent name — pre-selected in the ready list when it is
+   * ready. `sandcastle configure` passes the persisted (or role-effective)
+   * agent so reconfiguration starts from the live choice, not the first
+   * ready entry.
+   */
+  readonly initialAgentName?: string;
+  /**
+   * Current effective model/effort — forwarded to the model/effort picks,
+   * but only while the chosen agent is still `initialAgentName`: a
+   * different agent's persisted values would be meaningless preselections.
+   */
+  readonly initialModel?: string;
+  readonly initialEffort?: string;
   readonly exec?: DiscoveryExec;
 }): Effect.Effect<HostAgentChoice, InitError, Display> =>
   Effect.gen(function* () {
@@ -657,7 +742,11 @@ export const pickHostAgent = (params: {
         const picked = yield* Effect.promise(() =>
           clack.select({
             message: "Chọn agent chạy trên máy này:",
-            initialValue: ready[0]!.entry.name,
+            initialValue:
+              params.initialAgentName !== undefined &&
+              ready.some((r) => r.entry.name === params.initialAgentName)
+                ? params.initialAgentName
+                : ready[0]!.entry.name,
             options,
           }),
         );
@@ -706,11 +795,24 @@ export const pickHostAgent = (params: {
       const outcome = yield* resolveDiscoveredSelection({
         adapter: chosen.adapter,
         agentLabel: chosen.entry.label,
-        defaultModel: chosen.entry.defaultModel,
+        // While the picker stays on the persisted agent, its persisted model
+        // is the honest "default" for catalog-less agents (e.g. Claude Code)
+        // too — not the registry default that init would bake in.
+        defaultModel:
+          chosen.entry.name === params.initialAgentName &&
+          params.initialModel !== undefined
+            ? params.initialModel
+            : chosen.entry.defaultModel,
         modelFlag: params.modelFlag,
         effortFlag: params.effortFlag,
         isInteractive: true,
         allowUnverified: params.allowUnverified,
+        ...(chosen.entry.name === params.initialAgentName
+          ? {
+              initialModel: params.initialModel,
+              initialEffort: params.initialEffort,
+            }
+          : {}),
         ...(chosen.report !== undefined
           ? { initialReport: chosen.report }
           : {}),

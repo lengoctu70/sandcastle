@@ -123,7 +123,9 @@ export const recoveryStatePath = (cwd: string, issueNumber: number): string =>
 
 const WORKFLOW_PHASES: ReadonlySet<string> = new Set([
   "preflight",
+  "planning",
   "implementation",
+  "review",
   "verification",
   "integration",
   "integration-verification",

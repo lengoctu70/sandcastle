@@ -50,6 +50,7 @@ import {
   updateProjectSettingsAsync,
   type ProjectSettings,
   type VerificationStatus,
+  type WorkflowRole,
 } from "./ProjectSettings.js";
 import {
   RECOVERY_STATE_VERSION,
@@ -114,10 +115,16 @@ const execFileAsync = promisify(execFile);
 // Types
 // ---------------------------------------------------------------------------
 
-/** Where a run stopped. Extension point for repair/retry phases (#18/#19). */
+/**
+ * Where a run stopped. `"planning"`/`"review"` exist only for workflows that
+ * dispatch those optional phases (see {@link workflowDispatch}); the rest is
+ * the shared pipeline plus the repair/retry phases (#18/#19).
+ */
 export type WorkflowRunPhase =
   | "preflight"
+  | "planning"
   | "implementation"
+  | "review"
   | "verification"
   | "integration"
   | "integration-verification"
@@ -414,24 +421,102 @@ const AGENT_FACTORIES: Record<string, AgentFactory> = {
     antigravity(model, options as AntigravityOptions | undefined),
 };
 
-const resolveAgentProvider = (settings: ProjectSettings): AgentProvider => {
-  const entry = getAgent(settings.agent);
+/**
+ * One resolved role→provider binding: the provider instance plus the
+ * effective registry agent name (session-resume capability checks key on the
+ * provider, and a persisted session id only makes sense under the agent that
+ * produced it).
+ */
+interface ResolvedRoleAgent {
+  readonly provider: AgentProvider;
+  /** Effective registry agent name after applying the role override. */
+  readonly agentName: string;
+}
+
+/**
+ * Resolve one workflow role's effective agent provider (ADR 0025, #27).
+ * Layering is `roleOverrides[role]` over the shared `agent`/`model`/`effort`;
+ * each role resolves independently, so a planner override never leaks into
+ * the implementer. The persisted `agentExecutable` only applies while the
+ * role resolves to the shared agent — it names *that* agent's probed binary
+ * (e.g. Grok fingerprinted under its `agent` alias) and would be wrong for
+ * any override that swaps providers.
+ */
+const resolveRoleAgent = (
+  settings: ProjectSettings,
+  role: WorkflowRole,
+): ResolvedRoleAgent => {
+  const override = settings.roleOverrides?.[role];
+  const agentName = override?.agent ?? settings.agent;
+  const model = override?.model ?? settings.model;
+  const effort = override?.effort ?? settings.effort;
+  const entry = getAgent(agentName);
   const factory =
     entry === undefined ? undefined : AGENT_FACTORIES[entry.factoryImport];
   if (entry === undefined || factory === undefined) {
     throw new WorkflowRunError(
-      `Agent "${settings.agent}" trong settings không được hỗ trợ. ` +
+      `Agent "${agentName}"` +
+        (override?.agent !== undefined
+          ? ` (ghi đè cho vai trò "${role}")`
+          : "") +
+        ` trong settings không được hỗ trợ. ` +
         `Các agent khả dụng: ${listAgents()
           .map((a) => a.name)
           .join(", ")}. ` +
         "Chạy `sandcastle configure` hoặc sửa .sandcastle/settings.json.",
     );
   }
-  const options =
-    settings.effort !== undefined && entry.effortOption !== undefined
-      ? { [entry.effortOption]: settings.effort }
-      : undefined;
-  return factory(settings.model, options);
+  const options: Record<string, unknown> = {};
+  if (effort !== undefined && entry.effortOption !== undefined) {
+    options[entry.effortOption] = effort;
+  }
+  if (
+    settings.agentExecutable !== undefined &&
+    agentName === settings.agent &&
+    entry.executableOption !== undefined
+  ) {
+    options[entry.executableOption] = settings.agentExecutable;
+  }
+  return {
+    provider: factory(
+      model,
+      Object.keys(options).length > 0 ? options : undefined,
+    ),
+    agentName,
+  };
+};
+
+/**
+ * Which optional agent phases the persisted `settings.workflow` adds around
+ * the shared implement → verify → integrate → land pipeline (#27, F050):
+ *
+ * - `plan` — the planner-role agent analyzes the selected issue in the source
+ *   worktree before implementation; its plan text is injected into the
+ *   implementation prompt (`parallel-planner`, `parallel-planner-with-review`).
+ * - `review` — the reviewer-role agent reviews the branch diff after the
+ *   implementation commits and may commit corrections on the same branch
+ *   (`sequential-reviewer`, `parallel-planner-with-review`).
+ *
+ * `simple-loop` and `blank` run the base pipeline. An unknown identifier —
+ * e.g. a user-authored workflow name — also falls back to the base pipeline,
+ * with `known: false` so the run can say so instead of silently substituting.
+ */
+const workflowDispatch = (
+  workflow: string,
+): { plan: boolean; review: boolean; known: boolean } => {
+  switch (workflow) {
+    case "parallel-planner":
+      return { plan: true, review: false, known: true };
+    case "parallel-planner-with-review":
+      return { plan: true, review: true, known: true };
+    case "sequential-reviewer":
+      return { plan: false, review: true, known: true };
+    case "simple-loop":
+    case "blank":
+      return { plan: false, review: false, known: true };
+    default:
+      return { plan: false, review: false, known: false };
+  }
 };
 
 const resolveSandboxProvider = (settings: ProjectSettings): SandboxProvider => {
@@ -443,6 +528,42 @@ const resolveSandboxProvider = (settings: ProjectSettings): SandboxProvider => {
     case "docker":
       return docker();
   }
+};
+
+/**
+ * The agent's final message text, recovered by replaying the run's stdout
+ * through the provider's own stream parser — `result` events carry the final
+ * message for stream-json providers, and a text-only provider's deltas are
+ * the fallback. The planner's plan comes out of this rather than raw stdout,
+ * so stream-json framing never leaks into the implementation prompt.
+ *
+ * `run()` already collapses its `stdout` to the result-event text when the
+ * provider emits one (Orchestrator), so for result-capable providers the
+ * input is the final message itself — not raw stream lines — and the replay
+ * finds nothing. In that case the verbatim text IS the message; only
+ * JSON-framed leftovers that parsed to nothing count as "no plan".
+ */
+const lastAgentMessageText = (
+  provider: AgentProvider,
+  stdout: string,
+): string => {
+  let streamed = "";
+  let resultText = "";
+  for (const line of stdout.split("\n")) {
+    for (const event of provider.parseStreamLine(line)) {
+      if (event.type === "result") {
+        resultText = event.result;
+      } else if (event.type === "text") {
+        streamed += event.text;
+      }
+    }
+  }
+  const parsed = (resultText.length > 0 ? resultText : streamed).trim();
+  if (parsed.length > 0) return parsed;
+  // Raw stream-json that parsed to nothing has no message to extract —
+  // returning it would leak framing into the implementation prompt.
+  const trimmed = stdout.trim();
+  return trimmed.startsWith("{") ? "" : trimmed;
 };
 
 // ---------------------------------------------------------------------------
@@ -483,10 +604,16 @@ export const buildImplementationPrompt = (params: {
    * agent to continue it rather than start over.
    */
   readonly resumeError?: string;
+  /**
+   * The planner phase's output (planner workflows only) — injected as a
+   * `## Plan` section so the implementer follows it instead of re-deriving
+   * an approach.
+   */
+  readonly plan?: string;
 }): string => {
   const { issue, sourceBranch, targetBranch, verificationCommands } =
     params.context;
-  const { resumeError } = params;
+  const { resumeError, plan } = params;
   const verificationBlock =
     verificationCommands.length > 0
       ? `\n## Verification\n\nAfter you finish, the following project commands will be run to check your work. Make sure they pass:\n\n${verificationCommands.map((c) => `- \`${c}\``).join("\n")}\n`
@@ -495,10 +622,14 @@ export const buildImplementationPrompt = (params: {
     resumeError !== undefined
       ? `\n## Previous attempt\n\nA previous Sandcastle run already started this task in this worktree and stopped with:\n\n\`\`\`\n${tail(resumeError.trim())}\n\`\`\`\n\nWhatever it produced is still here — committed or uncommitted. Continue and finish that work rather than starting over.\n`
       : "";
+  const planBlock =
+    plan !== undefined && plan.trim().length > 0
+      ? `\n## Plan\n\nA planning agent analyzed this issue and this repository and produced the implementation plan below. Follow it unless the code proves it wrong.\n\n${plan.trim()}\n`
+      : "";
   return `# Task
 
 Implement GitHub issue #${issue.number}: ${issue.title}
-${resumeBlock}
+${resumeBlock}${planBlock}
 ${
   issue.body.trim().length > 0
     ? `## Issue description\n\n${issue.body}\n\n`
@@ -511,6 +642,84 @@ ${
 - Do NOT run \`gh issue close\`, \`gh issue comment\`, or any other command that mutates the issue — Sandcastle verifies, merges, reports, and closes the issue after your work lands.
 ${verificationBlock}
 When the work is fully implemented and committed, output exactly: ${DEFAULT_COMPLETION_SIGNAL}
+`;
+};
+
+/**
+ * The planning prompt for planner workflows (`parallel-planner`,
+ * `parallel-planner-with-review`): the planner-role agent analyzes the
+ * selected issue inside the source worktree and returns a plan — text that
+ * is injected into the implementation prompt as `## Plan`. It is explicitly
+ * forbidden from touching the tree: the worktree must stay clean so the
+ * implementer starts from the pristine branch.
+ */
+export const buildPlanningPrompt = (params: {
+  readonly context: WorkflowPromptContext;
+}): string => {
+  const { issue, sourceBranch, targetBranch, verificationCommands } =
+    params.context;
+  return `# Task — plan
+
+Analyze GitHub issue #${issue.number}: ${issue.title} in this repository and produce a concrete implementation plan for the agent that will implement it.
+
+${
+  issue.body.trim().length > 0
+    ? `## Issue description\n\n${issue.body}\n\n`
+    : ""
+}## Rules
+
+- You are working on branch \`${sourceBranch}\` in a dedicated worktree — read whatever code you need, but do NOT modify files, do NOT commit, and do NOT create branches. Your only output is the plan text itself.
+- The issue identity above is fixed for this run. Plan for issue #${issue.number} and nothing else.
+- Do NOT run \`gh issue close\`, \`gh issue comment\`, or any other command that mutates the issue — Sandcastle implements, verifies, merges into \`${targetBranch}\`, reports, and closes the issue itself.
+- Cover: which files/modules to touch, the approach, edge cases to handle,${
+    verificationCommands.length > 0
+      ? ` and how the work will be checked — these verification commands run afterwards:\n${verificationCommands.map((c) => `  - \`${c}\``).join("\n")}`
+      : " and how the work should be checked."
+  }
+
+When the plan is complete, output it, then output exactly: ${DEFAULT_COMPLETION_SIGNAL}
+`;
+};
+
+/**
+ * The review prompt for reviewed workflows (`sequential-reviewer`,
+ * `parallel-planner-with-review`): the reviewer-role agent inspects the
+ * implementation diff in the SAME worktree and may commit corrections on the
+ * source branch — they flow through the same verification and integration
+ * path as the implementer's own commits. Like every run-phase prompt it
+ * keeps issue closure out of the agent's reach.
+ */
+export const buildReviewPrompt = (params: {
+  readonly context: WorkflowPromptContext;
+}): string => {
+  const { issue, sourceBranch, targetBranch, verificationCommands } =
+    params.context;
+  return `# Task — review
+
+Review the implementation of GitHub issue #${issue.number}: ${issue.title} committed on branch \`${sourceBranch}\`.
+
+${
+  issue.body.trim().length > 0
+    ? `## Issue description\n\n${issue.body}\n\n`
+    : ""
+}## What to review
+
+Inspect the change with \`git diff ${targetBranch}...HEAD\` and \`git log ${targetBranch}..HEAD --oneline\` in this worktree.
+
+- Check correctness first: does the implementation match the issue's intent? Are edge cases handled? Are there unsafe casts, unchecked assumptions, injection or credential risks?
+- Then improve clarity, consistency, and maintainability — fix real problems rather than restyling, and never change what the code does.
+- Follow the project's coding standards when it declares them (e.g. .sandcastle/CODING_STANDARDS.md).
+
+## Rules
+
+- Commit any corrections on \`${sourceBranch}\` — Sandcastle verifies and merges them into \`${targetBranch}\` itself.
+- If the implementation is already sound, make no changes at all.
+- Do NOT run \`gh issue close\`, \`gh issue comment\`, or any other command that mutates the issue.
+${
+  verificationCommands.length > 0
+    ? `- These verification commands will run after your review — do not leave the tree in a state that fails them:\n${verificationCommands.map((c) => `  - \`${c}\``).join("\n")}\n`
+    : ""
+}When the review is done — changes committed or none needed — output exactly: ${DEFAULT_COMPLETION_SIGNAL}
 `;
 };
 
@@ -624,7 +833,9 @@ When the merge is committed — or you are certain it cannot be resolved — out
 /** Vietnamese label per workflow phase — reports and `sandcastle status`. */
 export const PHASE_LABEL: Record<WorkflowRunPhase, string> = {
   preflight: "kiểm tra điều kiện ban đầu",
+  planning: "lập kế hoạch triển khai",
   implementation: "chạy agent trên nhánh làm việc",
+  review: "review thay đổi trên nhánh làm việc",
   verification: "xác minh trên nhánh làm việc",
   integration: "merge trong worktree tích hợp",
   "integration-verification": "xác minh lại sau khi merge",
@@ -1076,10 +1287,29 @@ export const runIssueWorkflow = async (
           `${resume.retryCount > 0 ? `, đã retry ${resume.retryCount} lần` : ""})…`,
   );
 
-  // ---- Resolve agent + sandbox from persisted settings ----------------------
-
-  const agent = resolveAgentProvider(settings);
+  // ---- Resolve agents + sandbox from persisted settings ---------------------
+  //
+  // Every workflow role resolves independently (roleOverrides over the shared
+  // agent/model/effort) — the planner, reviewer, and merger only differ from
+  // the implementer when a `roleOverrides` entry says so.
+  const agents = {
+    planner: resolveRoleAgent(settings, "planner"),
+    implementer: resolveRoleAgent(settings, "implementer"),
+    reviewer: resolveRoleAgent(settings, "reviewer"),
+    merger: resolveRoleAgent(settings, "merger"),
+  };
   const sandbox = resolveSandboxProvider(settings);
+
+  // The persisted workflow decides which optional phases run around the
+  // shared pipeline (F050) — never a hard-coded or regenerated choice.
+  const dispatch = workflowDispatch(settings.workflow);
+  if (!dispatch.known) {
+    status(
+      `Workflow "${settings.workflow}" không phải workflow Sandcastle đã biết — ` +
+        "chạy pipeline chuẩn (implement → xác minh → merge) như simple-loop.",
+      "warn",
+    );
+  }
   // The resolved repo root, matching what createWorktree/wt.run use to key
   // host-side session storage — needed by the resume precheck for repairs.
   const hostRepoDir = await runEffect(resolveCwd(cwd));
@@ -1154,13 +1384,20 @@ export const runIssueWorkflow = async (
   let lastCompletionSignal: string | undefined;
   let lastLogFilePath: string | undefined = resume?.logFilePath;
 
-  const recordAgentRun = (r: WorktreeRunResult): void => {
+  const recordAgentRun = (
+    r: WorktreeRunResult,
+    opts?: { readonly trackSession?: boolean },
+  ): void => {
     // Dedupe by sha: the merge-conflict repair runs inside the integration
     // worktree, where commit collection re-reports the source commits that
     // arrived via the merge.
     for (const c of r.commits) {
       if (!allCommits.some((known) => known.sha === c.sha)) allCommits.push(c);
     }
+    // Planner/reviewer runs record their commits but must not overwrite the
+    // implementer-lineage session/log — `sandcastle retry` resumes the
+    // implementation session, not a phase agent's.
+    if (opts?.trackSession === false) return;
     const sid = r.iterations.at(-1)?.sessionId;
     if (sid !== undefined) lastSessionId = sid;
     if (r.completionSignal !== undefined)
@@ -1169,21 +1406,25 @@ export const runIssueWorkflow = async (
   };
 
   /**
-   * The session id to resume for a repair run, or `undefined` when a fresh
-   * invocation must carry the full context instead: non-resumable provider
-   * (no sessionStorage / captureSessions off), no session id captured, or the
-   * recorded session no longer exists on the host (ADR 0024 — "agents without
-   * resumable session storage can still retry because the code, branch,
-   * failure output, and task identity are preserved").
+   * The session id to resume for a repair run under `provider`, or
+   * `undefined` when a fresh invocation must carry the full context instead:
+   * non-resumable provider (no sessionStorage / captureSessions off), no
+   * session id captured, the recorded session no longer exists on the host,
+   * or the role resolved to a different agent whose session storage cannot
+   * hold it (ADR 0024 — "agents without resumable session storage can still
+   * retry because the code, branch, failure output, and task identity are
+   * preserved").
    */
-  const resumableSession = async (): Promise<string | undefined> => {
+  const resumableSession = async (
+    provider: AgentProvider,
+  ): Promise<string | undefined> => {
     if (lastSessionId === undefined) return undefined;
-    if (!agent.captureSessions || agent.sessionStorage === undefined) {
+    if (!provider.captureSessions || provider.sessionStorage === undefined) {
       return undefined;
     }
     try {
       await assertResumeSessionExists({
-        provider: agent,
+        provider,
         sandboxTag: sandbox.tag,
         hostRepoDir,
         resumeSession: lastSessionId,
@@ -1231,7 +1472,7 @@ export const runIssueWorkflow = async (
       return false; // budget spent — caller aborts and reports the merge error
     }
     attempts.mergeConflictRepair++;
-    const resumeSession = await resumableSession();
+    const resumeSession = await resumableSession(agents.merger.provider);
     status(
       `Merge bị xung đột — agent đang giải quyết trong worktree tích hợp ` +
         `(lần ${attempts.mergeConflictRepair}/${MAX_MERGE_CONFLICT_REPAIR_ATTEMPTS}` +
@@ -1239,7 +1480,9 @@ export const runIssueWorkflow = async (
       "warn",
     );
     const repair = await integrationWt.run({
-      agent,
+      // The merger role owns conflict resolution — a `roleOverrides.merger`
+      // entry can give it a different agent/model/effort entirely.
+      agent: agents.merger.provider,
       sandbox,
       prompt: buildMergeConflictRepairPrompt({
         context: promptContext,
@@ -1426,18 +1669,23 @@ export const runIssueWorkflow = async (
 
   // A retry re-enters the workflow at the recorded failure phase instead of
   // starting over: "implementation" only when there is no committed work to
-  // verify, "verification" to re-run the checks (with a fresh bounded repair
+  // verify (a planning failure also re-enters there — the planner re-runs as
+  // part of the stage), "review" to redo just the review pass,
+  // "verification" to re-run the checks (with a fresh bounded repair
   // budget), and straight into the integration loop for anything later —
   // the recorded source-stage verification already passed by then.
   const startPhase: WorkflowRunPhase =
     resume === undefined ||
     preservedCommits.length === 0 ||
     resume.failurePhase === "implementation" ||
+    resume.failurePhase === "planning" ||
     resume.failurePhase === "preflight"
       ? "implementation"
-      : resume.failurePhase === "verification"
-        ? "verification"
-        : "integration";
+      : resume.failurePhase === "review"
+        ? "review"
+        : resume.failurePhase === "verification"
+          ? "verification"
+          : "integration";
   phase = startPhase;
 
   // ---- Worktree — create fresh on a normal run, re-attach on retry ----------
@@ -1472,8 +1720,47 @@ export const runIssueWorkflow = async (
   }
 
   // ---- Implementation (skipped when a retry resumes past it) -----------------
+  //
+  // Planner workflows prepend a planning pass in the same worktree: the
+  // planner-role agent analyzes the issue and returns a plan, which is then
+  // injected into the implementer prompt — a per-issue reading of the
+  // parallel-planner templates' plan→execute ordering.
 
   if (startPhase === "implementation") {
+    let plan: string | undefined;
+    if (dispatch.plan) {
+      phase = "planning";
+      status(`Đang lập kế hoạch cho issue #${issue.number}…`);
+      try {
+        const planRun = await wt.run({
+          agent: agents.planner.provider,
+          sandbox,
+          prompt: buildPlanningPrompt({ context: promptContext }),
+          name: `issue-${issue.number}-plan`,
+          maxIterations: 1,
+          completionSignal: DEFAULT_COMPLETION_SIGNAL,
+        });
+        recordAgentRun(planRun, { trackSession: false });
+        const planText = lastAgentMessageText(
+          agents.planner.provider,
+          planRun.stdout,
+        )
+          .replaceAll(DEFAULT_COMPLETION_SIGNAL, "")
+          .trim();
+        if (planText.length > 0) {
+          plan = planText;
+        } else {
+          status(
+            "Planner không sinh kế hoạch nào — agent sẽ implement trực tiếp.",
+            "warn",
+          );
+        }
+      } catch (e) {
+        return fail(e);
+      }
+    }
+
+    phase = "implementation";
     status(
       resume === undefined
         ? `Đang chạy agent cho issue #${issue.number} trên nhánh \`${sourceBranch}\`…`
@@ -1483,14 +1770,17 @@ export const runIssueWorkflow = async (
     // Resume the recorded session when possible — the agent keeps its prior
     // reasoning. Without one, the prompt itself carries the context.
     const resumeSession =
-      resume !== undefined ? await resumableSession() : undefined;
+      resume !== undefined
+        ? await resumableSession(agents.implementer.provider)
+        : undefined;
     try {
       const implResult = await wt.run({
-        agent,
+        agent: agents.implementer.provider,
         sandbox,
         prompt: buildImplementationPrompt({
           context: promptContext,
           ...(resume !== undefined ? { resumeError: resume.error } : {}),
+          ...(plan !== undefined ? { plan } : {}),
         }),
         name: `issue-${issue.number}`,
         maxIterations: 1,
@@ -1512,6 +1802,35 @@ export const runIssueWorkflow = async (
     }
   }
 
+  // ---- Review (skipped unless the workflow dispatches it) ---------------------
+  //
+  // The reviewer-role agent inspects the committed diff in the same source
+  // worktree and may commit corrections on the branch — they flow through
+  // verification and integration exactly like the implementer's own work.
+  // A retry that recorded a review failure re-enters here; anything later
+  // skips it entirely.
+
+  if (
+    dispatch.review &&
+    (startPhase === "implementation" || startPhase === "review")
+  ) {
+    phase = "review";
+    status(`Đang review thay đổi cho issue #${issue.number}…`);
+    try {
+      const reviewRun = await wt.run({
+        agent: agents.reviewer.provider,
+        sandbox,
+        prompt: buildReviewPrompt({ context: promptContext }),
+        name: `issue-${issue.number}-review`,
+        maxIterations: 1,
+        completionSignal: DEFAULT_COMPLETION_SIGNAL,
+      });
+      recordAgentRun(reviewRun, { trackSession: false });
+    } catch (e) {
+      return fail(e);
+    }
+  }
+
   // ---- Verification on the source worktree -----------------------------------
   //
   // A failed command goes back to the agent in the SAME worktree — resuming
@@ -1521,7 +1840,11 @@ export const runIssueWorkflow = async (
   // Skipped when a retry resumes at integration — the recorded results
   // already passed and the merged tree is re-verified anyway.
 
-  if (startPhase === "implementation" || startPhase === "verification") {
+  if (
+    startPhase === "implementation" ||
+    startPhase === "review" ||
+    startPhase === "verification"
+  ) {
     phase = "verification";
     if (verificationConfigured()) {
       status("Đang chạy lệnh xác minh…");
@@ -1546,7 +1869,9 @@ export const runIssueWorkflow = async (
           );
         }
         attempts.verificationRepair++;
-        const resumeSession = await resumableSession();
+        const resumeSession = await resumableSession(
+          agents.implementer.provider,
+        );
         status(
           `Xác minh thất bại — agent đang sửa trong cùng worktree ` +
             `(lần ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
@@ -1555,7 +1880,7 @@ export const runIssueWorkflow = async (
         );
         try {
           const repair = await wt.run({
-            agent,
+            agent: agents.implementer.provider,
             sandbox,
             prompt: buildVerificationRepairPrompt({
               context: promptContext,

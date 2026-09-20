@@ -455,6 +455,10 @@ const initCommand = Command.make(
       let selectedAgent!: AgentEntry;
       let selectedModel!: string;
       let selectedEffort: string | undefined;
+      // The executable name the host-mode probe actually fingerprinted
+      // (e.g. Grok answering only under its `agent` alias) — persisted as
+      // `agentExecutable` so `run` invokes the same entrypoint.
+      let selectedExecutable: string | undefined;
       let modelSource: ModelSource = "manual-unverified";
 
       const applySelection = (
@@ -462,12 +466,14 @@ const initCommand = Command.make(
         selection: {
           model: string;
           effort?: string;
+          executable?: string;
           modelSource: ModelSource;
         },
       ) => {
         selectedAgent = agent;
         selectedModel = selection.model;
         selectedEffort = selection.effort;
+        selectedExecutable = selection.executable;
         modelSource = selection.modelSource;
       };
 
@@ -937,6 +943,9 @@ const initCommand = Command.make(
           settings: {
             modelSource,
             ...(selectedEffort !== undefined ? { effort: selectedEffort } : {}),
+            ...(selectedExecutable !== undefined
+              ? { agentExecutable: selectedExecutable }
+              : {}),
             verificationCommands,
             ...(verificationStatus !== undefined ? { verificationStatus } : {}),
           },

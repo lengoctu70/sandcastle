@@ -546,6 +546,16 @@ export interface AgentEntry {
    * unset — their generated call keeps the single-argument form.
    */
   readonly effortOption?: string;
+  /**
+   * Name of the factory-options field that receives the discovered executable
+   * name — `"executable"` for `grok("grok-4.6", { executable: "agent" })`.
+   * Host-mode discovery can fingerprint a binary under an alias (xAI ships
+   * Grok as both `grok` and `agent`); persisting it means `run` and the
+   * generated `main` invoke the exact probed entrypoint. Agents whose
+   * factories take no executable option leave this unset — the alias is
+   * never emitted for them.
+   */
+  readonly executableOption?: string;
 }
 
 const CLAUDE_CODE_DOCKERFILE = `FROM node:22-bookworm
@@ -961,6 +971,9 @@ GITHUB_TOKEN=`,
     defaultModel: "grok-4.6",
     factoryImport: "grok",
     effortOption: "effort",
+    // Grok's factory accepts `executable` — xAI installs the same binary as
+    // both `grok` and `agent`, and discovery reports which one answered.
+    executableOption: "executable",
     dockerfileTemplate: GROK_DOCKERFILE,
     // Host mode reuses the machine's `grok login` subscription session — the
     // .env.example block only applies to container sandboxes.
@@ -1628,6 +1641,7 @@ const rewriteMainTs = (
   agent: AgentEntry,
   model: string,
   effort: string | undefined,
+  agentExecutable: string | undefined,
   sandboxProvider: SandboxProviderEntry,
   mainFilename: string,
   providerVariant: boolean,
@@ -1659,11 +1673,20 @@ const rewriteMainTs = (
     // When init resolved a reasoning effort and the agent's factory accepts
     // one, it is emitted as the options argument — `codex("gpt-5.6-sol",
     // { effort: "xhigh" })` — so the persisted settings.json value reaches
-    // the agent CLI without the user editing generated code.
+    // the agent CLI without the user editing generated code. The discovered
+    // executable alias rides in the same options object for agents whose
+    // factory takes one (`grok("…", { executable: "agent" })`).
+    const optionEntries: string[] = [];
+    if (effort !== undefined && agent.effortOption !== undefined) {
+      optionEntries.push(`${agent.effortOption}: ${JSON.stringify(effort)}`);
+    }
+    if (agentExecutable !== undefined && agent.executableOption !== undefined) {
+      optionEntries.push(
+        `${agent.executableOption}: ${JSON.stringify(agentExecutable)}`,
+      );
+    }
     const optionsSuffix =
-      effort !== undefined && agent.effortOption !== undefined
-        ? `, { ${agent.effortOption}: ${JSON.stringify(effort)} }`
-        : "";
+      optionEntries.length > 0 ? `, { ${optionEntries.join(", ")} }` : "";
     const factoryCallRe = new RegExp(
       `${agent.factoryImport}\\(["']([^"']+)["']\\)`,
       "g",
@@ -2055,6 +2078,7 @@ export const scaffold = (
         agent: agent.name,
         model,
         effort: settingsOverrides?.effort,
+        agentExecutable: settingsOverrides?.agentExecutable,
         modelSource: settingsOverrides?.modelSource,
         workflow: templateName,
         sandbox:
@@ -2070,14 +2094,16 @@ export const scaffold = (
       }),
     );
 
-    // Rewrite main file with the selected agent factory, model, effort, and
-    // sandbox provider. A `main.<provider>.mts` variant is already
-    // provider-native, so it skips the docker() placeholder rewrite.
+    // Rewrite main file with the selected agent factory, model, effort,
+    // executable alias, and sandbox provider. A `main.<provider>.mts` variant
+    // is already provider-native, so it skips the docker() placeholder
+    // rewrite.
     yield* rewriteMainTs(
       configDir,
       agent,
       model,
       settingsOverrides?.effort,
+      settingsOverrides?.agentExecutable,
       sandboxProvider,
       mainFilename,
       mainSource !== "main.mts",

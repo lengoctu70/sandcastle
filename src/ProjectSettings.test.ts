@@ -61,6 +61,7 @@ const fullSettings = (): ProjectSettings =>
     agent: "claude-code",
     model: "claude-opus-4-8",
     effort: "max",
+    agentExecutable: "claude",
     modelSource: "discovered",
     workflow: "parallel-planner-with-review",
     sandbox: "host",
@@ -113,6 +114,7 @@ describe("ProjectSettings round-trip", () => {
     expect(loaded).toEqual(settings);
     const raw = await readFile(projectSettingsPath(dir), "utf-8");
     expect(raw).not.toContain('"effort"');
+    expect(raw).not.toContain('"agentExecutable"');
     expect(raw).not.toContain('"roleOverrides"');
     // Manual entry is the honest default — never claimed as discovered.
     expect(loaded.modelSource).toBe("manual-unverified");
@@ -130,6 +132,26 @@ describe("ProjectSettings round-trip", () => {
     const second = await readFile(projectSettingsPath(dir), "utf-8");
 
     expect(second).toBe(first);
+  });
+
+  it("round-trips agentExecutable — the probed executable alias (#27)", async () => {
+    const dir = await makeDir();
+    const settings = makeProjectSettings({
+      agent: "grok",
+      model: "grok-4.6",
+      agentExecutable: "agent",
+      modelSource: "discovered",
+      workflow: "simple-loop",
+      sandbox: "host",
+      issueTracker: "github-issues",
+    });
+
+    await run(saveProjectSettings(dir, settings));
+    const loaded = await run(loadProjectSettings(dir));
+
+    expect(loaded).toEqual(settings);
+    const raw = await readFile(projectSettingsPath(dir), "utf-8");
+    expect(raw).toContain('"agentExecutable": "agent"');
   });
 });
 
@@ -197,6 +219,22 @@ describe("scaffold writes initial settings", () => {
 
     const loaded = await run(loadProjectSettings(dir));
     expect(loaded.sandbox).toBe("host");
+  });
+
+  it("persists the probed executable alias from scaffold settings overrides", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, {
+      agent: getAgent("grok")!,
+      model: "grok-4.6",
+      settings: { agentExecutable: "agent", sandbox: "host" },
+    });
+
+    const loaded = await run(loadProjectSettings(dir));
+    expect(loaded.agent).toBe("grok");
+    expect(loaded.agentExecutable).toBe("agent");
+    // And the generated main passes it to the grok() factory options.
+    const main = await readFile(join(dir, ".sandcastle", "main.mts"), "utf-8");
+    expect(main).toContain('grok("grok-4.6", { executable: "agent" })');
   });
 
   it("defaults parallelism to 2 for parallel workflows and 1 otherwise", async () => {

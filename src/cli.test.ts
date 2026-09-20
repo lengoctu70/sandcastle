@@ -1609,6 +1609,168 @@ if (key === "--version") {
   });
 
   // ---------------------------------------------------------------------
+  // Host-mode Grok alias discovery (#27): xAI ships the same binary as
+  // `grok` and `agent`. Whichever entrypoint actually fingerprinted is
+  // persisted as `agentExecutable` and scaffolded into the provider call,
+  // so `run` re-invokes the same binary — including when only the `agent`
+  // alias answers, or an impostor sits on `grok`. These tests run on an
+  // isolated PATH: the dev machine's real grok/agent installs must never
+  // leak into the probe.
+  // ---------------------------------------------------------------------
+
+  /**
+   * Write a fake Grok binary under `name` ("grok" or its "agent" alias):
+   * `--version` fingerprints `grok <semver>`, `--help` carries the
+   * `Grok Build TUI` banner and `--reasoning-effort`, and `models` doubles
+   * as the auth probe + catalog. `impostor` writes a binary with the right
+   * name but a different product's fingerprints.
+   */
+  const writeFakeGrok = async (
+    dir: string,
+    options: {
+      name?: string;
+      authenticated?: boolean;
+      impostor?: boolean;
+    } = {},
+  ) => {
+    const { name = "grok", authenticated = true, impostor = false } = options;
+    const shim = join(dir, name);
+    const version = impostor ? "cursor-agent 9.9.9" : "grok 1.0.30 (deadbeef)";
+    const help = impostor
+      ? "Cursor Agent CLI\n\nUsage:\n  agent [options]"
+      : "Grok Build TUI\n\nOptions:\n  --reasoning-effort <level>";
+    const models = authenticated
+      ? `console.log("Default model: grok-4.6\\n\\nAvailable models:\\n  * grok-4.6 (default)\\n  - grok-4.5");`
+      : `console.log("You are not authenticated.");`;
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const key = process.argv.slice(2).join(" ");
+if (key === "--version") { console.log(${JSON.stringify(version)}); process.exit(0); }
+if (key === "--help") { console.log(${JSON.stringify(help)}); process.exit(0); }
+if (key === "models") { ${models} process.exit(0); }
+process.exit(1);
+`,
+    );
+    await chmod(shim, 0o755);
+    return shim;
+  };
+
+  /**
+   * PATH exposing only the shim dir plus node and git — no real agent
+   * binaries, no real grok/agent alias.
+   */
+  const isolatedPath = async (shimDir: string) => {
+    const bareDir = await mkdtemp(join(tmpdir(), "bare-path-"));
+    await symlink(process.execPath, join(bareDir, "node"));
+    const git = (await execAsync("command -v git")).stdout.trim();
+    await symlink(git, join(bareDir, "git"));
+    return `${shimDir}:${bareDir}`;
+  };
+
+  const initHostGrok = async (hostDir: string, shimDir: string, extra = "") =>
+    execAsync(
+      `node ${cliPath} init --agent grok --template blank --sandbox host --issue-tracker beads ${extra}`,
+      {
+        cwd: hostDir,
+        env: { ...process.env, PATH: await isolatedPath(shimDir) },
+      },
+    );
+
+  it("init --sandbox host --agent grok claims a Grok binary probed only under its agent alias", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-agent-"));
+    await writeFakeGrok(shimDir, { name: "agent" }); // no `grok` on PATH
+
+    const { stdout } = await initHostGrok(hostDir, shimDir);
+    expect(stdout).toContain("Khởi tạo xong");
+
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "grok",
+      model: "grok-4.6",
+      agentExecutable: "agent",
+      modelSource: "discovered",
+    });
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('grok("grok-4.6", { executable: "agent" })');
+  });
+
+  it("init --sandbox host --agent grok prefers the canonical grok executable when it answers", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-grok-"));
+    await writeFakeGrok(shimDir); // `grok` on PATH, no `agent`
+
+    await initHostGrok(hostDir, shimDir);
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings).toMatchObject({
+      agent: "grok",
+      model: "grok-4.6",
+      agentExecutable: "grok",
+      modelSource: "discovered",
+    });
+    const main = await readFile(
+      join(hostDir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(main).toContain('grok("grok-4.6", { executable: "grok" })');
+  });
+
+  it("init --sandbox host --agent grok skips an impostor grok and claims the agent alias", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-grok-"));
+    await writeFakeGrok(shimDir, { impostor: true }); // `grok` is Cursor's
+    await writeFakeGrok(shimDir, { name: "agent" });
+
+    await initHostGrok(hostDir, shimDir);
+    const settings = JSON.parse(
+      await readFile(join(hostDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    // Identity came from observed output — the impostor `grok` is bypassed
+    // and the real entrypoint persists.
+    expect(settings).toMatchObject({
+      agent: "grok",
+      agentExecutable: "agent",
+      modelSource: "discovered",
+    });
+  });
+
+  it("init --sandbox host --agent grok fails with install guidance when neither name answers as Grok", async () => {
+    if (process.platform === "win32") return;
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "fake-impostor-"));
+    await writeFakeGrok(shimDir, { impostor: true });
+    await writeFakeGrok(shimDir, { name: "agent", impostor: true });
+
+    try {
+      await initHostGrok(hostDir, shimDir);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("không phải Grok CLI");
+      expect(await readdir(hostDir)).not.toContain(".sandcastle");
+    }
+  });
+
+  // ---------------------------------------------------------------------
   // Ticket #15 — GitHub readiness, verification detection, package script
   // ---------------------------------------------------------------------
 
@@ -2448,11 +2610,13 @@ if (key === "--version") {
       });
 
       const settings = await readSettings(hostDir);
-      // The changed agent re-ran live discovery: catalog default + effort.
+      // The changed agent re-ran live discovery: catalog default + effort,
+      // and the probed executable replaces the previous agent's alias.
       expect(settings).toMatchObject({
         agent: "codex",
         model: "gpt-5.6-sol",
         effort: "medium",
+        agentExecutable: "codex",
         modelSource: "discovered",
         sandbox: "host",
       });
@@ -2643,6 +2807,71 @@ if (key === "--version") {
         expect(stdout + stderr).toContain("nonexistent");
         expect(stdout + stderr).toContain("claude-code");
       }
+    });
+
+    it("configure --agent on a container project drops a stale persisted executable alias", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      // An alias persisted by an earlier host-mode probe — it names the old
+      // agent's binary and must not follow an agent switch.
+      const seeded = await readSettings(hostDir);
+      seeded["agentExecutable"] = "agent";
+      await writeFile(
+        settingsFile(hostDir),
+        `${JSON.stringify(seeded, null, 2)}\n`,
+      );
+
+      await configure("--agent pi", hostDir);
+      const settings = await readSettings(hostDir);
+      expect(settings["agent"]).toBe("pi");
+      expect("agentExecutable" in settings).toBe(false);
+    });
+
+    it("configure --agent on a container project keeps the alias when the agent is unchanged", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      const seeded = await readSettings(hostDir);
+      seeded["agentExecutable"] = "claude";
+      await writeFile(
+        settingsFile(hostDir),
+        `${JSON.stringify(seeded, null, 2)}\n`,
+      );
+
+      // Same agent (claude-code) with a new model — the alias still names
+      // the right binary, so it survives the update.
+      await configure("--model claude-sonnet-4-6", hostDir);
+      const settings = await readSettings(hostDir);
+      expect(settings["agentExecutable"]).toBe("claude");
+    });
+
+    it("configure --model on a container project drops an inherited effort unless --effort is re-supplied", async () => {
+      const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+      await initRepo(hostDir);
+      await initDockerProject(hostDir);
+      await configure("--effort high", hostDir);
+      expect((await readSettings(hostDir))["effort"]).toBe("high");
+
+      // Model change without --effort: the old value was chosen against the
+      // previous model — it cannot ride along (F037).
+      await configure("--model claude-sonnet-4-6", hostDir);
+      let settings = await readSettings(hostDir);
+      expect(settings["model"]).toBe("claude-sonnet-4-6");
+      expect("effort" in settings).toBe(false);
+
+      // An explicit --effort alongside --model survives.
+      await configure("--model claude-opus-4-8 --effort xhigh", hostDir);
+      settings = await readSettings(hostDir);
+      expect(settings).toMatchObject({
+        model: "claude-opus-4-8",
+        effort: "xhigh",
+      });
+
+      // Re-selecting the *same* model is not a change — effort survives.
+      await configure("--model claude-opus-4-8", hostDir);
+      settings = await readSettings(hostDir);
+      expect(settings["effort"]).toBe("xhigh");
     });
   });
 });

@@ -186,7 +186,10 @@ process.stdin.on("end", () => {
   const issueNo = issueMatch ? issueMatch[1] : "?";
   const resumeIdx = process.argv.indexOf("--resume");
   const resumed = resumeIdx >= 0 ? process.argv[resumeIdx + 1] : null;
+  const modelIdx = process.argv.indexOf("--model");
+  const effortIdx = process.argv.indexOf("--effort");
   if (log) fs.appendFileSync(log, resumed ? "AGENT_RESUME " + resumed + "\\n" : "AGENT\\n");
+  if (log) fs.appendFileSync(log, "AGENT_ARGS model=" + (modelIdx >= 0 ? process.argv[modelIdx + 1] : "-") + " effort=" + (effortIdx >= 0 ? process.argv[effortIdx + 1] : "-") + "\\n");
   if (log) fs.appendFileSync(log, "AGENT_BEGIN " + issueNo + "\\n");
   const endRun = (code) => {
     if (log) fs.appendFileSync(log, "AGENT_END " + issueNo + "\\n");
@@ -213,6 +216,10 @@ process.stdin.on("end", () => {
     endRun(1);
   }
   const cwd = process.cwd();
+  // Planner/reviewer passes (#27) are read-only roles: they emit their
+  // phase-specific text but never touch the tree.
+  const isPlan = buf.includes("# Task — plan");
+  const isReview = buf.includes("# Task — review");
   if (buf.includes("# Merge conflict repair")) {
     if (process.env.FAKE_AGENT_NO_RESOLVE !== "1") {
       const unmerged = cp.execSync("git diff --name-only --diff-filter=U", { cwd })
@@ -222,7 +229,7 @@ process.stdin.on("end", () => {
     }
     // With FAKE_AGENT_NO_RESOLVE=1 the merge stays conflicted — Sandcastle's
     // post-repair state check must reject it.
-  } else {
+  } else if (!isPlan && !isReview) {
     if (buf.includes("# Verification repair")) {
       fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
     }
@@ -233,9 +240,14 @@ process.stdin.on("end", () => {
     fs.writeFileSync(path.join(cwd, name), "implemented " + n + "\\n");
     cp.execSync("git add -A && git commit -m \\"agent work " + n + "\\"", { cwd, stdio: "ignore" });
   }
+  const text = isPlan
+    ? "CLAUDE-PLAN: read the issue, outline the steps"
+    : isReview
+      ? "CLAUDE-REVIEW: diff inspected, no corrections needed"
+      : "worked";
   console.log(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }));
-  console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "worked" }] } }));
-  console.log(JSON.stringify({ type: "result", result: "done <promise>COMPLETE</promise>", session_id: sessionId }));
+  console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text }] } }));
+  console.log(JSON.stringify({ type: "result", result: text + " <promise>COMPLETE</promise>", session_id: sessionId }));
   endRun(0);
 });
 `,
@@ -267,13 +279,81 @@ if (log) fs.appendFileSync(log, "OPENCODE\\n");
 const promptOut = process.env.FAKE_AGENT_PROMPT;
 if (promptOut) fs.appendFileSync(promptOut, "\\n===PROMPT " + n + "===\\n" + prompt);
 const cwd = process.cwd();
-if (prompt.includes("# Verification repair")) {
-  fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
+// Planner/reviewer passes (#27) are read-only; the merger pass resolves the
+// in-progress merge like the fake claude does.
+const isPlan = prompt.includes("# Task — plan");
+const isReview = prompt.includes("# Task — review");
+if (prompt.includes("# Merge conflict repair")) {
+  const unmerged = cp.execSync("git diff --name-only --diff-filter=U", { cwd })
+    .toString().split("\\n").filter(Boolean);
+  for (const f of unmerged) fs.writeFileSync(path.join(cwd, f), "resolved by agent\\n");
+  cp.execSync("git add -A && git commit -m \\"resolve merge conflict\\"", { cwd, stdio: "ignore" });
+} else if (!isPlan && !isReview) {
+  if (prompt.includes("# Verification repair")) {
+    fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok\\n");
+  }
+  fs.writeFileSync(path.join(cwd, process.env.FAKE_AGENT_FILE || "agent-work.txt"), "implemented " + n + "\\n");
+  cp.execSync("git add -A && git commit -m \\"opencode work " + n + "\\"", { cwd, stdio: "ignore" });
 }
-fs.writeFileSync(path.join(cwd, process.env.FAKE_AGENT_FILE || "agent-work.txt"), "implemented " + n + "\\n");
-cp.execSync("git add -A && git commit -m \\"opencode work " + n + "\\"", { cwd, stdio: "ignore" });
+const text = isPlan
+  ? "OC-PLAN: outline the change"
+  : isReview
+    ? "OC-REVIEW: ship it"
+    : "done";
 console.log(JSON.stringify({ type: "step_start", sessionID: "oc-" + n }));
-console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <promise>COMPLETE</promise>" } }));
+console.log(JSON.stringify({ type: "text", part: { type: "text", text: text + " <promise>COMPLETE</promise>" } }));
+`,
+  );
+  await chmod(shim, 0o755);
+};
+
+/**
+ * Fake Grok binary under an arbitrary name (default `agent` — xAI's alias
+ * install, #27). Grok's headless contract: the prompt arrives on stdin via
+ * `--prompt-file /dev/stdin`; output is `streaming-json` events (`text`
+ * deltas, then `end`). No sessionId is emitted so the host run never enters
+ * the session-capture path; each invocation appends `marker` to the shared
+ * call log so tests can prove WHICH binary name was invoked.
+ */
+const writeFakeGrokShim = async (
+  dir: string,
+  name = "agent",
+  marker = "GROK",
+) => {
+  const shim = join(dir, name);
+  await writeFile(
+    shim,
+    `#!/usr/bin/env node
+const fs = require("fs");
+const cp = require("child_process");
+const path = require("path");
+let buf = "";
+process.stdin.on("data", (d) => (buf += d));
+process.stdin.on("end", () => {
+  const log = process.env.FAKE_GH_LOG;
+  if (log) fs.appendFileSync(log, ${JSON.stringify(marker)} + "\\n");
+  const promptOut = process.env.FAKE_AGENT_PROMPT;
+  if (promptOut) fs.appendFileSync(promptOut, "\\n===PROMPT ${name}===\\n" + buf);
+  const cwd = process.cwd();
+  let text;
+  if (buf.includes("# Task — plan")) {
+    text = "GROK-PLAN: outline the change";
+  } else if (buf.includes("# Task — review")) {
+    text = "GROK-REVIEW: ship it";
+  } else if (buf.includes("# Merge conflict repair")) {
+    const unmerged = cp.execSync("git diff --name-only --diff-filter=U", { cwd })
+      .toString().split("\\n").filter(Boolean);
+    for (const f of unmerged) fs.writeFileSync(path.join(cwd, f), "resolved by agent\\n");
+    cp.execSync("git add -A && git commit -m \\"resolve merge conflict\\"", { cwd, stdio: "ignore" });
+    text = "resolved";
+  } else {
+    fs.writeFileSync(path.join(cwd, process.env.FAKE_AGENT_FILE || "agent-work.txt"), "implemented via ${name}\\n");
+    cp.execSync("git add -A && git commit -m \\"${name} work\\"", { cwd, stdio: "ignore" });
+    text = "done";
+  }
+  console.log(JSON.stringify({ type: "text", data: text + " <promise>COMPLETE</promise>" }));
+  console.log(JSON.stringify({ type: "end" }));
+});
 `,
   );
   await chmod(shim, 0o755);
@@ -823,6 +903,253 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
     expect(stdout).toContain("--issue");
     expect(stdout).toContain("--all");
     expect(stdout).toContain("--parallelism");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Persisted workflow dispatch + per-role agents (#27): `settings.workflow`
+// decides which optional phases run, `roleOverrides` resolve each role's
+// effective agent/model/effort, and the persisted `agentExecutable` alias
+// reaches the provider that was probed under it — never a different one.
+// ---------------------------------------------------------------------------
+
+describe("sandcastle run — persisted workflow + per-role agents (#27)", () => {
+  it("parallel-planner: a planning pass runs first and its plan reaches the implementation prompt", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir, { workflow: "parallel-planner" });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    // Planner pass + implementation = two fresh agent invocations.
+    expect(log.filter((l) => l === "AGENT").length).toBe(2);
+
+    const prompts = await readFile(promptFile, "utf-8");
+    // The planner prompt ran first — a read-only analysis for the same issue.
+    expect(prompts).toContain("# Task — plan");
+    expect(prompts).toContain("do NOT modify files");
+    // The planner's output landed in the implementation prompt as ## Plan.
+    const planIdx = prompts.indexOf("# Task — plan");
+    const implIdx = prompts.indexOf("Implement GitHub issue #5");
+    const injectedIdx = prompts.indexOf("CLAUDE-PLAN: read the issue");
+    expect(planIdx).toBeGreaterThan(-1);
+    expect(implIdx).toBeGreaterThan(planIdx);
+    expect(injectedIdx).toBeGreaterThan(implIdx);
+    expect(prompts).toContain("## Plan");
+    expect(prompts).toContain("A planning agent analyzed this issue");
+
+    // The pipeline still landed and closed the issue.
+    expect(stdout).toContain("Hoàn thành issue #5");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+  });
+
+  it("sequential-reviewer: a review pass inspects the committed diff after implementation", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}"`;
+    await writeSettings(repoDir, {
+      workflow: "sequential-reviewer",
+      verificationCommands: [verifyCmd],
+    });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    expect(log.filter((l) => l === "AGENT").length).toBe(2);
+    const prompts = await readFile(promptFile, "utf-8");
+    // No planner pass in this workflow — but the reviewer ran.
+    expect(prompts).not.toContain("# Task — plan");
+    expect(prompts).toContain("# Task — review");
+    expect(prompts).toContain("git diff main...HEAD");
+    // The review prompt ran after the implementation prompt.
+    expect(prompts.indexOf("# Task — review")).toBeGreaterThan(
+      prompts.indexOf("Implement GitHub issue #5"),
+    );
+    // Verification ran on the source tree AND the integrated tree.
+    expect(log.filter((l) => l === "VERIFY").length).toBe(2);
+    expect(stdout).toContain("Hoàn thành issue #5");
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+  });
+
+  it("parallel-planner-with-review: plan, implement, and review all run in order", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir, {
+      workflow: "parallel-planner-with-review",
+    });
+
+    await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    expect(log.filter((l) => l === "AGENT").length).toBe(3);
+    const prompts = await readFile(promptFile, "utf-8");
+    const planIdx = prompts.indexOf("# Task — plan");
+    const implIdx = prompts.indexOf("Implement GitHub issue #5");
+    const reviewIdx = prompts.indexOf("# Task — review");
+    expect(planIdx).toBeGreaterThan(-1);
+    expect(implIdx).toBeGreaterThan(planIdx);
+    expect(reviewIdx).toBeGreaterThan(implIdx);
+  });
+
+  it("simple-loop and unknown workflow ids both run the base pipeline — the latter with a warning", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir, { workflow: "custom-internal-flow" });
+
+    const { stdout, stderr } = await runCli("run --issue 5", repoDir, env);
+    expect(stdout + stderr).toContain("custom-internal-flow");
+    expect(stdout + stderr).toContain("không phải workflow Sandcastle");
+
+    const log = await readLog(logFile);
+    // Base pipeline: exactly one agent invocation, no plan/review prompts.
+    expect(log.filter((l) => l === "AGENT").length).toBe(1);
+    const prompts = await readFile(promptFile, "utf-8");
+    expect(prompts).not.toContain("# Task — plan");
+    expect(prompts).not.toContain("# Task — review");
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+  });
+
+  it("roleOverrides give planner and reviewer their own agent while the implementer keeps the shared one", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir, {
+      workflow: "parallel-planner-with-review",
+      roleOverrides: {
+        planner: { agent: "opencode" },
+        reviewer: { agent: "opencode" },
+      },
+    });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    // Plan + review ran through opencode; implementation stayed on claude.
+    expect(log.filter((l) => l === "OPENCODE").length).toBe(2);
+    expect(log.filter((l) => l === "AGENT").length).toBe(1);
+
+    const prompts = await readFile(promptFile, "utf-8");
+    expect(prompts).toContain("# Task — plan");
+    expect(prompts).toContain("# Task — review");
+    // The opencode planner's text was extracted and injected into the
+    // implementer's prompt — cross-provider plan handoff works.
+    expect(prompts).toContain("## Plan");
+    expect(prompts).toContain("OC-PLAN: outline the change");
+
+    expect(stdout).toContain("Hoàn thành issue #5");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+  });
+
+  it("a per-role model+effort override reaches only that role's invocation", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir, {
+      workflow: "parallel-planner",
+      model: "shared-model",
+      effort: "low",
+      roleOverrides: {
+        planner: { model: "plan-model", effort: "high" },
+      },
+    });
+
+    await runCli("run --issue 5", repoDir, env);
+
+    const argLines = (await readLog(logFile)).filter((l) =>
+      l.startsWith("AGENT_ARGS"),
+    );
+    expect(argLines.length).toBe(2);
+    // Planner first — its override model/effort; implementer second — the
+    // shared settings.
+    expect(argLines[0]).toContain("model=plan-model");
+    expect(argLines[0]).toContain("effort=high");
+    expect(argLines[1]).toContain("model=shared-model");
+    expect(argLines[1]).toContain("effort=low");
+  });
+
+  it("a persisted executable alias invokes that binary at run time (grok under its agent alias)", async () => {
+    const { repoDir, shimDir, logFile, promptFile, env } = await makeFixture([
+      ISSUE_5,
+    ]);
+    // Only the `agent` entrypoint exists — if the provider used the
+    // canonical `grok` name the run would fail with ENOENT.
+    await writeFakeGrokShim(shimDir, "agent", "GROK_ALIAS");
+    await writeSettings(repoDir, {
+      agent: "grok",
+      model: "grok-4.6",
+      agentExecutable: "agent",
+    });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    expect(log).toContain("GROK_ALIAS");
+    expect(log.filter((l) => l === "AGENT").length).toBe(0);
+    const prompts = await readFile(promptFile, "utf-8");
+    expect(prompts).toContain("Implement GitHub issue #5");
+    expect(stdout).toContain("Hoàn thành issue #5");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+  });
+
+  it("the persisted executable alias does not leak into a role that overrides to a different agent", async () => {
+    const { repoDir, shimDir, logFile, env } = await makeFixture([ISSUE_5]);
+    // Both entrypoints exist with distinct markers: if the stale alias
+    // leaked into the overridden role, `agent` (GROK_ALIAS) would be
+    // invoked; the correct behavior invokes canonical `grok` (GROK_BIN).
+    await writeFakeGrokShim(shimDir, "grok", "GROK_BIN");
+    await writeFakeGrokShim(shimDir, "agent", "GROK_ALIAS");
+    await writeSettings(repoDir, {
+      agent: "claude-code",
+      model: "fake-model",
+      // Leftover alias from a previous config — it names the shared agent's
+      // probed binary and must not follow a role override to grok.
+      agentExecutable: "agent",
+      roleOverrides: { implementer: { agent: "grok", model: "grok-4.6" } },
+    });
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    expect(log).toContain("GROK_BIN");
+    expect(log).not.toContain("GROK_ALIAS");
+    expect(stdout).toContain("Hoàn thành issue #5");
+  });
+
+  it("a merger override resolves merge conflicts through its own agent", async () => {
+    const { repoDir, logFile, promptFile, env } = await makeFixture([
+      { ...ISSUE_5, number: 7 },
+    ]);
+    await writeSettings(repoDir, {
+      roleOverrides: { merger: { agent: "opencode" } },
+    });
+
+    // Same conflict seeding as the merge-conflict tests: the pre-existing
+    // source branch collides with a newer main commit at integration.
+    await execAsync("git checkout -b sandcastle/issue-7", { cwd: repoDir });
+    await commitFile(repoDir, "hello.txt", "branch version\n", "branch change");
+    await execAsync("git checkout main", { cwd: repoDir });
+    await commitFile(repoDir, "hello.txt", "main version\n", "main change");
+
+    const { stdout } = await runCli("run --issue 7", repoDir, env);
+
+    const log = await readLog(logFile);
+    // Implementation ran on claude; the conflict repair went to opencode —
+    // a fresh invocation (opencode has no session storage), never a resume.
+    expect(log.filter((l) => l === "AGENT").length).toBe(1);
+    expect(log.filter((l) => l === "OPENCODE").length).toBe(1);
+    expect(log.some((l) => l.startsWith("AGENT_RESUME"))).toBe(false);
+
+    // The repair prompt re-established context — the merger's provider
+    // cannot resume the implementer's session.
+    const prompts = await readFile(promptFile, "utf-8");
+    expect(prompts).toContain("# Merge conflict repair");
+    expect(prompts).toContain("A previous Sandcastle run implemented issue #7");
+
+    // The opencode merger's resolution landed on main.
+    expect(await git(repoDir, "show main:hello.txt")).toBe("resolved by agent");
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work.txt");
+    expect(log.some((l) => l.startsWith("gh issue close 7"))).toBe(true);
+    expect(stdout).toContain("đã được đóng");
   });
 });
 
