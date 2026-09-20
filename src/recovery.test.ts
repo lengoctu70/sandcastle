@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import {
   acquireRetryLock,
   listRecoveryStates,
+  parseRecoveryState,
   readRecoveryState,
   recoveryStatePath,
   retryLockPath,
@@ -156,6 +157,45 @@ describe("writeRecoveryState durability", () => {
       expect(names.filter((n) => n.endsWith(".tmp"))).toEqual([]);
     } finally {
       await chmod(recDir, 0o755).catch(() => {});
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Verification fields (#34)
+// ---------------------------------------------------------------------------
+
+describe("parseRecoveryState verification diagnostics", () => {
+  const entry = {
+    command: "npm test",
+    status: "failed",
+    exitCode: 1,
+    durationMs: 5,
+    outputTail: "tail only",
+  };
+
+  it("keeps the fuller repair diagnostic when the record carries one", () => {
+    const parsed = parseRecoveryState({
+      ...makeState(5),
+      verification: [{ ...entry, output: "root error … tail only" }],
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.verification[0]!.output).toBe(
+        "root error … tail only",
+      );
+      expect(parsed.state.verification[0]!.outputTail).toBe("tail only");
+    }
+  });
+
+  it("fills `output` from `outputTail` for records written before the field existed", () => {
+    const parsed = parseRecoveryState({
+      ...makeState(5),
+      verification: [entry],
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.state.verification[0]!.output).toBe("tail only");
     }
   });
 });
