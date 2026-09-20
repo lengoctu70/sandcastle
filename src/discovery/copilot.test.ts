@@ -73,22 +73,28 @@ const TOKEN_VARS = [
 
 describe("copilotDiscoveryAdapter", () => {
   let saved: Record<string, string | undefined>;
+  // Every test gets an empty COPILOT_HOME so the real ~/.copilot/config.json
+  // (and any real `copilot login` state on the dev machine) cannot leak in.
+  let copilotHome: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     saved = {};
-    for (const name of TOKEN_VARS) {
+    for (const name of [...TOKEN_VARS, "COPILOT_HOME"] as const) {
       saved[name] = process.env[name];
       delete process.env[name];
     }
+    copilotHome = await mkdtemp(join(tmpdir(), "sandcastle-copilot-home-"));
+    process.env.COPILOT_HOME = copilotHome;
   });
-  afterEach(() => {
-    for (const name of TOKEN_VARS) {
+  afterEach(async () => {
+    for (const name of [...TOKEN_VARS, "COPILOT_HOME"] as const) {
       if (saved[name] === undefined) {
         delete process.env[name];
       } else {
         process.env[name] = saved[name];
       }
     }
+    await rm(copilotHome, { recursive: true, force: true });
   });
 
   it("reports ready via a token env var, with an empty catalog", async () => {
@@ -181,6 +187,92 @@ describe("copilotDiscoveryAdapter", () => {
     const { exec } = makeFakeExec({
       "copilot --version": VERSION_PRODUCT,
       "gh auth status": GH_MISSING,
+    });
+    const report = await copilotDiscoveryAdapter.discover(exec);
+    expect(report.state).toBe("unauthenticated");
+    expect(report.guidance).toContain("copilot login");
+  });
+
+  // --- native `copilot login` credentials (F054) ---------------------------
+  // The token itself lives in the OS keychain (or the plaintext fallback);
+  // config.json's `loggedInUsers` is the documented non-secret login record.
+
+  const writeCopilotConfig = (config: unknown) =>
+    writeFile(
+      join(copilotHome, "config.json"),
+      JSON.stringify(config),
+      "utf-8",
+    );
+
+  it("reports ready via a native `copilot login` account, without probing gh", async () => {
+    await writeCopilotConfig({
+      lastLoggedInUser: { host: "github.com", login: "tu70" },
+      loggedInUsers: [{ host: "github.com", login: "tu70" }],
+    });
+    const { exec, calls } = makeFakeExec({
+      "copilot --version": VERSION_PRODUCT,
+      // Deliberately no `gh` handler — the native login must short-circuit it.
+    });
+    const report = await copilotDiscoveryAdapter.discover(exec);
+
+    expect(report.state).toBe("ready");
+    expect(report.authDetail).toContain("copilot login");
+    expect(report.authDetail).toContain("tu70");
+    expect(report.authDetail).toContain("github.com");
+    expect(calls).toEqual(["copilot --version"]);
+  });
+
+  it("native-login detection reads no secret material", async () => {
+    // A plaintext-fallback config may carry token fields next to the login
+    // record — none of it may surface in the report.
+    await writeCopilotConfig({
+      loggedInUsers: [{ host: "github.com", login: "dev" }],
+      oauth_token: "gho_SHOULD_NEVER_SURFACE",
+      access_token: "ghp_SHOULD_NEVER_SURFACE",
+    });
+    const { exec } = makeFakeExec({
+      "copilot --version": VERSION_PRODUCT,
+      "gh auth status": GH_SIGNED_OUT,
+    });
+    const report = await copilotDiscoveryAdapter.discover(exec);
+
+    expect(report.state).toBe("ready");
+    const surface = JSON.stringify(report);
+    expect(surface).not.toContain("gho_");
+    expect(surface).not.toContain("ghp_");
+    expect(surface).not.toContain("oauth_token");
+    // And the fake `gh` never ran — the native record authenticated first.
+  });
+
+  it("loggedInUsers entries without lastLoggedInUser still authenticate", async () => {
+    await writeCopilotConfig({
+      loggedInUsers: [{ host: "github.example.com", login: "ghe-user" }],
+    });
+    const { exec } = makeFakeExec({
+      "copilot --version": VERSION_PRODUCT,
+    });
+    const report = await copilotDiscoveryAdapter.discover(exec);
+    expect(report.state).toBe("ready");
+    expect(report.authDetail).toContain("ghe-user");
+  });
+
+  it("falls back to `gh` when config.json has no loggedInUsers", async () => {
+    await writeCopilotConfig({ theme: "dark", loggedInUsers: [] });
+    const { exec, calls } = makeFakeExec({
+      "copilot --version": VERSION_PRODUCT,
+      "gh auth status": GH_SIGNED_IN,
+    });
+    const report = await copilotDiscoveryAdapter.discover(exec);
+    expect(report.state).toBe("ready");
+    expect(report.authDetail).toContain("gh");
+    expect(calls).toContain("gh auth status");
+  });
+
+  it("falls back to `gh` when config.json is malformed", async () => {
+    await writeFile(join(copilotHome, "config.json"), "{ not json", "utf-8");
+    const { exec } = makeFakeExec({
+      "copilot --version": VERSION_PRODUCT,
+      "gh auth status": GH_SIGNED_OUT,
     });
     const report = await copilotDiscoveryAdapter.discover(exec);
     expect(report.state).toBe("unauthenticated");

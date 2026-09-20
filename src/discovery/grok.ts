@@ -284,7 +284,14 @@ const parseGrokModelsCatalog = (
       "models",
     );
   }
-  return { models, recommendedModel: defaultModel ?? models[0]!.id };
+  // `Default model:` may print an alias that is not listed under
+  // `Available models:` — recommend it only when it is a catalog member,
+  // else the picker would resolve an id that has no catalog entry (F018).
+  const recommendedModel =
+    defaultModel !== undefined && models.some((m) => m.id === defaultModel)
+      ? defaultModel
+      : models[0]!.id;
+  return { models, recommendedModel };
 };
 
 // ---------------------------------------------------------------------------

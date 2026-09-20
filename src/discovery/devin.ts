@@ -124,8 +124,10 @@ const parseVariant = (raw: unknown, where: string): DiscoveredEffort => {
 /**
  * One catalog family → one discovered model. `slug` is the `--model`
  * selector and `family_label` the display name — both required. `aliases`
- * are informational (they also work as `--model` selectors) and `variants`
- * become the effort choices; unknown fields are tolerated.
+ * also work as `--model` selectors: they populate `DiscoveredModel.aliases`
+ * (and stay in `description` as a picker hint) so init accepts them as
+ * verified selectors. `variants` become the effort choices; unknown fields
+ * are tolerated.
  */
 const parseFamily = (raw: unknown, index: number): DiscoveredModel => {
   const where = `families[${index}]`;
@@ -158,7 +160,7 @@ const parseFamily = (raw: unknown, index: number): DiscoveredModel => {
     id: requiredString(raw["slug"], "slug", where),
     displayName: requiredString(raw["family_label"], "family_label", where),
     ...(aliases.length > 0
-      ? { description: `Alias: ${aliases.join(", ")}` }
+      ? { aliases, description: `Alias: ${aliases.join(", ")}` }
       : {}),
     effortChoices,
     // No defaultEffort: the catalog does not declare one, and inventing a

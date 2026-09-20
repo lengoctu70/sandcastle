@@ -95,6 +95,35 @@ describe("grokDiscoveryAdapter", () => {
     expect(report.models[1]!.effortChoicesExhaustive).toBe(false);
   });
 
+  it("degrades a Default model that is not a catalog member to a real entry", async () => {
+    // `Default model:` may print an alias the `Available models:` list does
+    // not contain — recommending it would crash the headless picker on the
+    // effort lookup, so the report falls back to a catalog member (F018).
+    const { exec } = makeFakeExec({
+      "grok --version": execResult({
+        stdout: await readFixture("grok/version.txt"),
+      }),
+      "grok --help": execResult({
+        stdout: await readFixture("grok/help.txt"),
+      }),
+      "grok models": execResult({
+        stdout:
+          "Default model: grok-next-beta\n\n" +
+          "Available models:\n" +
+          "  * grok-4.6\n" +
+          "  - grok-4.5\n",
+      }),
+    });
+    const report = await grokDiscoveryAdapter.discover(exec);
+
+    expect(report.state).toBe("ready");
+    expect(report.models.map((m) => m.id)).toEqual(["grok-4.6", "grok-4.5"]);
+    expect(report.recommendedModel).toBe("grok-4.6");
+    expect(report.models.some((m) => m.id === report.recommendedModel)).toBe(
+      true,
+    );
+  });
+
   it("reports unauthenticated when `models` prints the not-authenticated marker", async () => {
     const { exec, calls } = makeFakeExec({
       "grok --version": execResult({

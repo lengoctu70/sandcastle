@@ -1,3 +1,4 @@
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
@@ -102,6 +103,60 @@ describe("grok factory", () => {
     const { command } = provider.buildPrintCommand(opts("x"));
     expect(command.startsWith("agent ")).toBe(true);
     expect(provider.buildInteractiveArgs!(opts(""))[0]).toBe("agent");
+  });
+
+  // --- execPlatform: prompt delivery follows the exec shell, not the host ---
+
+  /** Extract the quoted --prompt-file path from a win32 command. */
+  const promptFileOf = (command: string): string => {
+    const match = /--prompt-file "([^"]+)"/.exec(command);
+    expect(match, `no quoted --prompt-file in: ${command}`).not.toBeNull();
+    return match![1]!;
+  };
+
+  const cleanupPromptFile = (path: string | undefined): void => {
+    if (path !== undefined && existsSync(path)) unlinkSync(path);
+  };
+
+  it("a win32 exec delivers the prompt through a real temp file, not /dev/stdin", () => {
+    const provider = grok("grok-4.6", { execPlatform: "win32" });
+    const prompt = "dịch tiếng Việt — multibyte ✓ and a newline\ninside";
+    const { command, stdin } = provider.buildPrintCommand(opts(prompt));
+    const promptPath = promptFileOf(command);
+    try {
+      // cmd.exe gets a real file path; /dev/stdin does not exist there.
+      expect(command).not.toContain("/dev/stdin");
+      expect(stdin).toBeUndefined();
+      // The file carries the exact UTF-8 prompt and is deleted by the
+      // command itself after Grok exits (success or failure — `&` always
+      // runs `del`).
+      expect(readFileSync(promptPath, "utf-8")).toBe(prompt);
+      expect(command).toContain(`& del "${promptPath}"`);
+    } finally {
+      cleanupPromptFile(promptPath);
+    }
+  });
+
+  it("a win32 exec still uses the discovered executable alias", () => {
+    const provider = grok("grok-4.6", {
+      execPlatform: "win32",
+      executable: "agent",
+    });
+    const { command } = provider.buildPrintCommand(opts("x"));
+    expect(command.startsWith("agent ")).toBe(true);
+    cleanupPromptFile(/--prompt-file "([^"]+)"/.exec(command)?.[1]);
+  });
+
+  it("a non-win32 execPlatform keeps the POSIX stdin device (container on Windows host)", () => {
+    // Docker/Podman on a Windows host exec through sh — callers pass a
+    // non-"win32" platform and get /dev/stdin + stdin delivery back.
+    for (const execPlatform of ["linux", "darwin"]) {
+      const provider = grok("grok-4.6", { execPlatform });
+      const { command, stdin } = provider.buildPrintCommand(opts("x"));
+      expect(command).toContain("--prompt-file /dev/stdin");
+      expect(command).not.toContain("& del ");
+      expect(stdin).toBe("x");
+    }
   });
 
   it("buildInteractiveArgs passes model, effort, permission mode and prompt", () => {

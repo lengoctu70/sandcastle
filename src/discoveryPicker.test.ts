@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { Effect, Option, Ref } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -218,6 +220,49 @@ const claudeReady = (): Record<string, Handler | DiscoveryExecResult> => ({
     stdout: JSON.stringify({ loggedIn: true, authMethod: "oauth" }),
   }),
 });
+
+// --- Devin: version + auth status + families/variants catalog fixture ---
+
+/** The sanitized `devin models list --format json` capture. */
+const DEVIN_CATALOG_PATH = join(
+  import.meta.dirname,
+  "discovery",
+  "fixtures",
+  "devin-models.json",
+);
+
+/** A real fixture-backed Devin report — catalog parsing included. */
+const devinReport = async (): Promise<AgentDiscoveryReport> => {
+  const { exec } = makeExec({
+    "devin --version": res({ stdout: "devin 3000.10.31 (b98cc431)\n" }),
+    "devin auth status": res({ stdout: "Logged in (via Devin).\n" }),
+    "devin models list --format json": res({
+      stdout: await readFile(DEVIN_CATALOG_PATH, "utf-8"),
+    }),
+  });
+  const report = await getDiscoveryAdapter("devin")!.discover(exec);
+  expect(report.state).toBe("ready");
+  return report;
+};
+
+/** resolveDiscoveredSelection against a pre-fetched Devin report. */
+const resolveDevin = (
+  report: AgentDiscoveryReport,
+  flags: { model?: string; effort?: string },
+  ref = displayRef(),
+) =>
+  resolveDiscoveredSelection({
+    adapter: getDiscoveryAdapter("devin")!,
+    agentLabel: "Devin",
+    defaultModel: "claude-opus-5",
+    modelFlag:
+      flags.model !== undefined ? Option.some(flags.model) : Option.none(),
+    effortFlag:
+      flags.effort !== undefined ? Option.some(flags.effort) : Option.none(),
+    isInteractive: false,
+    allowUnverified: false,
+    initialReport: report,
+  }).pipe(Effect.provide(SilentDisplay.layer(ref)));
 
 // ---------------------------------------------------------------------------
 // Run helpers
@@ -707,6 +752,107 @@ describe("resolveDiscoveredSelection", () => {
         modelSource: "discovered",
       },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Devin — family slugs vs aliases vs exact variant model_uids (F016, ADR 0021)
+// ---------------------------------------------------------------------------
+
+describe("resolveDiscoveredSelection — Devin selectors", () => {
+  it("--model <family slug> selects the family with no variant", async () => {
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "claude-opus-5" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: { model: "claude-opus-5", modelSource: "discovered" },
+    });
+  });
+
+  it("--model <family alias> resolves to the family slug, discovered", async () => {
+    // `devin --model opus` is advertised by the live catalog's `aliases`.
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "opus" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: { model: "claude-opus-5", modelSource: "discovered" },
+    });
+  });
+
+  it("--model <exact variant model_uid> keeps family and variant distinct", async () => {
+    // `claude-opus-5-high` is not a family — it picks the family AND the
+    // thinking level in one selector. The uid lands on `effort` so the
+    // provider can pass it back to --model unchanged.
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "claude-opus-5-high" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        model: "claude-opus-5",
+        effort: "claude-opus-5-high",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("--model <enum-style model_uid> resolves through the variant path too", async () => {
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "MODEL_GPT_5_2_XHIGH" }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        model: "gpt-5.2",
+        effort: "MODEL_GPT_5_2_XHIGH",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("an explicit --effort still wins over a variant --model", async () => {
+    const outcome = await Effect.runPromise(
+      resolveDevin(await devinReport(), {
+        model: "claude-opus-5-high",
+        effort: "claude-opus-5-max",
+      }),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: {
+        model: "claude-opus-5",
+        effort: "claude-opus-5-max",
+        modelSource: "discovered",
+      },
+    });
+  });
+
+  it("an unknown selector is still rejected with the catalog ids", async () => {
+    const err = await Effect.runPromise(
+      resolveDevin(await devinReport(), { model: "bogus-9" }).pipe(Effect.flip),
+    );
+    expect(err).toBeInstanceOf(InitError);
+    expect(err.message).toContain("bogus-9");
+    expect(err.message).toContain("claude-opus-5");
+  });
+
+  it("a recommended model outside the catalog degrades to a real entry (F018)", async () => {
+    // `recommendedModel` surfaces raw CLI output — an off-catalog value must
+    // not crash the headless path on the effort lookup.
+    const report = await devinReport();
+    const ref = displayRef();
+    const outcome = await Effect.runPromise(
+      resolveDevin({ ...report, recommendedModel: "grok-next-beta" }, {}, ref),
+    );
+    expect(outcome).toEqual({
+      kind: "selection",
+      selection: { model: "claude-opus-5", modelSource: "discovered" },
+    });
+    expect(
+      statusMessages(entries(ref)).some((m) => m.includes("grok-next-beta")),
+    ).toBe(true);
   });
 });
 

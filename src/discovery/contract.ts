@@ -114,6 +114,13 @@ export interface DiscoveredModel {
   /** Optional catalog description, shown as a picker hint. */
   readonly description?: string;
   /**
+   * Alternate selectors the agent's own model flag accepts for this model —
+   * e.g. Devin's family aliases (`"opus"` for `claude-opus-5`). Populated
+   * when the live catalog advertises them; the init picker accepts them as
+   * verified selectors that resolve to `id`.
+   */
+  readonly aliases?: readonly string[];
+  /**
    * The model provider serving this model — only populated for agents that
    * aggregate more than one service (e.g. Pi, OpenCode), where init groups
    * models by provider (ADR 0021). Single-provider agents leave it unset.
