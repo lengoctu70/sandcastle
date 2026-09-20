@@ -821,9 +821,12 @@ const initCommand = Command.make(
             yield* Effect.fail(
               new InitError({
                 message:
-                  `Không tạo được label "Sandcastle": ${labelResult.detail}. ` +
-                  "Kiểm tra quyền ghi của tài khoản `gh` trên repository này " +
-                  "(label cần quyền Issues: write), hoặc chạy lại init với --create-label false.",
+                  labelResult.kind === "forbidden"
+                    ? `Không tạo được label "Sandcastle": ${labelResult.detail}. ` +
+                      "Kiểm tra quyền ghi của tài khoản `gh` trên repository này " +
+                      "(label cần quyền Issues: write), hoặc chạy lại init với --create-label false."
+                    : `Không tạo được label "Sandcastle": ${labelResult.detail}. ` +
+                      "Chạy lại init với --create-label false để bỏ qua bước này.",
               }),
             );
           }
