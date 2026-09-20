@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { devin } from "./devin.js";
 import type { AgentCommandOptions } from "../AgentProvider.js";
@@ -117,9 +119,11 @@ describe("devin factory", () => {
 describe("devin parseStreamLine (plain-text print output)", () => {
   const provider = devin("claude-opus-5");
 
-  it("maps a plain output line to a text event", () => {
+  it("maps a plain output line to a newline-terminated text event", () => {
+    // readline strips each line's "\n" before parseStreamLine runs; the parser
+    // restores it so buffered and terminal output keep the line boundary.
     expect(provider.parseStreamLine("Working on the fix…")).toEqual([
-      { type: "text", text: "Working on the fix…" },
+      { type: "text", text: "Working on the fix…\n" },
     ]);
   });
 
@@ -130,13 +134,28 @@ describe("devin parseStreamLine (plain-text print output)", () => {
       "All done. <promise>COMPLETE</promise>",
     );
     expect(events).toEqual([
-      { type: "text", text: "All done. <promise>COMPLETE</promise>" },
+      { type: "text", text: "All done. <promise>COMPLETE</promise>\n" },
     ]);
+  });
+
+  it("preserves boundaries between consecutive lines", () => {
+    const events = ["first line", "second line"].flatMap((l) =>
+      provider.parseStreamLine(l),
+    );
+    expect(events).toEqual([
+      { type: "text", text: "first line\n" },
+      { type: "text", text: "second line\n" },
+    ]);
+    // Concatenated the way the Orchestrator accumulates text, the lines stay
+    // separated instead of smashing into "first linesecond line".
+    expect(events.map((e) => (e.type === "text" ? e.text : "")).join("")).toBe(
+      "first line\nsecond line\n",
+    );
   });
 
   it("strips ANSI escape sequences from output lines", () => {
     expect(provider.parseStreamLine("\x1b[32mgreen\x1b[0m text")).toEqual([
-      { type: "text", text: "green text" },
+      { type: "text", text: "green text\n" },
     ]);
   });
 
@@ -152,7 +171,26 @@ describe("devin parseStreamLine (plain-text print output)", () => {
     expect(
       provider.parseStreamLine("Error: model not allowed by team settings"),
     ).toEqual([
-      { type: "text", text: "Error: model not allowed by team settings" },
+      { type: "text", text: "Error: model not allowed by team settings\n" },
     ]);
+  });
+
+  it("round-trips a captured print-mode transcript with every line boundary intact", async () => {
+    const fixture = await readFile(
+      join(import.meta.dirname, "fixtures", "devin-print-output.txt"),
+      "utf-8",
+    );
+    const events = fixture
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .flatMap((l) => provider.parseStreamLine(l));
+    // Every parsed line carries its restored "\n", so the buffered output the
+    // completion-signal scan consumes equals the captured stream verbatim —
+    // including the "<promise>COMPLETE</promise>" line staying matchable.
+    const buffered = events
+      .map((e) => (e.type === "text" ? e.text : ""))
+      .join("");
+    expect(buffered).toBe(fixture);
+    expect(buffered).toContain("<promise>COMPLETE</promise>");
   });
 });

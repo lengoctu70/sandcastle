@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { describe, expect, it } from "vitest";
 import { grok } from "./grok.js";
-import type { AgentCommandOptions } from "../AgentProvider.js";
+import {
+  TOOL_ARG_DISPLAY_MAX_CHARS,
+  type AgentCommandOptions,
+} from "../AgentProvider.js";
 import type { BindMountSandboxHandle } from "../SandboxProvider.js";
 import {
   encodeGrokSessionDir,
@@ -165,6 +168,40 @@ describe("grok parseStreamLine", () => {
     expect(event).toMatchObject({ name: "scheduler_create" });
     if (event?.type === "tool_call") {
       expect(event.args).toContain("cron");
+    }
+  });
+
+  it("bounds an oversized mapped rawInput field with a visible ellipsis", () => {
+    const provider = grok("grok-4.6");
+    const command = `echo ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "tool_call",
+      toolCallId: "call-big-1",
+      toolName: "run_terminal_command",
+      rawInput: { command },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "run_terminal_command",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
+    ]);
+  });
+
+  it("bounds the JSON-dump fallback for unmapped tools", () => {
+    const provider = grok("grok-4.6");
+    const line = JSON.stringify({
+      type: "tool_call",
+      toolCallId: "call-big-2",
+      toolName: "scheduler_create",
+      rawInput: { cron: "* * * * *", prompt: "y".repeat(1000) },
+    });
+    const [event] = provider.parseStreamLine(line);
+    expect(event?.type).toBe("tool_call");
+    if (event?.type === "tool_call") {
+      expect(event.args.length).toBe(TOOL_ARG_DISPLAY_MAX_CHARS + 1);
+      expect(event.args.endsWith("…")).toBe(true);
     }
   });
 

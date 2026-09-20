@@ -1,0 +1,9 @@
+{"type":"session","version":3,"id":"9ba1c695-2222-4444-8888-e7e847bf34dd","timestamp":"2026-09-20T08:00:00Z","cwd":"/sandbox/repo"}
+{"type":"message_start","message":{"role":"assistant"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Running the test suite."}}
+{"type":"tool_execution_start","toolName":"bash","args":{"command":"npm test","description":"Run the test suite"}}
+{"type":"tool_execution_end","toolName":"bash","result":{"content":[{"type":"text","text":"12 passing"}]}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"All done. "}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"<promise>COMPLETE</promise>"}}
+{"type":"message_end","message":{"role":"assistant"}}
+{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"fix it"}]},{"role":"assistant","content":[{"type":"text","text":"All done. <promise>COMPLETE</promise>"}]}]}

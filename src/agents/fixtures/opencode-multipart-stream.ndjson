@@ -1,0 +1,8 @@
+{"type":"step_start","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"step-start","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2"}}
+{"type":"text","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"text","text":"I'll check "}}
+{"type":"text","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"text","text":"the test suite "}}
+{"type":"text","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"text","text":"now."}}
+{"type":"tool_use","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"tool","tool":"bash","callID":"call_01","state":{"status":"completed","input":{"command":"npm test"}}}}
+{"type":"tool_use","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"tool","tool":"apply_patch","callID":"call_02","state":{"status":"completed","input":{"patch":"*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch"}}}}
+{"type":"text","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"text","text":"Done. <promise>COMPLETE</promise>"}}
+{"type":"step_finish","sessionID":"ses_19cb8236effe4lu1aSmQyzbeP2","part":{"type":"step-finish","tokens":{"total":512}}}

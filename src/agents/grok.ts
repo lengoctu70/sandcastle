@@ -25,6 +25,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, posix } from "node:path";
 import {
+  boundToolCallArgs,
   extractErrorMessage,
   readSandboxFile,
   shellEscape,
@@ -67,19 +68,14 @@ const GROK_TOOL_ARG_FIELDS: Record<string, string> = {
   ask_user_question: "question",
 };
 
-/** Display args are rendered inline — bound the JSON-dump fallback so a
- *  `write`-sized payload cannot flood the log. */
-const TOOL_ARG_DUMP_MAX_CHARS = 300;
-
+/** Display args are rendered inline — bound mapped fields and the JSON-dump
+ *  fallback alike so a `write`-sized payload cannot flood the log. */
 const grokToolCallArgs = (toolName: string, rawInput: unknown): string => {
   if (!isRecord(rawInput)) return "";
   const field = GROK_TOOL_ARG_FIELDS[toolName];
   const value = field !== undefined ? rawInput[field] : undefined;
-  if (typeof value === "string") return value;
-  const dump = JSON.stringify(rawInput);
-  return dump.length > TOOL_ARG_DUMP_MAX_CHARS
-    ? `${dump.slice(0, TOOL_ARG_DUMP_MAX_CHARS)}…`
-    : dump;
+  if (typeof value === "string") return boundToolCallArgs(value);
+  return boundToolCallArgs(JSON.stringify(rawInput));
 };
 
 /**
