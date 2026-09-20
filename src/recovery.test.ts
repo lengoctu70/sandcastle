@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import {
   chmod,
   mkdir,
@@ -9,11 +9,13 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   acquireRetryLock,
   listRecoveryStates,
   parseRecoveryState,
+  probeRecoveryArtifacts,
   readRecoveryState,
   recoveryStatePath,
   retryLockPath,
@@ -22,6 +24,8 @@ import {
   RECOVERY_STATE_VERSION,
   type RecoveryState,
 } from "./recovery.js";
+
+const execAsync = promisify(exec);
 
 const makeDir = () => mkdtemp(join(tmpdir(), "recovery-"));
 
@@ -501,5 +505,88 @@ describe("acquireRetryLock across processes", () => {
       first.kill("SIGKILL");
       await new Promise((r) => first.on("exit", r));
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Artifact probing (F030/F072): a failed target..source comparison is UNKNOWN
+// — never zero unmerged commits — and an empty range on a run that never
+// committed is incomplete work, not landed work.
+// ---------------------------------------------------------------------------
+
+describe("probeRecoveryArtifacts comparison state", () => {
+  const initGitRepo = async (dir: string) => {
+    await execAsync("git init -b main", { cwd: dir });
+    await execAsync('git config user.email "test@test.com"', { cwd: dir });
+    await execAsync('git config user.name "Test"', { cwd: dir });
+    await writeFile(join(dir, "hello.txt"), "hello\n");
+    await execAsync('git add -A && git commit -m "initial"', { cwd: dir });
+  };
+
+  it("a missing target branch is an unknown comparison, never an empty range", async () => {
+    const dir = await makeDir();
+    await initGitRepo(dir);
+    // Real preserved work: two commits on the source branch the (now
+    // renamed-away) target branch does not have.
+    await execAsync("git checkout -b sandcastle/issue-5", { cwd: dir });
+    await writeFile(join(dir, "work.txt"), "w\n");
+    await execAsync('git add -A && git commit -m "work"', { cwd: dir });
+    await execAsync("git checkout main", { cwd: dir });
+    await execAsync("git branch -m main main-renamed", { cwd: dir });
+
+    const probe = await probeRecoveryArtifacts(dir, makeState(5));
+    expect(probe.comparison).toBe("target-missing");
+    expect(probe.preservedCommits).toEqual([]);
+    expect(probe.landedOrEmpty).toBe(false);
+  });
+
+  it("an empty range on a run that never committed is incomplete, not landed", async () => {
+    const dir = await makeDir();
+    await initGitRepo(dir);
+    // Branch exists but sits exactly at the target tip — as an
+    // implementation-phase crash leaves it.
+    await execAsync("git branch sandcastle/issue-5", { cwd: dir });
+    const state: RecoveryState = { ...makeState(5), commits: [] };
+
+    const probe = await probeRecoveryArtifacts(dir, state);
+    expect(probe.comparison).toBe("ok");
+    expect(probe.preservedCommits).toEqual([]);
+    expect(probe.landedOrEmpty).toBe(false);
+  });
+
+  it("an empty range with recorded commits is the landed/reset stale signal", async () => {
+    const dir = await makeDir();
+    await initGitRepo(dir);
+    await execAsync("git branch sandcastle/issue-5", { cwd: dir });
+    // The record says the run produced a commit, yet the target..source
+    // range is empty — the work landed elsewhere or the branch was reset.
+    const probe = await probeRecoveryArtifacts(dir, makeState(5));
+    expect(probe.comparison).toBe("ok");
+    expect(probe.preservedCommits).toEqual([]);
+    expect(probe.landedOrEmpty).toBe(true);
+  });
+
+  it("a non-empty range reports the real preserved commits", async () => {
+    const dir = await makeDir();
+    await initGitRepo(dir);
+    await execAsync("git checkout -b sandcastle/issue-5", { cwd: dir });
+    await writeFile(join(dir, "work.txt"), "w\n");
+    await execAsync('git add -A && git commit -m "work"', { cwd: dir });
+    await execAsync("git checkout main", { cwd: dir });
+
+    const probe = await probeRecoveryArtifacts(dir, makeState(5));
+    expect(probe.comparison).toBe("ok");
+    expect(probe.preservedCommits.length).toBe(1);
+    expect(probe.landedOrEmpty).toBe(false);
+  });
+
+  it("a missing source branch is reported, not compared", async () => {
+    const dir = await makeDir();
+    await initGitRepo(dir);
+    const probe = await probeRecoveryArtifacts(dir, makeState(5));
+    expect(probe.comparison).toBe("source-missing");
+    expect(probe.branchExists).toBe(false);
+    expect(probe.preservedCommits).toEqual([]);
+    expect(probe.landedOrEmpty).toBe(false);
   });
 });
