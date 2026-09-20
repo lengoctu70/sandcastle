@@ -1,7 +1,14 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import type { FileSystem } from "@effect/platform";
 import { Cause, Effect, Exit } from "effect";
-import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -19,6 +26,7 @@ import {
   projectSettingsPath,
   saveProjectSettings,
   updateProjectSettings,
+  updateProjectSettingsAsync,
 } from "./ProjectSettings.js";
 import {
   ProjectSettingsIoError,
@@ -437,6 +445,147 @@ describe("updateProjectSettings", () => {
         );
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Atomic persistence + serialized updates (F024)
+// ---------------------------------------------------------------------------
+
+describe("settings durability (F024)", () => {
+  it("a failed replacement preserves the previous document, reports the write path, and cleans up temp files", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+    const before = await readFile(projectSettingsPath(dir), "utf-8");
+
+    const sandDir = join(dir, ".sandcastle");
+    await chmod(sandDir, 0o555);
+    // Probe — as root (or without POSIX perms) the dir stays writable and
+    // the fault cannot be injected; stand down rather than assert nothing.
+    const writable = await writeFile(join(sandDir, ".probe"), "x").then(
+      () => true,
+      () => false,
+    );
+    try {
+      if (writable) return;
+
+      const err = await failureOf(
+        saveProjectSettings(dir, { ...fullSettings(), model: "lost-write" }),
+      );
+      expect(err).toBeInstanceOf(ProjectSettingsIoError);
+      const ioErr = err as ProjectSettingsIoError;
+      expect(ioErr.settingsPath).toBe(projectSettingsPath(dir));
+      expect(ioErr.operation).toBe("write");
+      // The diagnostic says the old document survived.
+      expect(ioErr.message).toContain("được giữ nguyên");
+
+      // The prior valid document is byte-for-byte intact; no temp litter.
+      expect(await readFile(projectSettingsPath(dir), "utf-8")).toBe(before);
+      const names = await readdir(sandDir);
+      expect(names.filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      await chmod(sandDir, 0o755).catch(() => {});
+    }
+  });
+
+  it("readers only ever observe a complete document while saves replace it", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+    let done = false;
+
+    const writer = (async () => {
+      for (let i = 0; i < 30; i++) {
+        await run(
+          saveProjectSettings(dir, {
+            ...fullSettings(),
+            model: `model-${i}`,
+            verificationCommands: [`cmd-${i}`, "y".repeat(64 * 1024)],
+          }),
+        );
+      }
+      done = true;
+    })();
+    const reader = (async () => {
+      let reads = 0;
+      while (!done) {
+        // Must never throw malformed — every observed file is complete.
+        const loaded = await run(loadProjectSettings(dir));
+        expect(
+          loaded.model.startsWith("model-") ||
+            loaded.model === "claude-opus-4-8",
+        ).toBe(true);
+        reads++;
+      }
+      expect(reads).toBeGreaterThan(0);
+    })();
+
+    await Promise.all([writer, reader]);
+    expect(
+      (await readdir(join(dir, ".sandcastle"))).filter((n) =>
+        n.endsWith(".tmp"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("serializes concurrent read-modify-writes across the Effect and Promise seams — no lost update", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+
+    let done = false;
+    const reader = (async () => {
+      while (!done) {
+        // Concurrent readers during the storm always parse a full document.
+        await loadProjectSettingsAsync(dir);
+      }
+    })();
+
+    // Eight updates racing on eight DISTINCT fields — if any load→save pair
+    // interleaved, one side's patch would be silently dropped.
+    await Promise.all([
+      run(updateProjectSettings(dir, { model: "claude-sonnet-4-6" })),
+      updateProjectSettingsAsync(dir, { effort: "low" }),
+      run(updateProjectSettings(dir, { parallelism: 2 })),
+      updateProjectSettingsAsync(dir, {
+        verificationCommands: ["make check"],
+      }),
+      run(updateProjectSettings(dir, { verificationStatus: "failed" })),
+      updateProjectSettingsAsync(dir, { workflow: "blank" }),
+      run(updateProjectSettings(dir, { issueTracker: "beads" })),
+      updateProjectSettingsAsync(dir, { agent: "pi" }),
+    ]);
+    done = true;
+    await reader;
+
+    const loaded = await run(loadProjectSettings(dir));
+    expect(loaded).toMatchObject({
+      agent: "pi",
+      model: "claude-sonnet-4-6",
+      effort: "low",
+      workflow: "blank",
+      verificationCommands: ["make check"],
+      verificationStatus: "failed",
+      parallelism: 2,
+      issueTracker: "beads",
+    });
+  });
+
+  it("a failed update inside the serialized chain does not wedge later updates", async () => {
+    const dir = await makeDir();
+    await run(saveProjectSettings(dir, fullSettings()));
+
+    // One update fails validation; the NEXT queued update must still run.
+    const [failed, ok] = await Promise.allSettled([
+      updateProjectSettingsAsync(dir, { parallelism: 99 }),
+      // Ensure ordering: the failing update is submitted first.
+      updateProjectSettingsAsync(dir, { model: "still-works" }),
+    ]);
+
+    expect(failed.status).toBe("rejected");
+    expect((failed as PromiseRejectedResult).reason).toBeInstanceOf(
+      ProjectSettingsValidationError,
+    );
+    expect(ok.status).toBe("fulfilled");
+    expect((await run(loadProjectSettings(dir))).model).toBe("still-works");
   });
 });
 

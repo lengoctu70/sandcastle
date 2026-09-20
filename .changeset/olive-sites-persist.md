@@ -1,0 +1,5 @@
+---
+"@lengoctu70/sandcastle": patch
+---
+
+Make settings and recovery state durable under interruption and concurrency (#36). `.sandcastle/settings.json` and `.sandcastle/recovery/issue-<N>.json` are now written to a same-directory temporary file, flushed to disk, and atomically renamed into place — readers observe either the complete old document or the complete new one, never a truncated file, and a failed replacement preserves the prior document with an actionable Vietnamese diagnostic instead of leaving litter. In-process `updateProjectSettings` read-modify-write operations are serialized per repository so parallel queue workers can no longer lose each other's verification-status updates. `sandcastle retry <issue>` now acquires a cross-process lock file (`.sandcastle/recovery/issue-<N>.lock`) before it can touch the worktree or Git index — a second concurrent retry for the same issue is refused with the lock path and holding pid; a lock left by a dead process is broken as stale, while an unattributable lock file is reported rather than silently deleted.

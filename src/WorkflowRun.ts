@@ -1339,7 +1339,19 @@ export const runIssueWorkflow = async (
       retryCount: (resume?.retryCount ?? 0) + (resume !== undefined ? 1 : 0),
       failedAt: new Date().toISOString(),
     };
-    await writeRecoveryState(cwd, state).catch(() => {});
+    // A failed write must not sink the failure path, but it is surfaced in
+    // the run message — otherwise the summary would claim a retryable record
+    // exists when it does not.
+    const recoveryWriteError = await writeRecoveryState(cwd, state).then(
+      () => undefined,
+      (e) => (e instanceof Error ? e.message : String(e)),
+    );
+    if (recoveryWriteError !== undefined) {
+      status(
+        `Không ghi được bản ghi phục hồi cho issue #${issue.number}: ${recoveryWriteError}`,
+        "warn",
+      );
+    }
     const repairSummary =
       attempts.verificationRepair > 0 ||
       attempts.mergeConflictRepair > 0 ||
@@ -1379,6 +1391,9 @@ export const runIssueWorkflow = async (
         `Thất bại ở bước "${PHASE_LABEL[phase]}": ${firstLine(detail)}.` +
         `${repairSummary} ` +
         `Issue #${issue.number} vẫn mở; nhánh \`${sourceBranch}\` và worktree được giữ lại.` +
+        (recoveryWriteError !== undefined
+          ? ` (Không ghi được bản ghi phục hồi — \`sandcastle retry ${issue.number}\` sẽ không dùng được: ${firstLine(recoveryWriteError)})`
+          : "") +
         (reportPosted ? "" : " (Không đăng được báo cáo thất bại lên GitHub.)"),
     };
   };

@@ -54,11 +54,13 @@ import {
   type RunIssueWorkflowOptions,
 } from "./WorkflowRun.js";
 import {
+  acquireRetryLock,
   discardRecoveryWork,
   listRecoveryStates,
   probeRecoveryArtifacts,
   readRecoveryState,
   recoveryStatePath,
+  RetryLockHeldError,
   type RecoveryReadResult,
   type RecoveryState,
 } from "./recovery.js";
@@ -1529,6 +1531,11 @@ const statusCommand = Command.make("status", {}, () =>
  * pins the issue/branch/worktree so the run NEVER re-selects an issue or
  * creates a new implementation branch; it re-enters the workflow at the
  * recorded failure phase.
+ *
+ * A per-issue lock file (`.sandcastle/recovery/issue-<N>.lock`, F065) is
+ * acquired after the record checks out and BEFORE the workflow can mutate
+ * the worktree or the Git index, so two processes can never retry the same
+ * issue at once; it is released when the run ends for any reason.
  */
 const retryCommand = Command.make(
   "retry",
@@ -1558,13 +1565,24 @@ const retryCommand = Command.make(
           }),
         );
       }
+      const lock = yield* Effect.tryPromise({
+        try: () => acquireRetryLock(cwd, issueNumber),
+        catch: (e) =>
+          new InitError({
+            message:
+              e instanceof RetryLockHeldError
+                ? e.message
+                : `Không tạo được khóa retry cho issue #${issueNumber}: ` +
+                  (e instanceof Error ? e.message : String(e)),
+          }),
+      });
       yield* runWorkflowAndReport(d, {
         cwd,
         resume: record.state,
         onStatus: (message, severity) => {
           Effect.runSync(d.status(message, severity));
         },
-      });
+      }).pipe(Effect.ensuring(Effect.promise(() => lock.release())));
     }),
 );
 
