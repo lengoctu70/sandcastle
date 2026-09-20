@@ -31,10 +31,10 @@ import {
   type WorktreeRunResult,
 } from "./createWorktree.js";
 import type { DiscoveryExec } from "./discovery/contract.js";
-import { nodeDiscoveryExec } from "./discovery/nodeExec.js";
 import type { Severity } from "./Display.js";
 import { probeGhReadiness } from "./githubSetup.js";
 import {
+  hasSandcastleLabel,
   makeGithubIssueOps,
   nodeGhRunner,
   SANDCASTLE_LABEL,
@@ -909,9 +909,10 @@ const workflowRunPreflight = async (options: {
       : "Đang kiểm tra GitHub CLI (gh) và label…",
     "info",
   );
-  const readiness = await probeGhReadiness(
-    options.discoveryExec ?? nodeDiscoveryExec,
-  );
+  // No `nodeDiscoveryExec` fallback: the readiness probe defaults to a
+  // shell-free gh exec inside githubSetup.ts (no GitHub operation may go
+  // through a command shell); `discoveryExec` remains injectable for tests.
+  const readiness = await probeGhReadiness(options.discoveryExec);
   if (readiness.kind !== "ready") {
     throw new WorkflowRunError(
       readiness.kind === "not-installed"
@@ -982,7 +983,7 @@ export const runIssueWorkflow = async (
         `Issue #${issue.number} không ở trạng thái mở (state: ${issue.state || "unknown"}).`,
       );
     }
-    if (!issue.labels.includes(SANDCASTLE_LABEL)) {
+    if (!hasSandcastleLabel(issue.labels)) {
       throw new WorkflowRunError(
         `Issue #${issue.number} không có label "${SANDCASTLE_LABEL}" — ` +
           "chỉ các issue được gắn label này mới được Sandcastle thực hiện.",

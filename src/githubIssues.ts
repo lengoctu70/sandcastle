@@ -36,16 +36,30 @@ export interface GithubIssue {
  */
 export type GhRunner = (
   args: readonly string[],
-  options: { readonly cwd: string; readonly timeoutMs?: number },
+  options: {
+    readonly cwd: string;
+    readonly timeoutMs?: number;
+    /**
+     * Text written to the process's stdin, after which stdin is closed.
+     * Untrusted report content travels this way (`gh … --body-file -`) so it
+     * is never interpolated into a command line — multiline text, shell
+     * metacharacters, percent signs, Unicode, and bodies longer than the
+     * Windows command-line limit all survive literally.
+     */
+    readonly stdin?: string;
+  },
 ) => Promise<DiscoveryExecResult>;
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const SIGKILL_GRACE_MS = 500;
 
 /**
- * The real {@link GhRunner} — `spawn("gh", …)` without a shell (except on
- * Windows, where `.cmd` shims need `cmd`). Forces the C locale so callers can
- * match git/gh's English diagnostics reliably.
+ * The real {@link GhRunner} — `spawn("gh", …)` with a fixed executable plus
+ * argv and **no command shell on any platform**. Real `gh` is a native
+ * binary (`gh.exe` on Windows), so no `.cmd` shim indirection is ever
+ * needed; without a shell, argv reaches the process literally and
+ * metacharacters in arguments cannot spawn secondary commands. Forces the C
+ * locale so callers can match git/gh's English diagnostics reliably.
  */
 export const nodeGhRunner: GhRunner = (
   args,
@@ -55,9 +69,8 @@ export const nodeGhRunner: GhRunner = (
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const child = spawn("gh", [...args], {
       cwd: options.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, LC_ALL: "C" },
-      shell: process.platform === "win32",
       windowsHide: true,
     });
 
@@ -97,16 +110,48 @@ export const nodeGhRunner: GhRunner = (
     child.on("close", (code) =>
       settle({ stdout, stderr, exitCode: code, timedOut }),
     );
+
+    // If the process exits before we finish writing, stdin errors (EPIPE)
+    // are uninteresting — the captured output already explains the outcome.
+    child.stdin.on("error", () => {});
+    if (options.stdin !== undefined) {
+      child.stdin.write(options.stdin);
+    }
+    child.stdin.end();
   });
 
-/** A `gh` call failed (non-zero exit, timeout, or spawn failure). */
+/**
+ * Why a `gh` call failed — each kind maps to a distinct user action, so the
+ * workflow never collapses them into one opaque "gh failed" message.
+ */
+export type GithubCliErrorKind =
+  /** The process exceeded `timeoutMs` and was killed (network stalls, …). */
+  | "timeout"
+  /** `gh` could not be started at all (ENOENT, EACCES, …). */
+  | "spawn-failure"
+  /** gh reported the active account is not signed in to the host. */
+  | "unauthenticated"
+  /** gh reported the account lacks permission for the operation. */
+  | "permission"
+  /** gh answered but stdout was not the JSON the operation needs. */
+  | "malformed-json"
+  /** Any other non-zero exit. */
+  | "exit";
+
+/**
+ * A `gh` call failed. `kind` distinguishes the typed cause (timeout, spawn
+ * failure, unauthenticated, permission, malformed JSON, other exit) and
+ * `detail` carries actionable Vietnamese guidance — callers surface
+ * `message` verbatim inside their own Vietnamese diagnostics (ADR 0026).
+ */
 export class GithubCliError extends Error {
   readonly _tag = "GithubCliError";
   constructor(
     readonly args: readonly string[],
+    readonly kind: GithubCliErrorKind,
     readonly detail: string,
   ) {
-    super(`gh ${args.join(" ")} failed: ${detail}`);
+    super(`gh ${args.join(" ")} thất bại: ${detail}`);
     this.name = "GithubCliError";
   }
 }
@@ -117,27 +162,92 @@ const firstLine = (text: string): string | undefined =>
     .map((l) => l.trim())
     .find((l) => l.length > 0);
 
+/** gh's "not signed in" diagnostics (auth status report, API 401, …). */
+const UNAUTHENTICATED_PATTERN =
+  /not logged in|no github hosts|authentication required|requires authentication|bad credentials|http 401|gh auth login/i;
+
+/** gh's "missing permission" diagnostics (HTTP 403, GraphQL forbids, …). */
+const PERMISSION_PATTERN =
+  /http 403|forbidden|resource not accessible|insufficient|permission|not authorized|must have \w+ access/i;
+
+/**
+ * Fold a failed {@link DiscoveryExecResult} into a typed {@link GithubCliError}.
+ * Timeout and spawn failure are checked before output parsing so they can
+ * never be misreported as an auth problem, and auth/permission signatures in
+ * gh's own diagnostics select the matching Vietnamese next step.
+ */
+const classifyGhFailure = (
+  args: readonly string[],
+  res: DiscoveryExecResult,
+  timeoutMs: number,
+): GithubCliError => {
+  if (res.timedOut) {
+    return new GithubCliError(
+      args,
+      "timeout",
+      `hết thời gian chờ sau ${timeoutMs}ms — kiểm tra kết nối mạng rồi thử lại.`,
+    );
+  }
+  if (res.spawnError !== undefined) {
+    return new GithubCliError(
+      args,
+      "spawn-failure",
+      `không khởi động được gh (${res.spawnError}) — kiểm tra gh đã được cài đặt và nằm trên PATH.`,
+    );
+  }
+  const output = `${res.stderr}\n${res.stdout}`;
+  const line =
+    firstLine(res.stderr) ??
+    firstLine(res.stdout) ??
+    `thoát với mã ${res.exitCode ?? "null"}`;
+  if (UNAUTHENTICATED_PATTERN.test(output)) {
+    return new GithubCliError(
+      args,
+      "unauthenticated",
+      `${line} — chạy \`gh auth login\` để đăng nhập GitHub.`,
+    );
+  }
+  if (PERMISSION_PATTERN.test(output)) {
+    return new GithubCliError(
+      args,
+      "permission",
+      `${line} — tài khoản gh thiếu quyền cho thao tác này trên repository (cần quyền Issues: write).`,
+    );
+  }
+  return new GithubCliError(args, "exit", line);
+};
+
 /** Run `gh <args>` and fail with {@link GithubCliError} on any non-zero outcome. */
 const ghOk = async (
   runner: GhRunner,
   cwd: string,
   args: readonly string[],
-  timeoutMs = DEFAULT_TIMEOUT_MS,
+  options: { readonly timeoutMs?: number; readonly stdin?: string } = {},
 ): Promise<string> => {
-  const res = await runner(args, { cwd, timeoutMs });
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const res = await runner(args, { cwd, timeoutMs, stdin: options.stdin });
   if (res.exitCode !== 0) {
-    throw new GithubCliError(
-      args,
-      res.timedOut
-        ? `timed out after ${timeoutMs}ms`
-        : (firstLine(res.stderr) ??
-            firstLine(res.stdout) ??
-            (res.spawnError !== undefined
-              ? `spawn failed (${res.spawnError})`
-              : `exited with code ${res.exitCode ?? "null"}`)),
-    );
+    throw classifyGhFailure(args, res, timeoutMs);
   }
   return res.stdout;
+};
+
+/**
+ * Parse a `gh … --json` response. gh writing non-JSON (proxy error pages,
+ * upgrade banners, truncated output) is a typed {@link GithubCliError}
+ * (`"malformed-json"`), never a raw `SyntaxError` or a silent empty result.
+ */
+const parseGhJson = (args: readonly string[], stdout: string): unknown => {
+  try {
+    return JSON.parse(stdout);
+  } catch (e) {
+    throw new GithubCliError(
+      args,
+      "malformed-json",
+      `gh trả về dữ liệu JSON không hợp lệ (${e instanceof Error ? e.message : String(e)}) — ` +
+        "kiểm tra phiên bản gh (`gh --version`) và kết nối mạng, rồi thử lại.",
+    );
+  }
 };
 
 /** Parse one `gh issue … --json` entry into a {@link GithubIssue}. */
@@ -181,9 +291,21 @@ export interface GithubIssueOps {
 /** The label the run workflow selects issues by. */
 export const SANDCASTLE_LABEL = "Sandcastle";
 
+/**
+ * Case-insensitive `Sandcastle`-label check — GitHub treats labels as
+ * case-insensitively unique, so a repository label named `sandcastle` must
+ * satisfy every Sandcastle lookup exactly like `Sandcastle` does.
+ */
+export const hasSandcastleLabel = (labels: readonly string[]): boolean =>
+  labels.some((l) => l.toLowerCase() === SANDCASTLE_LABEL.toLowerCase());
+
 const ISSUE_JSON_FIELDS = "number,title,body,state,labels,url";
 const ISSUE_LIST_LIMIT = 100;
-const LABEL_LIST_LIMIT = 200;
+/**
+ * Cap on the `--search`-filtered label query — a specific search, not an
+ * arbitrary page of every label, so large repositories stay correct.
+ */
+const LABEL_SEARCH_LIMIT = 100;
 
 /**
  * Bind the issue operations to a repository directory. `cwd` is handed to
@@ -194,32 +316,34 @@ export const makeGithubIssueOps = (
   runner: GhRunner = nodeGhRunner,
 ): GithubIssueOps => ({
   labelExists: async () => {
-    const stdout = await ghOk(runner, cwd, [
+    const args = [
       "label",
       "list",
+      "--search",
+      SANDCASTLE_LABEL,
       "--json",
       "name",
       "--limit",
-      String(LABEL_LIST_LIMIT),
-    ]);
-    try {
-      const entries = JSON.parse(stdout) as unknown;
-      return (
-        Array.isArray(entries) &&
-        entries.some(
-          (e) =>
-            typeof e === "object" &&
-            e !== null &&
-            (e as Record<string, unknown>)["name"] === SANDCASTLE_LABEL,
-        )
-      );
-    } catch {
-      return false;
-    }
+      String(LABEL_SEARCH_LIMIT),
+    ] as const;
+    const stdout = await ghOk(runner, cwd, args);
+    const entries = parseGhJson(args, stdout);
+    return (
+      Array.isArray(entries) &&
+      entries.some(
+        (e) =>
+          typeof e === "object" &&
+          e !== null &&
+          typeof (e as Record<string, unknown>)["name"] === "string" &&
+          hasSandcastleLabel([
+            (e as Record<string, unknown>)["name"] as string,
+          ]),
+      )
+    );
   },
 
   listEligibleIssues: async () => {
-    const stdout = await ghOk(runner, cwd, [
+    const args = [
       "issue",
       "list",
       "--state",
@@ -230,38 +354,44 @@ export const makeGithubIssueOps = (
       ISSUE_JSON_FIELDS,
       "--limit",
       String(ISSUE_LIST_LIMIT),
-    ]);
-    const raw: unknown = JSON.parse(stdout);
+    ] as const;
+    const stdout = await ghOk(runner, cwd, args);
+    const raw = parseGhJson(args, stdout);
     if (!Array.isArray(raw)) return [];
     return raw.map(toIssue).filter((i): i is GithubIssue => i !== undefined);
   },
 
   viewIssue: async (issueNumber) => {
-    const stdout = await ghOk(runner, cwd, [
+    const args = [
       "issue",
       "view",
       String(issueNumber),
       "--json",
       ISSUE_JSON_FIELDS,
-    ]);
-    const issue = toIssue(JSON.parse(stdout));
+    ] as const;
+    const stdout = await ghOk(runner, cwd, args);
+    const issue = toIssue(parseGhJson(args, stdout));
     if (issue === undefined) {
       throw new GithubCliError(
-        ["issue", "view", String(issueNumber)],
-        "unexpected response shape (missing issue number)",
+        args,
+        "malformed-json",
+        "gh trả về issue thiếu trường `number` — kiểm tra phiên bản gh (`gh --version`) rồi thử lại.",
       );
     }
     return issue;
   },
 
   postComment: async (issueNumber, body) => {
-    await ghOk(runner, cwd, [
-      "issue",
-      "comment",
-      String(issueNumber),
-      "--body",
-      body,
-    ]);
+    // The report body is untrusted multiline content — it travels on stdin
+    // (`--body-file -`), never on the command line, so newlines, shell
+    // metacharacters, percent signs, Unicode, and bodies beyond the Windows
+    // command-line limit all reach GitHub literally.
+    await ghOk(
+      runner,
+      cwd,
+      ["issue", "comment", String(issueNumber), "--body-file", "-"],
+      { stdin: body },
+    );
   },
 
   closeIssue: async (issueNumber) => {

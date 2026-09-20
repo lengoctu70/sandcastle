@@ -75,8 +75,16 @@ const shimmedPath = (...shimDirs: string[]) =>
  * workflow issues. Driven by env:
  * - FAKE_GH_AUTH="1" → `auth status` succeeds
  * - FAKE_GH_LABEL="1" → `label list` reports the Sandcastle label
+ * - FAKE_GH_LABEL_NAME → override that label's name (e.g. "sandcastle" for
+ *   GitHub's case-insensitive label semantics)
  * - FAKE_GH_ISSUES  → path to a JSON array of issues
  * - FAKE_GH_COMMENT_FAIL / FAKE_GH_CLOSE_FAIL → those mutations exit 1
+ *
+ * `issue comment … --body-file -` reads the report body from stdin and logs
+ * it verbatim between `--- GH-BODY ---` markers so tests can assert literal
+ * comment content (multiline, metacharacters, Unicode) — the body must
+ * never travel on the command line. Label matching is case-insensitive like
+ * real GitHub.
  */
 const writeFakeGh = async (dir: string) => {
   const shim = join(dir, "gh");
@@ -91,19 +99,25 @@ if (log) fs.appendFileSync(log, "gh " + key + "\\n");
 if (key === "--version") { console.log("gh version 2.90.0"); process.exit(0); }
 if (key === "auth status") {
   if (process.env.FAKE_GH_AUTH === "1") {
-    console.log("github.com\\n  ✓ Logged in to github.com as test");
+    console.log("github.com\\n  ✓ Logged in to github.com account test (keyring)");
     process.exit(0);
   }
   console.error("You are not logged into any GitHub hosts.");
   process.exit(1);
 }
 if (args[0] === "label" && args[1] === "list") {
-  console.log(JSON.stringify(process.env.FAKE_GH_LABEL === "1" ? [{ name: "Sandcastle" }] : []));
+  const si = args.indexOf("--search");
+  const search = si !== -1 ? String(args[si + 1]).toLowerCase() : undefined;
+  const name = process.env.FAKE_GH_LABEL_NAME || "Sandcastle";
+  const known = process.env.FAKE_GH_LABEL === "1" ? [{ name }] : [];
+  const out = search === undefined ? known : known.filter((l) => l.name.toLowerCase().indexOf(search) !== -1);
+  console.log(JSON.stringify(out));
   process.exit(0);
 }
 const issues = () => JSON.parse(fs.readFileSync(process.env.FAKE_GH_ISSUES, "utf-8"));
+const hasSandcastle = (i) => (i.labels || []).some((l) => (l.name || "").toLowerCase() === "sandcastle");
 if (args[0] === "issue" && args[1] === "list") {
-  const open = issues().filter((i) => i.state === "OPEN" && (i.labels || []).some((l) => l.name === "Sandcastle"));
+  const open = issues().filter((i) => i.state === "OPEN" && hasSandcastle(i));
   console.log(JSON.stringify(open));
   process.exit(0);
 }
@@ -115,17 +129,29 @@ if (args[0] === "issue" && args[1] === "view") {
   process.exit(0);
 }
 if (args[0] === "issue" && args[1] === "comment") {
-  if (process.env.FAKE_GH_COMMENT_FAIL === "1") { console.error("comment denied"); process.exit(1); }
-  console.log("commented");
-  process.exit(0);
-}
-if (args[0] === "issue" && args[1] === "close") {
+  const bf = args.indexOf("--body-file");
+  const finish = (body) => {
+    if (log) fs.appendFileSync(log, "--- GH-BODY ---\\n" + body + "\\n--- /GH-BODY ---\\n");
+    if (process.env.FAKE_GH_COMMENT_FAIL === "1") { console.error("comment denied"); process.exit(1); }
+    console.log("commented");
+    process.exit(0);
+  };
+  if (bf !== -1 && args[bf + 1] !== "-") {
+    finish(fs.readFileSync(args[bf + 1], "utf-8"));
+  } else {
+    let body = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (d) => (body += d));
+    process.stdin.on("end", () => finish(body));
+  }
+} else if (args[0] === "issue" && args[1] === "close") {
   if (process.env.FAKE_GH_CLOSE_FAIL === "1") { console.error("close denied"); process.exit(1); }
   console.log("closed");
   process.exit(0);
+} else {
+  console.error("unexpected gh args: " + key);
+  process.exit(1);
 }
-console.error("unexpected gh args: " + key);
-process.exit(1);
 `,
   );
   await chmod(shim, 0o755);
@@ -816,6 +842,41 @@ describe("sandcastle run (CLI seam, fake gh + fake agent)", () => {
       expect(stdout + stderr).toContain("#5");
       expect(stdout + stderr).toContain("Sandcastle");
     }
+  });
+
+  it("accepts a lowercase 'sandcastle' label end-to-end (GitHub labels are case-insensitive)", async () => {
+    const { repoDir, logFile, env } = await makeFixture(
+      [{ ...ISSUE_5, labels: [{ name: "sandcastle" }] }],
+      { FAKE_GH_LABEL_NAME: "sandcastle" },
+    );
+    await writeSettings(repoDir);
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+
+    const log = await readLog(logFile);
+    // The repo label lookup ran through --search and matched case-insensitively.
+    expect(log.some((l) => l.startsWith("gh label list --search"))).toBe(true);
+    expect(log.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
+    expect(log.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+    expect(stdout).toContain("Hoàn thành issue #5");
+  });
+
+  it("posts the report body through --body-file stdin, never on the command line", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    await writeSettings(repoDir);
+
+    await runCli("run --issue 5", repoDir, env);
+
+    const raw = await readFile(logFile, "utf-8");
+    // The argv line carries only the body-file marker — no report content
+    // is interpolated into the command string.
+    expect(raw).toContain("gh issue comment 5 --body-file -\n");
+    expect(raw).not.toContain("--body ");
+    // The literal report content arrived through stdin, intact.
+    const body =
+      raw.split("--- GH-BODY ---\n")[1]?.split("\n--- /GH-BODY ---")[0] ?? "";
+    expect(body).toContain("Sandcastle đã hoàn thành");
+    expect(body).toContain("issue #5");
   });
 
   it("run --help exposes --issue, --all, and --parallelism", async () => {
