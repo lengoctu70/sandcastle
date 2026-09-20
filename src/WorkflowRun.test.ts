@@ -9,7 +9,10 @@ import {
   buildFailureReport,
   buildImplementationPrompt,
   buildMergeConflictRepairPrompt,
+  buildPlanningPrompt,
+  buildReviewPrompt,
   buildVerificationRepairPrompt,
+  PHASE_LABEL,
   runVerificationCommands,
 } from "./WorkflowRun.js";
 
@@ -63,6 +66,91 @@ describe("buildImplementationPrompt", () => {
       context: promptContext([]),
     });
     expect(bare).not.toContain("## Verification");
+  });
+
+  it("injects the planner's plan as a ## Plan section when provided (#27)", () => {
+    const prompt = buildImplementationPrompt({
+      context: promptContext(),
+      plan: "1. Add greeting.ts\n2. Wire it into main",
+    });
+    expect(prompt).toContain("## Plan");
+    expect(prompt).toContain("A planning agent analyzed this issue");
+    expect(prompt).toContain("1. Add greeting.ts");
+    expect(prompt).toContain("2. Wire it into main");
+  });
+
+  it("omits the plan section when the planner returned nothing usable", () => {
+    const prompt = buildImplementationPrompt({
+      context: promptContext(),
+      plan: "   ",
+    });
+    expect(prompt).not.toContain("## Plan");
+  });
+});
+
+describe("buildPlanningPrompt", () => {
+  const prompt = buildPlanningPrompt({ context: promptContext() });
+
+  it("asks for a plan for the immutable selected issue", () => {
+    expect(prompt).toContain("# Task — plan");
+    expect(prompt).toContain("issue #42");
+    expect(prompt).toContain("Add a greeting command");
+    expect(prompt).toContain("The CLI should greet the user.");
+  });
+
+  it("forbids tree mutations — the planner's only output is text", () => {
+    expect(prompt).toContain("do NOT modify files");
+    expect(prompt).toContain("do NOT commit");
+    expect(prompt).toContain("do NOT create branches");
+  });
+
+  it("keeps issue closure out of the agent's reach and lists verification", () => {
+    expect(prompt).toContain("Do NOT run `gh issue close`");
+    expect(prompt).toContain("`npm test`");
+    expect(prompt).toContain("<promise>COMPLETE</promise>");
+    expect(prompt).toContain("`main`");
+    expect(prompt).toContain("sandcastle/issue-42");
+  });
+});
+
+describe("buildReviewPrompt", () => {
+  const prompt = buildReviewPrompt({ context: promptContext() });
+
+  it("points the reviewer at the committed diff on the source branch", () => {
+    expect(prompt).toContain("# Task — review");
+    expect(prompt).toContain("issue #42");
+    expect(prompt).toContain("`sandcastle/issue-42`");
+    expect(prompt).toContain("git diff main...HEAD");
+    expect(prompt).toContain("git log main..HEAD --oneline");
+  });
+
+  it("allows correction commits on the source branch but not issue mutations", () => {
+    expect(prompt).toContain("Commit any corrections on `sandcastle/issue-42`");
+    expect(prompt).toContain("`main`");
+    expect(prompt).toContain("Do NOT run `gh issue close`");
+    expect(prompt).toContain("`npm test`");
+    expect(prompt).toContain("<promise>COMPLETE</promise>");
+  });
+});
+
+describe("PHASE_LABEL", () => {
+  it("has a Vietnamese label for every run phase including planning and review", () => {
+    expect(PHASE_LABEL["planning"]).toContain("kế hoạch");
+    expect(PHASE_LABEL["review"]).toContain("review");
+    // Every declared phase still has a label — no orphan phases.
+    for (const phase of [
+      "preflight",
+      "planning",
+      "implementation",
+      "review",
+      "verification",
+      "integration",
+      "integration-verification",
+      "landing",
+      "reporting",
+    ] as const) {
+      expect(PHASE_LABEL[phase].length).toBeGreaterThan(0);
+    }
   });
 });
 

@@ -93,6 +93,7 @@ const settingsSummaryRows = (
     agent: settings.agent,
     model: settings.model,
     effort: settings.effort ?? "—",
+    agentExecutable: settings.agentExecutable ?? "—",
     modelSource: settings.modelSource,
     workflow: settings.workflow,
     sandbox: settings.sandbox,
@@ -239,7 +240,10 @@ const resolveSharedFlagUpdate = (params: {
   readonly allowUnverified: boolean;
   readonly isInteractive: boolean;
 }): Effect.Effect<
-  Pick<MutableUpdate, "agent" | "model" | "effort" | "modelSource">,
+  Pick<
+    MutableUpdate,
+    "agent" | "model" | "effort" | "agentExecutable" | "modelSource"
+  >,
   InitError,
   Display
 > =>
@@ -303,47 +307,66 @@ const resolveSharedFlagUpdate = (params: {
       }).pipe(translateStopMessage);
       if (outcome.kind === "back") {
         // Interactive escape: "pick another agent" — fall into the full
-        // ready-first picker exactly like init does.
+        // ready-first picker exactly like init does, still pre-selecting the
+        // current effective values.
         const picked = yield* pickHostAgent({
           agents: listAgents(),
           modelFlag,
           effortFlag,
           allowUnverified,
+          initialAgentName: current.agent,
+          initialModel: current.model,
+          initialEffort: current.effort,
         }).pipe(translateStopMessage);
+        const exe = executableUpdate(
+          picked.agent.name,
+          picked.selection,
+          current,
+        );
         return {
           agent: picked.agent.name,
           model: picked.selection.model,
           effort: clearEffort ? null : (picked.selection.effort ?? null),
           modelSource: picked.selection.modelSource,
+          ...(exe !== undefined ? { agentExecutable: exe } : {}),
         };
       }
+      const exe = executableUpdate(targetName, outcome.selection, current);
       return {
         agent: targetName,
         model: outcome.selection.model,
         effort: clearEffort ? null : (outcome.selection.effort ?? null),
         modelSource: outcome.selection.modelSource,
+        ...(exe !== undefined ? { agentExecutable: exe } : {}),
       };
     }
 
     // Static path — container projects never probe the host, and a changed
-    // agent drops the previous model/effort for the registry default.
+    // agent drops the previous model/effort for the registry default. A
+    // changed model also drops the inherited effort (F037): it was verified
+    // — or never verified — against the old model, so only an explicit
+    // --effort survives the switch.
     const model =
       modelFlag._tag === "Some"
         ? modelFlag.value.trim()
         : agentChanged
           ? (entry?.defaultModel ?? current.model)
           : current.model;
+    const modelChanged = model !== current.model;
     const effort = clearEffort
       ? null
       : effortFlag._tag === "Some"
         ? effortFlag.value.trim()
-        : agentChanged
+        : agentChanged || modelChanged
           ? null
           : undefined; // unchanged
     return {
       agent: targetName,
       model,
       ...(effort !== undefined ? { effort } : {}),
+      // The persisted executable alias names the previous agent's binary —
+      // it must not follow an agent switch.
+      ...(agentChanged ? { agentExecutable: null } : {}),
       modelSource: "manual-unverified" as const,
     };
   });
@@ -481,10 +504,14 @@ const pickStaticAgent = (params: {
     if (clack.isCancel(modelEntered)) {
       return yield* stopConfigure();
     }
+    // F037: the persisted effort only pre-fills while the model is unchanged —
+    // once the model moves, an inherited effort is at best unverified, so the
+    // prompt starts empty and only a freshly typed value is kept.
+    const sameModel = sameAgent && modelEntered.trim() === params.initialModel;
     const effortEntered = yield* Effect.promise(() =>
       clack.text({
         message: `Nhập effort cho ${modelEntered.trim()} (để trống nếu không dùng):`,
-        ...(sameAgent && params.initialEffort !== undefined
+        ...(sameModel && params.initialEffort !== undefined
           ? { initialValue: params.initialEffort }
           : {}),
       }),
@@ -521,12 +548,34 @@ const pickAgentSelection = (params: {
         modelFlag: Option.none(),
         effortFlag: Option.none(),
         allowUnverified: params.allowUnverified,
+        // Forward the current effective values — the pickers pre-select them
+        // instead of the first ready agent / catalog recommendation (F015).
+        initialAgentName: params.initialAgentName,
+        initialModel: params.initialModel,
+        initialEffort: params.initialEffort,
       }).pipe(translateStopMessage)
     : pickStaticAgent({
         initialAgentName: params.initialAgentName,
         initialModel: params.initialModel,
         initialEffort: params.initialEffort,
       });
+
+/**
+ * What a re-resolved selection means for the persisted `agentExecutable`
+ * alias: a freshly probed executable replaces it; a switch to a different
+ * agent clears it (the alias names the old agent's binary); an unchanged
+ * agent without a probed executable leaves the stored value alone.
+ */
+const executableUpdate = (
+  selectedAgentName: string,
+  selection: { readonly executable?: string },
+  current: ProjectSettings,
+): string | null | undefined =>
+  selection.executable !== undefined
+    ? selection.executable
+    : selectedAgentName !== current.agent
+      ? null
+      : undefined;
 
 type ConfigureSection =
   | "shared"
@@ -556,6 +605,8 @@ const sharedSection = (params: {
     update.model = picked.selection.model;
     update.effort = picked.selection.effort ?? null;
     update.modelSource = picked.selection.modelSource;
+    const exe = executableUpdate(picked.agent.name, picked.selection, current);
+    if (exe !== undefined) update.agentExecutable = exe;
   });
 
 const verificationSection = (params: {

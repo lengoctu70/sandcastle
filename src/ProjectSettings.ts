@@ -86,6 +86,13 @@ export interface ProjectSettings {
   readonly model: string;
   /** Optional reasoning effort / model variant the agent supports. */
   readonly effort?: string;
+  /**
+   * The executable name host-mode discovery actually probed for the selected
+   * agent (e.g. `"agent"` when Grok's CLI only answers under its alias).
+   * Persisted so `sandcastle run` invokes the same binary that was
+   * fingerprinted — the agent name alone can resolve to a different product.
+   */
+  readonly agentExecutable?: string;
   readonly modelSource: ModelSource;
   /** Workflow/template identifier chosen at init, e.g. `"simple-loop"`. */
   readonly workflow: string;
@@ -253,6 +260,8 @@ export interface InitialProjectSettings {
   readonly sandbox: SandboxProviderChoice;
   readonly issueTracker: string;
   readonly effort?: string;
+  /** The probed executable name for the agent, when discovery ran (host mode). */
+  readonly agentExecutable?: string;
   /** Defaults to `"manual-unverified"` — init must opt in to `"discovered"` only when it actually queried the agent's live catalog. */
   readonly modelSource?: ModelSource;
   /** Defaults to `[]`. */
@@ -274,6 +283,7 @@ export interface InitialProjectSettings {
  */
 export interface ProjectSettingsInitOverrides {
   readonly effort?: string;
+  readonly agentExecutable?: string;
   readonly modelSource?: ModelSource;
   readonly sandbox?: SandboxProviderChoice;
   readonly verificationCommands?: readonly string[];
@@ -293,6 +303,9 @@ export const makeProjectSettings = (
   agent: init.agent,
   model: init.model,
   ...(init.effort !== undefined ? { effort: init.effort } : {}),
+  ...(init.agentExecutable !== undefined
+    ? { agentExecutable: init.agentExecutable }
+    : {}),
   modelSource: init.modelSource ?? "manual-unverified",
   workflow: init.workflow,
   sandbox: init.sandbox,
@@ -325,8 +338,8 @@ export interface RoleOverrideUpdate {
  * Partial update applied by {@link updateProjectSettings}.
  *
  * - `undefined` leaves a field unchanged.
- * - `null` clears an optional field (`effort`) or removes a role's override
- *   entry inside `roleOverrides`.
+ * - `null` clears an optional field (`effort`, `agentExecutable`) or removes a
+ *   role's override entry inside `roleOverrides`.
  * - `verificationCommands` and each role-override entry replace wholesale
  *   (per-key `null` clears inside a role entry).
  * - `version` is never updatable.
@@ -335,6 +348,7 @@ export interface ProjectSettingsUpdate {
   readonly agent?: string;
   readonly model?: string;
   readonly effort?: string | null;
+  readonly agentExecutable?: string | null;
   readonly modelSource?: ModelSource;
   readonly workflow?: string;
   readonly sandbox?: SandboxProviderChoice;
@@ -417,6 +431,7 @@ const SETTINGS_FIELDS = [
   "agent",
   "model",
   "effort",
+  "agentExecutable",
   "modelSource",
   "workflow",
   "sandbox",
@@ -453,6 +468,15 @@ const validateSettings = (
   let effort: string | undefined;
   if (raw["effort"] !== undefined) {
     effort = requireString(raw["effort"], "effort", fail);
+  }
+
+  let agentExecutable: string | undefined;
+  if (raw["agentExecutable"] !== undefined) {
+    agentExecutable = requireString(
+      raw["agentExecutable"],
+      "agentExecutable",
+      fail,
+    );
   }
 
   const modelSource = raw["modelSource"];
@@ -536,6 +560,7 @@ const validateSettings = (
     agent,
     model,
     ...(effort !== undefined ? { effort } : {}),
+    ...(agentExecutable !== undefined ? { agentExecutable } : {}),
     modelSource: modelSource as ModelSource,
     workflow,
     sandbox: sandbox as SandboxProviderChoice,
@@ -742,6 +767,12 @@ const applyUpdate = (
     delete next.effort;
   } else if (update.effort !== undefined) {
     next.effort = update.effort;
+  }
+
+  if (update.agentExecutable === null) {
+    delete next.agentExecutable;
+  } else if (update.agentExecutable !== undefined) {
+    next.agentExecutable = update.agentExecutable;
   }
 
   if (update.roleOverrides !== undefined) {
