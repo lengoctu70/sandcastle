@@ -19,6 +19,16 @@ export type { ParsedStreamEvent, IterationUsage } from "./AgentProvider.js";
 
 const IDLE_WARNING_INTERVAL_MS = 60_000;
 
+/**
+ * Bound on how long `invokeAgent` waits for a spawned process tree to finish
+ * teardown once the invocation is aborted (idle timeout, completion timeout,
+ * or cancellation). For the no-sandbox provider the exec promise resolves on
+ * the child's "close" event — promptly after its SIGTERM → SIGKILL
+ * escalation — so this is only a safety bound for providers that ignore the
+ * abort signal; their teardown happens at sandbox release instead.
+ */
+const EXEC_TEARDOWN_AWAIT_MS = 5_000;
+
 const invokeAgent = (
   sandbox: SandboxService,
   sandboxRepoDir: string,
@@ -37,7 +47,12 @@ const invokeAgent = (
   forkSession?: boolean,
   signal?: AbortSignal,
 ): Effect.Effect<
-  { result: string; sessionId?: string; usage?: IterationUsage },
+  {
+    result: string;
+    sessionId?: string;
+    usage?: IterationUsage;
+    completionSignal?: string;
+  },
   SandboxError
 > =>
   Effect.gen(function* () {
@@ -48,6 +63,10 @@ const invokeAgent = (
     // hanging process can be force-completed once the signal is in the buffer
     // (see ADR 0019).
     let accumulatedOutput = "";
+    // The completion signal matched in accumulatedOutput. Tracked here so a
+    // signal seen in an earlier conversation turn survives a later result
+    // event that does not repeat it.
+    let detectedSignal: string | undefined;
 
     // Deferred that fails when the idle timer fires (no signal seen).
     const timeoutSignal = yield* Deferred.make<never, AgentIdleTimeoutError>();
@@ -56,7 +75,12 @@ const invokeAgent = (
     // hand control back to the orchestrator with the buffered output, which
     // still contains the signal so the existing completionSignal check works.
     const completionTimeoutDeferred = yield* Deferred.make<
-      { result: string; sessionId?: string; usage?: IterationUsage },
+      {
+        result: string;
+        sessionId?: string;
+        usage?: IterationUsage;
+        completionSignal?: string;
+      },
       never
     >();
     let timeoutFiber: Fiber.RuntimeFiber<unknown, unknown> | null = null;
@@ -98,6 +122,7 @@ const invokeAgent = (
               result: resultText || accumulatedOutput,
               sessionId,
               usage,
+              completionSignal: detectedSignal,
             });
           }),
         );
@@ -123,12 +148,19 @@ const invokeAgent = (
     // Deferred that will be resolved (as a defect) when the AbortSignal fires.
     // Uses Effect.die so the abort reason propagates as-is to run().
     const abortDeferred = yield* Deferred.make<never, never>();
+    // Internal abort controller handed to sandbox.exec in place of the
+    // caller's signal. It is aborted on caller cancellation, on idle timeout,
+    // and on completion timeout, so every exit path terminates the spawned
+    // process tree — and the finalizer below awaits that teardown — before
+    // invokeAgent returns control to the workflow (ADR 0024).
+    const execController = new AbortController();
     let abortCleanup: (() => void) | null = null;
     if (signal) {
       if (signal.aborted) {
         return yield* Effect.die(signal.reason);
       }
       const onAbort = () => {
+        execController.abort();
         Effect.runFork(Deferred.die(abortDeferred, signal.reason));
       };
       signal.addEventListener("abort", onAbort, { once: true });
@@ -173,20 +205,26 @@ const invokeAgent = (
           }
           // Check for the completion signal AFTER parsing this line so the
           // accumulator contains everything seen so far. Flip to the
-          // completion-grace timer the first time the signal appears.
-          if (
-            !completionDetected &&
-            completionSignals.some((sig) => accumulatedOutput.includes(sig))
-          ) {
-            completionDetected = true;
-            interruptFiber(warningFiber);
-            warningFiber = null;
+          // completion-grace timer the first time the signal appears. The
+          // matched signal is remembered: it was detected over the whole
+          // streamed conversation, so a later result event that drops it
+          // cannot erase it.
+          if (!completionDetected) {
+            const matched = completionSignals.find((sig) =>
+              accumulatedOutput.includes(sig),
+            );
+            if (matched !== undefined) {
+              completionDetected = true;
+              detectedSignal = matched;
+              interruptFiber(warningFiber);
+              warningFiber = null;
+            }
           }
           resetTimer();
         },
         cwd: sandboxRepoDir,
         stdin: printCmd.stdin,
-        signal,
+        signal: execController.signal,
       });
 
       if (execResult.exitCode !== 0) {
@@ -207,7 +245,18 @@ const invokeAgent = (
         );
       }
 
-      return { result: resultText || execResult.stdout, sessionId, usage };
+      const result = resultText || execResult.stdout;
+      return {
+        result,
+        sessionId,
+        usage,
+        // Prefer the signal detected over the accumulated stream; fall back
+        // to scanning the final output for a signal that only ever reached
+        // raw stdout unparsed.
+        completionSignal:
+          detectedSignal ??
+          completionSignals.find((sig) => result.includes(sig)),
+      };
     }).pipe(
       Effect.ensuring(
         Effect.sync(() => {
@@ -219,10 +268,20 @@ const invokeAgent = (
       ),
     );
 
+    // Run the exec in its own fiber: interrupting the race loser only detaches
+    // the join below — the fiber keeps running until the underlying process
+    // actually settles, which the finalizer awaits after aborting it.
+    const execFiber = yield* Effect.fork(execEffect);
+
     let raced: Effect.Effect<
-      { result: string; sessionId?: string; usage?: IterationUsage },
+      {
+        result: string;
+        sessionId?: string;
+        usage?: IterationUsage;
+        completionSignal?: string;
+      },
       AgentIdleTimeoutError | SandboxError
-    > = Effect.raceFirst(execEffect, Deferred.await(timeoutSignal));
+    > = Effect.raceFirst(Fiber.join(execFiber), Deferred.await(timeoutSignal));
     raced = Effect.raceFirst(raced, Deferred.await(completionTimeoutDeferred));
     if (signal) {
       raced = Effect.raceFirst(
@@ -233,12 +292,30 @@ const invokeAgent = (
 
     return yield* raced.pipe(
       Effect.ensuring(
-        Effect.sync(() => {
+        Effect.gen(function* () {
           abortCleanup?.();
           interruptFiber(timeoutFiber);
           timeoutFiber = null;
           interruptFiber(warningFiber);
           warningFiber = null;
+          // Whichever branch resolved the race — clean exit, idle timeout,
+          // completion timeout, or caller abort — the spawned process tree
+          // must be gone before control returns to the workflow, so
+          // lifecycle Git operations never overlap a live agent (ADR 0024).
+          // Abort is a no-op once the process exited; the wait is bounded so
+          // a provider that ignores the signal cannot deadlock the run
+          // (container teardown happens at sandbox release instead).
+          execController.abort();
+          yield* Effect.async<void>((resume) => {
+            const timer = setTimeout(
+              () => resume(Effect.void),
+              EXEC_TEARDOWN_AWAIT_MS,
+            );
+            execFiber.addObserver(() => {
+              clearTimeout(timer);
+              resume(Effect.void);
+            });
+          });
         }),
       ),
     );
@@ -476,6 +553,7 @@ export const orchestrate = (
                   result: agentOutput,
                   sessionId,
                   usage: streamUsage,
+                  completionSignal: detectedSignal,
                 } = yield* invokeAgent(
                   ctx.sandbox,
                   ctx.sandboxRepoDir,
@@ -545,12 +623,11 @@ export const orchestrate = (
                   }
                 }
 
-                // Check completion signal
-                const matchedSignal = completionSignals.find((sig) =>
-                  agentOutput.includes(sig),
-                );
+                // Completion detection accumulated across the whole streamed
+                // conversation inside invokeAgent — a signal from an earlier
+                // turn survives a later result event that drops it.
                 return {
-                  completionSignal: matchedSignal,
+                  completionSignal: detectedSignal,
                   stdout: agentOutput,
                   sessionId,
                   sessionFilePath,
