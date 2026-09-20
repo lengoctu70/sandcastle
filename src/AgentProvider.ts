@@ -50,6 +50,19 @@ export const TOOL_ARG_FIELDS: Record<string, string> = {
 };
 
 /**
+ * Tool-call args render inline in the terminal, the run log, and forwarded
+ * `toolCall` stream events. Bound every arg string — allowlisted field values
+ * and JSON-dump fallbacks alike — so one oversized or unfamiliar argument
+ * cannot flood output or memory. Truncation stays visible via the ellipsis.
+ */
+export const TOOL_ARG_DISPLAY_MAX_CHARS = 300;
+
+export const boundToolCallArgs = (args: string): string =>
+  args.length > TOOL_ARG_DISPLAY_MAX_CHARS
+    ? `${args.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`
+    : args;
+
+/**
  * Extract an error message from a parsed JSON error event.
  * Handles { error: "string" }, { error: { message: "string" } },
  * { error: { data: { message: "string" } } }, and { message: "string" }.
@@ -96,7 +109,7 @@ const parseStreamJsonLine = (line: string): ParsedStreamEvent[] => {
           events.push({
             type: "tool_call",
             name: block.name,
-            args: argValue,
+            args: boundToolCallArgs(argValue),
           });
         }
       }
@@ -151,7 +164,13 @@ const parseCursorToolCallStarted = (
     | { args?: { path?: unknown } }
     | undefined;
   if (readToolCall?.args && typeof readToolCall.args.path === "string") {
-    return [{ type: "tool_call", name: "Read", args: readToolCall.args.path }];
+    return [
+      {
+        type: "tool_call",
+        name: "Read",
+        args: boundToolCallArgs(readToolCall.args.path),
+      },
+    ];
   }
 
   const writeToolCall = tc.writeToolCall as
@@ -159,7 +178,11 @@ const parseCursorToolCallStarted = (
     | undefined;
   if (writeToolCall?.args && typeof writeToolCall.args.path === "string") {
     return [
-      { type: "tool_call", name: "Write", args: writeToolCall.args.path },
+      {
+        type: "tool_call",
+        name: "Write",
+        args: boundToolCallArgs(writeToolCall.args.path),
+      },
     ];
   }
 
@@ -171,13 +194,19 @@ const parseCursorToolCallStarted = (
         const parsedArgs = JSON.parse(rawArgs) as Record<string, unknown>;
         if (typeof parsedArgs.command === "string") {
           return [
-            { type: "tool_call", name: "Bash", args: parsedArgs.command },
+            {
+              type: "tool_call",
+              name: "Bash",
+              args: boundToolCallArgs(parsedArgs.command),
+            },
           ];
         }
       } catch {
         // Use raw arguments string for display.
       }
-      return [{ type: "tool_call", name: fn.name, args: rawArgs }];
+      return [
+        { type: "tool_call", name: fn.name, args: boundToolCallArgs(rawArgs) },
+      ];
     }
     return [{ type: "tool_call", name: fn.name, args: "" }];
   }
@@ -566,15 +595,24 @@ const parsePiStreamLine = (line: string): ParsedStreamEvent[] => {
       return [];
     }
     if (obj.type === "tool_execution_start") {
-      const toolName = obj.toolName;
-      if (typeof toolName !== "string") return [];
+      const rawName = obj.toolName;
+      if (typeof rawName !== "string") return [];
+      // Pi emits lowercase "bash" for its built-in shell tool; normalise to
+      // the shared allowlist entry (same as the Copilot parser).
+      const toolName = rawName === "bash" ? "Bash" : rawName;
       const argField = TOOL_ARG_FIELDS[toolName];
       if (argField === undefined) return [];
       const args = obj.args as Record<string, unknown> | undefined;
       if (!args) return [];
       const argValue = args[argField];
       if (typeof argValue !== "string") return [];
-      return [{ type: "tool_call", name: toolName, args: argValue }];
+      return [
+        {
+          type: "tool_call",
+          name: toolName,
+          args: boundToolCallArgs(argValue),
+        },
+      ];
     }
     // Pi emits agent_error / error events on stdout (not stderr) for auth
     // failures, rate limits, and API errors. Capture them as result events so
@@ -732,7 +770,13 @@ const parseCodexStreamLine = (line: string): ParsedStreamEvent[] => {
       obj.item?.type === "command_execution" &&
       typeof obj.item.command === "string"
     ) {
-      return [{ type: "tool_call", name: "Bash", args: obj.item.command }];
+      return [
+        {
+          type: "tool_call",
+          name: "Bash",
+          args: boundToolCallArgs(obj.item.command),
+        },
+      ];
     }
 
     // Codex emits error events on stdout (not stderr) for auth failures,
@@ -939,7 +983,9 @@ const parseOpenCodeStreamLine = (line: string): ParsedStreamEvent[] => {
       const argValue = argField !== undefined ? input[argField] : undefined;
       const args =
         typeof argValue === "string" ? argValue : JSON.stringify(input);
-      return [{ type: "tool_call", name: part.tool, args }];
+      return [
+        { type: "tool_call", name: part.tool, args: boundToolCallArgs(args) },
+      ];
     }
 
     // OpenCode emits error events on stdout (not stderr) for auth failures,
@@ -1083,7 +1129,13 @@ const parseCopilotStreamLine = (line: string): ParsedStreamEvent[] => {
       if (!args) return [];
       const argValue = args[argField];
       if (typeof argValue !== "string") return [];
-      return [{ type: "tool_call", name: toolName, args: argValue }];
+      return [
+        {
+          type: "tool_call",
+          name: toolName,
+          args: boundToolCallArgs(argValue),
+        },
+      ];
     }
 
     // Final assistant message → result. Each assistant turn emits one of

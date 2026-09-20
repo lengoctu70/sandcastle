@@ -9,6 +9,7 @@ import {
   cursor,
   opencode,
   pi,
+  TOOL_ARG_DISPLAY_MAX_CHARS,
 } from "./AgentProvider.js";
 import type { AgentCommandOptions } from "./AgentProvider.js";
 import type { BindMountSandboxHandle } from "./SandboxProvider.js";
@@ -96,6 +97,24 @@ describe("claudeCode factory", () => {
     });
     expect(provider.parseStreamLine(line)).toEqual([
       { type: "tool_call", name: "Bash", args: "npm test" },
+    ]);
+  });
+
+  it("parseStreamLine bounds an oversized allowlisted tool arg with a visible ellipsis", () => {
+    const provider = claudeCode("claude-opus-4-8");
+    const command = `run ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [{ type: "tool_use", name: "Bash", input: { command } }],
+      },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "Bash",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
     ]);
   });
 
@@ -414,6 +433,66 @@ describe("pi factory", () => {
     expect(provider.parseStreamLine(line)).toEqual([
       { type: "tool_call", name: "Bash", args: "npm test" },
     ]);
+  });
+
+  it("parseStreamLine normalizes the lowercase bash tool name (Pi's observed casing)", () => {
+    // Pi's built-in tools are lowercase (`bash`, `read`, `write`, … — see the
+    // pi help fixture). Without normalization the case-sensitive allowlist
+    // lookup silently dropped every executed command from the stream.
+    const provider = pi("claude-sonnet-4-6");
+    const line = JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "bash",
+      args: { command: "npm test" },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      { type: "tool_call", name: "Bash", args: "npm test" },
+    ]);
+  });
+
+  it("parseStreamLine bounds an oversized tool arg with a visible ellipsis", () => {
+    const provider = pi("claude-sonnet-4-6");
+    const command = `run ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "bash",
+      args: { command },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "Bash",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
+    ]);
+  });
+
+  it("parseStreamLine parses a captured pi --mode json stream end to end", async () => {
+    // Fixture mirrors a real `pi -p --mode json` capture: session header,
+    // text deltas, a lowercase `bash` tool_execution_start, and agent_end.
+    const fixture = await readFile(
+      join(import.meta.dirname, "agents", "fixtures", "pi-json-mode.ndjson"),
+      "utf-8",
+    );
+    const provider = pi("claude-sonnet-4-6");
+    const events = fixture
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .flatMap((l) => provider.parseStreamLine(l));
+
+    expect(events[0]).toEqual({
+      type: "session_id",
+      sessionId: "9ba1c695-2222-4444-8888-e7e847bf34dd",
+    });
+    expect(events).toContainEqual({
+      type: "tool_call",
+      name: "Bash",
+      args: "npm test",
+    });
+    expect(events.at(-1)).toEqual({
+      type: "result",
+      result: "All done. <promise>COMPLETE</promise>",
+    });
   });
 
   it("parseStreamLine skips non-allowlisted tools", () => {
@@ -836,6 +915,22 @@ describe("codex factory", () => {
     ]);
   });
 
+  it("parseStreamLine bounds an oversized command_execution arg with a visible ellipsis", () => {
+    const provider = codex("gpt-5.4-mini");
+    const command = `run ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "item.started",
+      item: { type: "command_execution", command },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "Bash",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
+    ]);
+  });
+
   it("parseStreamLine skips turn.completed events without usage", () => {
     const provider = codex("gpt-5.4-mini");
     const line = JSON.stringify({ type: "turn.completed" });
@@ -1144,6 +1239,45 @@ describe("cursor factory", () => {
     expect(provider.parseStreamLine(line)).toEqual([
       { type: "tool_call", name: "Write", args: "src/index.ts" },
     ]);
+  });
+
+  it("parseStreamLine bounds an oversized fn.arguments command with a visible ellipsis", () => {
+    const provider = cursor("claude-sonnet-4-6");
+    const command = `run ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "tool_call",
+      subtype: "started",
+      call_id: "toolu_vrtx_03",
+      tool_call: {
+        function: { name: "Shell", arguments: JSON.stringify({ command }) },
+      },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "Bash",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
+    ]);
+  });
+
+  it("parseStreamLine bounds a raw (unparseable) fn.arguments string", () => {
+    const provider = cursor("claude-sonnet-4-6");
+    const rawArgs = `{not-json ${"y".repeat(1000)}}`;
+    const line = JSON.stringify({
+      type: "tool_call",
+      subtype: "started",
+      call_id: "toolu_vrtx_04",
+      tool_call: {
+        function: { name: "mystery", arguments: rawArgs },
+      },
+    });
+    const [event] = provider.parseStreamLine(line);
+    expect(event).toEqual({
+      type: "tool_call",
+      name: "mystery",
+      args: `${rawArgs.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+    });
   });
 
   it("parseStreamLine ignores tool_call completed events", () => {
@@ -1481,6 +1615,103 @@ describe("opencode factory", () => {
     ]);
   });
 
+  it("parseStreamLine bounds an oversized mapped tool arg with a visible ellipsis", () => {
+    const provider = opencode("opencode/big-pickle");
+    const command = `run ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "tool_use",
+      sessionID: "ses_abc",
+      part: {
+        type: "tool",
+        tool: "bash",
+        state: { status: "completed", input: { command } },
+      },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "bash",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
+    ]);
+  });
+
+  it("parseStreamLine bounds the JSON.stringify(input) fallback for oversized unknown tool args", () => {
+    const provider = opencode("opencode/big-pickle");
+    const line = JSON.stringify({
+      type: "tool_use",
+      sessionID: "ses_abc",
+      part: {
+        type: "tool",
+        tool: "apply_patch",
+        state: {
+          status: "completed",
+          input: { patch: "y".repeat(1000) },
+        },
+      },
+    });
+    const [event] = provider.parseStreamLine(line);
+    expect(event?.type).toBe("tool_call");
+    if (event?.type === "tool_call") {
+      expect(event.name).toBe("apply_patch");
+      expect(event.args.length).toBe(TOOL_ARG_DISPLAY_MAX_CHARS + 1);
+      expect(event.args.endsWith("…")).toBe(true);
+      expect(event.args).toContain('"patch":"');
+    }
+  });
+
+  it("parseStreamLine documents per-delta result events in a captured multi-part stream (F010 gate)", async () => {
+    // Fixture mirrors a real `opencode run --format json` capture: the
+    // assistant message arrives as several `text` parts interleaved with tool
+    // calls. The parser currently emits a `result` for EVERY text delta, so
+    // the Orchestrator's last-write-wins resultText retains only the final
+    // delta. This documents the observed behavior — result semantics change
+    // only once a multi-part reproduction gates the fix.
+    const fixture = await readFile(
+      join(
+        import.meta.dirname,
+        "agents",
+        "fixtures",
+        "opencode-multipart-stream.ndjson",
+      ),
+      "utf-8",
+    );
+    const provider = opencode("opencode/big-pickle");
+    const events = fixture
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .flatMap((l) => provider.parseStreamLine(l));
+
+    expect(events[0]).toEqual({
+      type: "session_id",
+      sessionId: "ses_19cb8236effe4lu1aSmQyzbeP2",
+    });
+    expect(events).toContainEqual({
+      type: "tool_call",
+      name: "bash",
+      args: "npm test",
+    });
+    // Unknown tools surface a bounded JSON dump of the whole input.
+    expect(events).toContainEqual({
+      type: "tool_call",
+      name: "apply_patch",
+      args: '{"patch":"*** Begin Patch\\n*** Update File: src/a.ts\\n@@\\n-old\\n+new\\n*** End Patch"}',
+    });
+    // One result per text delta — the last delta wins downstream.
+    const results = events
+      .filter((e) => e.type === "result")
+      .map((e) => (e as { type: "result"; result: string }).result);
+    expect(results).toEqual([
+      "I'll check ",
+      "the test suite ",
+      "now.",
+      "Done. <promise>COMPLETE</promise>",
+    ]);
+    // Simulating the Orchestrator's last-write-wins accumulation shows the
+    // current truncation: the result is the final delta, not the full message.
+    expect(results.at(-1)).toBe("Done. <promise>COMPLETE</promise>");
+  });
+
   it("parseStreamLine skips tool_use with a missing tool name", () => {
     const provider = opencode("opencode/big-pickle");
     const line = JSON.stringify({
@@ -1751,6 +1982,27 @@ describe("copilot factory", () => {
     });
     expect(provider.parseStreamLine(line)).toEqual([
       { type: "tool_call", name: "Bash", args: "ls /" },
+    ]);
+  });
+
+  it("parseStreamLine bounds an oversized tool arg with a visible ellipsis", () => {
+    const provider = copilot("claude-sonnet-4.5");
+    const command = `ls ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      type: "tool.execution_start",
+      data: {
+        toolCallId: "t2",
+        toolName: "bash",
+        arguments: { command },
+        turnId: "0",
+      },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "Bash",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
     ]);
   });
 

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { antigravity } from "./antigravity.js";
-import type { AgentCommandOptions } from "../AgentProvider.js";
+import {
+  TOOL_ARG_DISPLAY_MAX_CHARS,
+  type AgentCommandOptions,
+} from "../AgentProvider.js";
 
 /** Shorthand: build options with dangerouslySkipPermissions: true (mirrors existing sandbox callers). */
 const opts = (prompt: string): AgentCommandOptions => ({
@@ -196,6 +199,56 @@ describe("parseStreamLine", () => {
     ]);
   });
 
+  it("bounds an oversized mapped tool arg with a visible ellipsis", () => {
+    // A long CommandLine must not flood the terminal or forwarded events.
+    const command = `run ${"x".repeat(1000)}`;
+    const line = JSON.stringify({
+      event: "step_update",
+      step_update: {
+        step_index: 4,
+        state: "DONE",
+        step_type: "tool",
+        tool_name: "run_command",
+        tool_info: {
+          name: "run_command",
+          parameters: { CommandLine: command },
+        },
+      },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      {
+        type: "tool_call",
+        name: "run_command",
+        args: `${command.slice(0, TOOL_ARG_DISPLAY_MAX_CHARS)}…`,
+      },
+    ]);
+  });
+
+  it("bounds the JSON-dump fallback for unmapped tools", () => {
+    // Unknown argument shapes dump the whole parameters object — that dump is
+    // capped too, so a file-write payload cannot flood the log.
+    const line = JSON.stringify({
+      event: "step_update",
+      step_update: {
+        step_index: 5,
+        state: "DONE",
+        step_type: "tool",
+        tool_name: "write_to_file",
+        tool_info: {
+          name: "write_to_file",
+          parameters: { Path: "/a/b", Content: "y".repeat(1000) },
+        },
+      },
+    });
+    const [event] = provider.parseStreamLine(line);
+    expect(event?.type).toBe("tool_call");
+    if (event?.type === "tool_call") {
+      expect(event.args.length).toBe(TOOL_ARG_DISPLAY_MAX_CHARS + 1);
+      expect(event.args.endsWith("…")).toBe(true);
+      expect(event.args).toContain('"Path":"/a/b"');
+    }
+  });
+
   it("skips ACTIVE tool frames (no duplicate tool_call per step)", () => {
     const line = JSON.stringify({
       event: "step_update",
@@ -282,6 +335,34 @@ describe("parseStreamLine", () => {
         type: "result",
         result: 'invalid model selection: model "nope" is not recognized',
       },
+      {
+        type: "usage",
+        usage: {
+          inputTokens: 0,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+          outputTokens: 0,
+        },
+      },
+    ]);
+  });
+
+  it("extracts a structured error object from an ERROR result event", () => {
+    // agy can report `error` as {message: ...} — not only a plain string.
+    const line = JSON.stringify({
+      event: "result",
+      result: {
+        conversation_id: "",
+        status: "ERROR",
+        response: "",
+        error: { message: "Quota exceeded" },
+        duration_seconds: 0,
+        num_turns: 0,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+    expect(provider.parseStreamLine(line)).toEqual([
+      { type: "result", result: "Quota exceeded" },
       {
         type: "usage",
         usage: {
