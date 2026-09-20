@@ -3440,6 +3440,36 @@ describe("InitService scaffold", () => {
       },
     );
 
+    it.each(["parallel-planner", "parallel-planner-with-review"])(
+      "host %s merger runs in a dedicated integration worktree, never the active checkout (#32)",
+      async (templateName) => {
+        const dir = await makeDir();
+        await runScaffold(dir, {
+          sandboxProvider: hostProvider,
+          templateName,
+        });
+
+        const mainTs = await readFile(
+          join(dir, ".sandcastle", "main.mts"),
+          "utf-8",
+        );
+        // The merger's run() call — including its conflict repair — must pin
+        // merge-to-head explicitly: the no-sandbox runtime default is `head`,
+        // which would merge inside the user's active checkout (F026/ADR 0021).
+        const mergerName = mainTs.indexOf('name: "merger"');
+        expect(mergerName).toBeGreaterThan(-1);
+        const callStart = mainTs.lastIndexOf("sandcastle.run({", mergerName);
+        const callEnd = mainTs.indexOf("});", mergerName);
+        const mergerCall = mainTs.slice(callStart, callEnd);
+        expect(mergerCall).toContain("sandbox: noSandbox()");
+        expect(mergerCall).toContain(
+          'branchStrategy: { type: "merge-to-head" }',
+        );
+        expect(mergerCall).toContain("copyToWorktree");
+        expect(mergerCall).not.toContain('type: "head"');
+      },
+    );
+
     it.each([
       ["docker", "parallel-planner"],
       ["podman", "parallel-planner"],

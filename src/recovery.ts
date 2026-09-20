@@ -88,7 +88,11 @@ export interface RecoveryState {
   readonly error: string;
   readonly verification: readonly VerificationCommandResult[];
   readonly integrationVerification?: readonly VerificationCommandResult[];
-  /** Commits the agent produced on the source branch. */
+  /**
+   * Commits the run produced — the agent's source-branch commits plus every
+   * commit the integration machinery created (merge commit, repair commits,
+   * deterministic merge completion), deduped by sha.
+   */
   readonly commits: readonly { readonly sha: string }[];
   /** Last captured agent session id — native resume material. */
   readonly sessionId?: string;

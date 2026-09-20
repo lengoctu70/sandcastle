@@ -464,9 +464,16 @@ export const withSandboxLifecycle = <A>(
           Effect.tryPromise({
             try: async () => {
               try {
-                await execAsync(`git merge "${resolvedBranch}"`, {
-                  cwd: hostRepoDir,
-                });
+                // `-c merge.ff=true` overrides the user's merge policy for
+                // this Sandcastle-owned merge — `merge.ff=only` would refuse
+                // the merge-commit case outright and `merge.ff=false` would
+                // force a merge commit where a fast-forward is expected.
+                await execAsync(
+                  `git -c merge.ff=true merge "${resolvedBranch}"`,
+                  {
+                    cwd: hostRepoDir,
+                  },
+                );
               } catch {
                 throw new Error(
                   `Merge of '${resolvedBranch}' onto '${hostCurrentBranch}' failed. ` +

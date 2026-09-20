@@ -92,11 +92,13 @@ import * as WorktreeManager from "./WorktreeManager.js";
  * issue-number order, then runs each through `runIssueWorkflow` —
  * sequentially (parallelism 1) or with bounded parallelism (the configured
  * `parallelism`, 1–4). Concurrent runs share one FIFO lock
- * ({@link createWorkflowRunLock}) that serializes worktree creation and the
- * integrate → re-verify → land section, so parallel issues can never prune
- * each other's half-created worktrees or race the target branch. A failing
- * issue never aborts the others; the queue ends with a Vietnamese summary of
- * landed vs failed issues.
+ * ({@link createWorkflowRunLock}) that serializes only the shared-repo
+ * mutation seams — worktree creation/pruning, the final target freshness
+ * check + ref update, and shared cleanup — so parallel issues can never
+ * prune each other's half-created worktrees or race the target branch,
+ * while agent invocations and verification stay genuinely concurrent. A
+ * failing issue never aborts the others; the queue ends with a Vietnamese
+ * summary of landed vs failed issues.
  *
  * Ordering guarantees that matter (ADR 0023):
  * - The implementation agent never sees issue-closing instructions — the
@@ -238,7 +240,11 @@ export interface WorkflowRunResult {
   /** Set when a worktree was left behind (dirty after success, or any failure). */
   readonly preservedWorktreePath?: string;
   readonly integrationBranch?: string;
-  /** Commits the agent produced on the source branch. */
+  /**
+   * Commits the run produced — the agent's source-branch commits plus every
+   * commit the integration machinery created (the merge commit, repair
+   * commits, and the deterministic merge completion), deduped by sha.
+   */
   readonly commits: readonly { readonly sha: string }[];
   /** Verification results on the source worktree (empty when none configured). */
   readonly verification: readonly VerificationCommandResult[];
@@ -309,11 +315,14 @@ export interface RunIssueWorkflowOptions {
    * Shared FIFO lock serializing shared-repo git mutations across concurrent
    * queued runs (#20). A queue run (`runIssueQueueWorkflow`) creates one lock
    * and hands it to every issue's run; a standalone run leaves it unset and
-   * gets the no-op default. The locked sections are worktree creation
-   * (`pruneStale` inside `createWorktree` could otherwise delete a sibling's
-   * half-created worktree) and the whole integrate → re-verify → land loop
-   * (the target-branch freshness check and ref update must never interleave
-   * with a sibling's landing).
+   * gets the no-op default. The lock covers only repository-mutation seams
+   * (#32): worktree creation/pruning (`pruneStale` inside `createWorktree`
+   * could otherwise delete a sibling's half-created worktree), the final
+   * target-branch freshness check + ref update (they must never interleave
+   * with a sibling's landing), and shared cleanup (integration/implementation
+   * worktree removal and temp branch deletion). Agent invocations and
+   * verification commands run outside the lock so queued issues stay
+   * genuinely concurrent.
    */
   readonly sharedLock?: WorkflowRunLock;
   /**
@@ -1966,7 +1975,10 @@ export const runIssueWorkflow = async (
     const detail = error instanceof Error ? error.message : String(error);
     // The integration worktree/branch is derived state — always discarded;
     // the source branch and implementation worktree keep the actual work.
-    await cleanupIntegration();
+    // Its removal mutates shared repo state (worktree metadata + branch
+    // refs), so it runs inside the shared lock just like the landing path's
+    // cleanup — a concurrent sibling must never prune it mid-teardown.
+    await lock.withLock(() => cleanupIntegration());
     const reportBody = buildFailureReport({
       issue,
       phase,
@@ -2109,7 +2121,9 @@ export const runIssueWorkflow = async (
     }
     // Drop stale worktree registrations (e.g. the preserved dir was deleted
     // out from under git) so `createWorktree` sees the real on-disk state.
-    await git(["worktree", "prune"], cwd).catch(() => {});
+    // `worktree prune` is a shared-repo mutation — inside the lock like every
+    // other worktree prune (#32).
+    await lock.withLock(() => git(["worktree", "prune"], cwd)).catch(() => {});
     for (const sha of preservedCommits) allCommits.push({ sha });
   }
 
@@ -2404,32 +2418,75 @@ export const runIssueWorkflow = async (
 
   // ---- Integration in a separate worktree (ADR 0024) --------------------------
   //
-  // One loop iteration = build a disposable integration worktree on the
+  // One loop iteration = create a disposable integration worktree on the
   // target's CURRENT tip → merge → (one bounded conflict repair) → re-run all
-  // verification → freshness check → land. A moved target branch discards the
-  // integrated state and rebuilds it once; a second movement stops safely
-  // instead of force-updating the user's branch.
+  // verification → freshness check → land → cleanup. A moved target branch
+  // discards the integrated state and rebuilds it once; a second movement
+  // stops safely instead of force-updating the user's branch.
   //
-  // The whole section mutates shared-repo state (a new worktree, merges, and
-  // finally the target-branch ref): under a queue run the shared lock
-  // serializes it across concurrent issues so a sibling's landing can never
-  // interleave with the freshness check or ref update, and integration
-  // worktree creation stays serialized with every other worktree
-  // create/prune (#20). Standalone runs see NO_LOCK — identical behavior.
+  // Under a queue run the shared lock covers only the repository-mutation
+  // seams (#32):
+  //   (a) integration worktree creation — `createWorktree`'s pruneStale could
+  //       otherwise delete a sibling's half-created worktree, and
+  //   (b) the landing section — the freshness check, ref update, and shared
+  //       cleanup stay atomic so a sibling can never interleave between the
+  //       check and the update, or prune the worktree mid-landing.
+  // The merge, the conflict-repair agent invocation, and the integrated
+  // verification run OUTSIDE the lock: they touch only this run's own
+  // worktree/branch, and holding the lock across them would serialize the
+  // queue's real work (ADR 0025). Standalone runs see NO_LOCK — identical
+  // behavior.
 
   let integrationBaseSha: string | undefined;
   let landedSha: string | undefined;
+  let preservedWorktreePath: string | undefined;
 
-  const integrationFailure = await lock.withLock(
-    async (): Promise<WorkflowRunResult | undefined> => {
-      for (;;) {
-        phase = "integration";
-        status(
-          `Đang merge \`${sourceBranch}\` vào \`${targetBranch}\` trong worktree tích hợp…`,
-        );
+  /**
+   * Target drift discovered inside the locked landing section — either by
+   * the freshness check or by a refused ref update. Rebuilds the integrated
+   * state on the new tip while the budget lasts (the cleanup stays inside
+   * the same locked section, so a sibling never sees the half-torn-down
+   * worktree); once the budget is spent, returns the error and stops safely
+   * — the user's branch is never force-updated (ADR 0024).
+   */
+  const handleTargetDrift = async (
+    movedToSha: string,
+  ): Promise<"rebuild" | { error: unknown }> => {
+    if (attempts.integrationRebuild < MAX_TARGET_REBUILD_ATTEMPTS) {
+      attempts.integrationRebuild++;
+      status(
+        `Nhánh \`${targetBranch}\` đã di chuyển ` +
+          `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(movedToSha)}) — ` +
+          `đang dựng lại worktree tích hợp trên đầu nhánh mới ` +
+          `(lần ${attempts.integrationRebuild}/${MAX_TARGET_REBUILD_ATTEMPTS})…`,
+        "warn",
+      );
+      await cleanupIntegration();
+      return "rebuild";
+    }
+    return {
+      error: new Error(
+        `Nhánh \`${targetBranch}\` đã di chuyển trong khi Sandcastle đang chạy ` +
+          `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(movedToSha)}) — ` +
+          "dừng an toàn, không ghi đè công việc mới.",
+      ),
+    };
+  };
+
+  for (;;) {
+    phase = "integration";
+    status(
+      `Đang merge \`${sourceBranch}\` vào \`${targetBranch}\` trong worktree tích hợp…`,
+    );
+
+    // -- Locked seam (a): capture the target tip and create the disposable
+    // integration worktree (createWorktree's pruneStale mutates shared
+    // metadata — see the sharedLock option doc).
+    const createError = await lock.withLock(
+      async (): Promise<unknown> => {
         try {
-          // Base = the target's CURRENT tip, captured right before the merge — the
-          // freshness check before landing compares against this.
+          // Base = the target's CURRENT tip, captured right before the merge —
+          // the freshness check before landing compares against this.
           integrationBaseSha = await git(
             ["rev-parse", `refs/heads/${targetBranch}`],
             cwd,
@@ -2451,83 +2508,123 @@ export const runIssueWorkflow = async (
           ).catch(() => {
             // Dependency copies are best-effort — verification still runs.
           });
-          await git(["merge", "--no-edit", sourceBranch], integrationPath);
+          return undefined;
         } catch (e) {
-          try {
-            const repaired = await repairMergeConflict(e);
-            if (!repaired) {
-              // Abort any in-progress merge so the worktree is removable; the
-              // active checkout was never touched.
-              if (integrationPath !== undefined) {
-                await gitQuiet(["merge", "--abort"], integrationPath);
-              }
-              return fail(e);
-            }
-          } catch (repairError) {
-            return fail(repairError);
-          }
+          return e;
         }
+      },
+      () => status("Đang chờ một issue khác khởi tạo worktree…"),
+    );
+    if (createError !== undefined) return fail(createError);
 
-        const integPath = integrationPath;
-        const integBranch = integrationBranch;
-        if (integPath === undefined || integBranch === undefined) {
-          return fail(new Error("Không tạo được worktree tích hợp để merge."));
+    const integPath = integrationPath;
+    const integBranch = integrationBranch;
+    if (integPath === undefined || integBranch === undefined) {
+      return fail(new Error("Không tạo được worktree tích hợp để merge."));
+    }
+
+    // -- Unlocked: the merge and the bounded conflict repair touch only this
+    // run's own worktree and throwaway branch — no shared-repo mutation — so
+    // they stay outside the lock. `-c merge.ff=false` overrides the user's
+    // merge policy (e.g. `merge.ff=only`) for this Sandcastle-owned merge:
+    // the integration merge always completes as a real merge commit on the
+    // throwaway integration branch instead of failing on diverged history.
+    try {
+      await git(
+        ["-c", "merge.ff=false", "merge", "--no-edit", sourceBranch],
+        integPath,
+      );
+    } catch (e) {
+      try {
+        const repaired = await repairMergeConflict(e);
+        if (!repaired) {
+          // Abort any in-progress merge so the worktree is removable; the
+          // active checkout was never touched.
+          if (integrationPath !== undefined) {
+            await gitQuiet(["merge", "--abort"], integrationPath);
+          }
+          return fail(e);
         }
+      } catch (repairError) {
+        return fail(repairError);
+      }
+    }
 
-        // ---- Re-verify the integrated result --------------------------------
+    // Every commit the integration machinery created is accounted for in the
+    // result and the recovery record (F053): the merge commit itself (or the
+    // fast-forwarded source tip), the deterministic `commit --no-edit`
+    // completion of an agent-repaired merge, and repair commits — the latter
+    // already collected via recordAgentRun; all deduped by sha.
+    const integratedHead = await git(["rev-parse", "HEAD"], integPath).catch(
+      () => "",
+    );
+    if (
+      integratedHead !== "" &&
+      !allCommits.some((c) => c.sha === integratedHead)
+    ) {
+      allCommits.push({ sha: integratedHead });
+    }
 
-        phase = "integration-verification";
-        if (verificationConfigured()) {
-          status(
-            `Đang xác minh lại kết quả sau khi merge ${verificationEnvWhere}…`,
-          );
-          // Same executor binding as the source stage, but bound to the
-          // INTEGRATION worktree — the merged state is what gets verified.
-          let boundInteg: BoundVerificationExec;
-          try {
-            boundInteg = await verificationExecFor(integPath);
-          } catch (e) {
-            return fail(e);
-          }
-          try {
-            integrationVerification = await runVerificationCommands(
-              settings.verificationCommands,
-              {
-                cwd: integPath,
-                timeoutMs: verificationTimeoutMs,
-                exec: boundInteg.exec,
-              },
-            );
-            await persistVerificationStatus(
-              cwd,
-              aggregateVerificationStatus(
-                settings.verificationCommands.length,
-                integrationVerification,
-                settings.verificationStatus,
-              ),
-            );
-          } finally {
-            await boundInteg.close().catch(() => {
-              // best-effort teardown
-            });
-          }
-          const failed = integrationVerification.find(
-            (r) => r.status === "failed",
-          );
-          if (failed !== undefined) {
-            return fail(
-              new Error(
-                `Lệnh xác minh ${verificationFailureDetail(failed)} sau khi merge: ` +
-                  `\`${failed.command}\`\n${failed.outputTail}`,
-              ),
-            );
-          }
-        }
+    // ---- Re-verify the integrated result (outside the lock) -----------------
 
-        // ---- Landing — freshness check, then a non-conflicting update -------
+    phase = "integration-verification";
+    if (verificationConfigured()) {
+      status(
+        `Đang xác minh lại kết quả sau khi merge ${verificationEnvWhere}…`,
+      );
+      // Same executor binding as the source stage, but bound to the
+      // INTEGRATION worktree — the merged state is what gets verified.
+      // Verification stays OUTSIDE the mutation lock (ticket-32): the bound
+      // executor only runs commands inside this run's own worktree/sandbox.
+      let boundInteg: BoundVerificationExec;
+      try {
+        boundInteg = await verificationExecFor(integPath);
+      } catch (e) {
+        return fail(e);
+      }
+      try {
+        integrationVerification = await runVerificationCommands(
+          settings.verificationCommands,
+          {
+            cwd: integPath,
+            timeoutMs: verificationTimeoutMs,
+            exec: boundInteg.exec,
+          },
+        );
+        await persistVerificationStatus(
+          cwd,
+          aggregateVerificationStatus(
+            settings.verificationCommands.length,
+            integrationVerification,
+            settings.verificationStatus,
+          ),
+        );
+      } finally {
+        await boundInteg.close().catch(() => {
+          // best-effort teardown
+        });
+      }
+      const failed = integrationVerification.find(
+        (r) => r.status === "failed",
+      );
+      if (failed !== undefined) {
+        return fail(
+          new Error(
+            `Lệnh xác minh ${verificationFailureDetail(failed)} sau khi merge: ` +
+              `\`${failed.command}\`\n${failed.outputTail}`,
+          ),
+        );
+      }
+    }
 
-        phase = "landing";
-        status(`Đang cập nhật nhánh \`${targetBranch}\`…`);
+    // -- Locked seam (b): freshness check → ref update → shared cleanup —
+    // one atomic section. A sibling's landing can never interleave between
+    // the check and the update, and shared cleanup can never prune a
+    // worktree out from under a sibling's in-flight mutation.
+    phase = "landing";
+    status(`Đang cập nhật nhánh \`${targetBranch}\`…`);
+    const landing = await lock.withLock(
+      async (): Promise<"landed" | "rebuild" | { error: unknown }> => {
         try {
           const integrationHead = await git(["rev-parse", "HEAD"], integPath);
           const currentTargetSha = await git(
@@ -2535,88 +2632,96 @@ export const runIssueWorkflow = async (
             cwd,
           );
           if (currentTargetSha !== integrationBaseSha) {
-            // The target moved while we integrated. Rebuild the integration state
-            // on the new tip once (ADR 0024); if it moved again, stop safely —
-            // the user's branch is never force-updated.
-            if (attempts.integrationRebuild < MAX_TARGET_REBUILD_ATTEMPTS) {
-              attempts.integrationRebuild++;
-              status(
-                `Nhánh \`${targetBranch}\` đã di chuyển ` +
-                  `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(currentTargetSha)}) — ` +
-                  `đang dựng lại worktree tích hợp trên đầu nhánh mới ` +
-                  `(lần ${attempts.integrationRebuild}/${MAX_TARGET_REBUILD_ATTEMPTS})…`,
-                "warn",
-              );
-              await cleanupIntegration();
-              continue;
-            }
-            return fail(
-              new Error(
-                `Nhánh \`${targetBranch}\` đã di chuyển trong khi Sandcastle đang chạy ` +
-                  `(${shortSha(integrationBaseSha ?? "")} → ${shortSha(currentTargetSha)}) — ` +
-                  "dừng an toàn, không ghi đè công việc mới.",
-              ),
-            );
+            // The target moved while we integrated — consume the rebuild
+            // budget or stop safely.
+            return await handleTargetDrift(currentTargetSha);
           }
           const headBranch = await git(
             ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd,
           );
-          if (headBranch === targetBranch) {
-            // Target is the active checkout — a fast-forward merge can never
-            // conflict and never leaves the checkout mid-merge.
-            await git(["merge", "--ff-only", integBranch], cwd);
-          } else {
-            // Target isn't checked out here — move it atomically. update-ref with
-            // the expected old value is a compare-and-swap: it refuses when the
-            // branch moved after our check, and also when the branch is checked
-            // out in another worktree.
-            await git(
-              [
-                "update-ref",
-                `refs/heads/${targetBranch}`,
-                integrationHead,
-                currentTargetSha,
-              ],
+          try {
+            if (headBranch === targetBranch) {
+              // Target is the active checkout — a fast-forward merge can
+              // never conflict and never leaves the checkout mid-merge.
+              await git(["merge", "--ff-only", integBranch], cwd);
+            } else {
+              // Target isn't checked out here — move it atomically.
+              // update-ref with the expected old value is a compare-and-swap:
+              // it refuses when the branch moved after our check, and also
+              // when the branch is checked out in another worktree.
+              await git(
+                [
+                  "update-ref",
+                  `refs/heads/${targetBranch}`,
+                  integrationHead,
+                  currentTargetSha,
+                ],
+                cwd,
+              );
+            }
+          } catch (updateError) {
+            // The update refused — most often because the target moved in
+            // the window between the freshness check and the ref update (an
+            // external actor; a queue sibling can never reach this window).
+            // Re-read the tip: drift consumes the same bounded rebuild
+            // budget as the freshness-check path; anything else is a real
+            // landing failure. Never force-update.
+            const movedTo = await git(
+              ["rev-parse", `refs/heads/${targetBranch}`],
               cwd,
-            );
+            ).catch(() => "");
+            if (movedTo !== "" && movedTo !== currentTargetSha) {
+              return await handleTargetDrift(movedTo);
+            }
+            return { error: updateError };
           }
           landedSha = await git(
             ["rev-parse", `refs/heads/${targetBranch}`],
             cwd,
           );
-          return undefined;
+          // Shared cleanup inside the same locked section — the integration
+          // worktree/branch and the implementation worktree/source branch
+          // are removed only after the target moved, and no sibling's
+          // mutation can interleave with the teardown.
+          await cleanupIntegration();
+          const closeResult = await wt.close().catch(() => ({
+            preservedWorktreePath: wt?.worktreePath,
+          }));
+          preservedWorktreePath = closeResult.preservedWorktreePath;
+          if (preservedWorktreePath === undefined) {
+            // Worktree removed — the source branch's content is now on the
+            // target, so force-delete is safe (and required: `-d` would
+            // refuse when the current checkout isn't the target).
+            await gitQuiet(["branch", "-D", sourceBranch], cwd);
+          }
+          return "landed";
         } catch (e) {
-          return fail(e);
+          return { error: e };
         }
-      }
-    },
-    () =>
-      status(`Đang chờ một issue khác hoàn tất merge vào \`${targetBranch}\`…`),
-  );
-  if (integrationFailure !== undefined) return integrationFailure;
+      },
+      () => status(`Đang chờ một issue khác cập nhật \`${targetBranch}\`…`),
+    );
+
+    if (landing === "rebuild") continue;
+    if (landing !== "landed") return fail(landing.error);
+    break;
+  }
 
   if (landedSha === undefined) {
-    // Unreachable — the locked section only resolves undefined after a
-    // successful landing.
+    // Unreachable — the locked landing section only resolves "landed" after
+    // the ref update succeeded.
     return fail(new Error("Landing kết thúc mà không cập nhật nhánh đích."));
   }
   const landedTargetSha: string = landedSha;
   const finalIntegrationBaseSha: string = integrationBaseSha ?? landedSha;
 
-  // ---- Success cleanup — integration + implementation state --------------------
+  // ---- Success cleanup — per-issue recovery record ---------------------------
+  //
+  // Worktree and branch cleanup already ran inside the locked landing
+  // section. The recovery record is per-issue state, not a shared-repo
+  // mutation, so it stays outside the lock.
 
-  await cleanupIntegration();
-  const closeResult = await wt.close().catch(() => ({
-    preservedWorktreePath: wt?.worktreePath,
-  }));
-  const preservedWorktreePath = closeResult.preservedWorktreePath;
-  if (preservedWorktreePath === undefined) {
-    // Worktree removed — the source branch's content is now on the target, so
-    // force-delete is safe (and required: `-d` would refuse when the current
-    // checkout isn't the target).
-    await gitQuiet(["branch", "-D", sourceBranch], cwd);
-  }
   await clearRecoveryState(cwd, issue.number);
 
   // ---- Report, then close (ADR 0023 ordering) ---------------------------------

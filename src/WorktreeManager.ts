@@ -20,6 +20,37 @@ const NO_CONFIG_LOCK_FLAGS = [
   "push.autoSetupRemote=false",
 ];
 
+/**
+ * Process-local FIFO mutex serializing every mutation of shared worktree
+ * metadata: `git worktree add`/`remove`/`prune` and the
+ * `.sandcastle/worktrees/` orphan sweep.
+ *
+ * Concurrent `run()`/`createWorktree()`/`createSandbox()` calls in one
+ * process (parallel templates' bounded worker pools, queue workers)
+ * otherwise race: a sibling's {@link pruneStale} can enumerate
+ * `.sandcastle/worktrees/` while another worker's `worktree add` is still in
+ * flight — the directory exists on disk but git has not registered it yet,
+ * so the orphan sweep deletes it from under the in-flight create. Parallel
+ * `git worktree` invocations can also contend on `.git` lock files. Agent
+ * invocations and verification never run inside this mutex — it guards only
+ * the metadata mutation itself (ADR 0025).
+ */
+const worktreeMutationMutex = Effect.unsafeMakeSemaphore(1);
+
+/**
+ * @internal Serialize `effect` against every shared worktree metadata
+ * mutation in this process.
+ *
+ * {@link create}, {@link pruneStale}, and {@link remove} already hold the
+ * mutex internally — do not wrap them in this again (the semaphore is not
+ * reentrant). Exported for tests that need a deterministic barrier inside
+ * the mutation section, and for orchestrators composing raw git operations
+ * that must not interleave with worktree mutations.
+ */
+export const withWorktreeMutationLock = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> => worktreeMutationMutex.withPermits(1)(effect);
+
 /** Format a timestamp as YYYYMMDD-HHMMSS */
 const formatTimestamp = (date: Date): string => {
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -300,130 +331,137 @@ export const create = (
   WorktreeError | WorktreeTimeoutError,
   FileSystem.FileSystem
 > =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
-    yield* fs
-      .makeDirectory(worktreesDir, { recursive: true })
-      .pipe(Effect.mapError((e) => new WorktreeError({ message: e.message })));
+  // The collision check + `worktree add` run inside the shared mutation
+  // mutex so a sibling's prune can never see the new directory in its
+  // exists-but-unregistered window.
+  withWorktreeMutationLock(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+      yield* fs
+        .makeDirectory(worktreesDir, { recursive: true })
+        .pipe(
+          Effect.mapError((e) => new WorktreeError({ message: e.message })),
+        );
 
-    let branch: string;
-    let worktreeName: string;
+      let branch: string;
+      let worktreeName: string;
 
-    if (opts?.branch) {
-      branch = opts.branch;
-      worktreeName = branch.replace(/\//g, "-");
-    } else {
-      const timestamp = formatTimestamp(new Date());
-      const suffix = randomBranchSuffix();
-      if (opts?.name) {
-        const sanitized = sanitizeName(opts.name);
-        branch = `sandcastle/${sanitized}/${timestamp}-${suffix}`;
-        worktreeName = `sandcastle-${sanitized}-${timestamp}-${suffix}`;
+      if (opts?.branch) {
+        branch = opts.branch;
+        worktreeName = branch.replace(/\//g, "-");
       } else {
-        branch = `sandcastle/${timestamp}-${suffix}`;
-        worktreeName = `sandcastle-${timestamp}-${suffix}`;
-      }
-    }
-
-    const worktreePath = join(worktreesDir, worktreeName);
-
-    if (opts?.branch) {
-      // Proactively detect collision before git produces a confusing error.
-      // Match by branch first; fall back to target path (covers mid-rebase
-      // detached-HEAD state where the branch field is null).
-      const existing = yield* listWorktrees(repoDir);
-      const collision = findCollidingWorktree(existing, branch, worktreePath);
-      if (collision) {
-        // Only reuse worktrees managed by sandcastle (under .sandcastle/worktrees/)
-        if (isManagedWorktreePath(collision.path, worktreesDir)) {
-          const dirty = yield* hasUncommittedChanges(collision.path);
-          if (dirty) {
-            console.warn(
-              `Reusing worktree at ${collision.path} (branch '${branch}') — worktree has uncommitted changes`,
-            );
-          } else {
-            yield* fastForwardFromOrigin(collision.path, branch);
-          }
-          // git reports forward slashes even on Windows; return a
-          // platform-native path so downstream join/fs calls stay consistent.
-          return { path: normalize(collision.path), branch };
+        const timestamp = formatTimestamp(new Date());
+        const suffix = randomBranchSuffix();
+        if (opts?.name) {
+          const sanitized = sanitizeName(opts.name);
+          branch = `sandcastle/${sanitized}/${timestamp}-${suffix}`;
+          worktreeName = `sandcastle-${sanitized}-${timestamp}-${suffix}`;
+        } else {
+          branch = `sandcastle/${timestamp}-${suffix}`;
+          worktreeName = `sandcastle-${timestamp}-${suffix}`;
         }
-        // Branch is checked out in the main working tree or external worktree
-        yield* Effect.fail(
-          new WorktreeError({
-            message:
-              `Branch '${branch}' is already checked out in worktree at '${collision.path}'. ` +
-              `Sandcastle's branch and merge-to-head strategies run the agent in a git worktree under .sandcastle/worktrees/, ` +
-              `and git refuses to check out the same branch in two worktrees at once (HEAD would become ambiguous). ` +
-              `Pick a different branch, or switch the main working tree to a different branch before re-running.`,
+      }
+
+      const worktreePath = join(worktreesDir, worktreeName);
+
+      if (opts?.branch) {
+        // Proactively detect collision before git produces a confusing error.
+        // Match by branch first; fall back to target path (covers mid-rebase
+        // detached-HEAD state where the branch field is null).
+        const existing = yield* listWorktrees(repoDir);
+        const collision = findCollidingWorktree(existing, branch, worktreePath);
+        if (collision) {
+          // Only reuse worktrees managed by sandcastle (under .sandcastle/worktrees/)
+          if (isManagedWorktreePath(collision.path, worktreesDir)) {
+            const dirty = yield* hasUncommittedChanges(collision.path);
+            if (dirty) {
+              console.warn(
+                `Reusing worktree at ${collision.path} (branch '${branch}') — worktree has uncommitted changes`,
+              );
+            } else {
+              yield* fastForwardFromOrigin(collision.path, branch);
+            }
+            // git reports forward slashes even on Windows; return a
+            // platform-native path so downstream join/fs calls stay consistent.
+            return { path: normalize(collision.path), branch };
+          }
+          // Branch is checked out in the main working tree or external worktree
+          yield* Effect.fail(
+            new WorktreeError({
+              message:
+                `Branch '${branch}' is already checked out in worktree at '${collision.path}'. ` +
+                `Sandcastle's branch and merge-to-head strategies run the agent in a git worktree under .sandcastle/worktrees/, ` +
+                `and git refuses to check out the same branch in two worktrees at once (HEAD would become ambiguous). ` +
+                `Pick a different branch, or switch the main working tree to a different branch before re-running.`,
+            }),
+          );
+        }
+        yield* execGit(
+          [...NO_CONFIG_LOCK_FLAGS, "worktree", "add", worktreePath, branch],
+          repoDir,
+        ).pipe(
+          Effect.catchAll((e) => {
+            if (e.message.includes("invalid reference")) {
+              return execGit(
+                [
+                  ...NO_CONFIG_LOCK_FLAGS,
+                  "worktree",
+                  "add",
+                  "-b",
+                  branch,
+                  worktreePath,
+                  opts?.baseBranch ?? "HEAD",
+                ],
+                repoDir,
+              );
+            }
+            return Effect.fail(e);
+          }),
+        );
+      } else {
+        yield* execGit(
+          [
+            ...NO_CONFIG_LOCK_FLAGS,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            worktreePath,
+            "HEAD",
+          ],
+          repoDir,
+        ).pipe(
+          Effect.catchAll((e) => {
+            if (
+              e.message.includes("already checked out") ||
+              e.message.includes("already exists")
+            ) {
+              return Effect.fail(
+                new WorktreeError({
+                  message:
+                    `Branch '${branch}' is already checked out in another worktree. ` +
+                    `Use a different branch name, or wait for the other run to finish.`,
+                }),
+              );
+            }
+            return Effect.fail(e);
           }),
         );
       }
-      yield* execGit(
-        [...NO_CONFIG_LOCK_FLAGS, "worktree", "add", worktreePath, branch],
-        repoDir,
-      ).pipe(
-        Effect.catchAll((e) => {
-          if (e.message.includes("invalid reference")) {
-            return execGit(
-              [
-                ...NO_CONFIG_LOCK_FLAGS,
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktreePath,
-                opts?.baseBranch ?? "HEAD",
-              ],
-              repoDir,
-            );
-          }
-          return Effect.fail(e);
-        }),
-      );
-    } else {
-      yield* execGit(
-        [
-          ...NO_CONFIG_LOCK_FLAGS,
-          "worktree",
-          "add",
-          "-b",
-          branch,
-          worktreePath,
-          "HEAD",
-        ],
-        repoDir,
-      ).pipe(
-        Effect.catchAll((e) => {
-          if (
-            e.message.includes("already checked out") ||
-            e.message.includes("already exists")
-          ) {
-            return Effect.fail(
-              new WorktreeError({
-                message:
-                  `Branch '${branch}' is already checked out in another worktree. ` +
-                  `Use a different branch name, or wait for the other run to finish.`,
-              }),
-            );
-          }
-          return Effect.fail(e);
-        }),
-      );
-    }
 
-    return { path: worktreePath, branch };
-  }).pipe(
-    withTimeout(
-      WORKTREE_TIMEOUT_MS,
-      () =>
-        new WorktreeTimeoutError({
-          message: `Worktree creation timed out after ${WORKTREE_TIMEOUT_MS}ms`,
-          timeoutMs: WORKTREE_TIMEOUT_MS,
-          path: repoDir,
-          operation: "create",
-        }),
+      return { path: worktreePath, branch };
+    }).pipe(
+      withTimeout(
+        WORKTREE_TIMEOUT_MS,
+        () =>
+          new WorktreeTimeoutError({
+            message: `Worktree creation timed out after ${WORKTREE_TIMEOUT_MS}ms`,
+            timeoutMs: WORKTREE_TIMEOUT_MS,
+            path: repoDir,
+            operation: "create",
+          }),
+      ),
     ),
   );
 
@@ -449,8 +487,11 @@ export const remove = (
 ): Effect.Effect<void, WorktreeError> => {
   // Derive the main repo dir: worktreePath = <repoDir>/.sandcastle/worktrees/<name>
   const repoDir = join(worktreePath, "..", "..", "..");
-  return execGit(["worktree", "remove", "--force", worktreePath], repoDir).pipe(
-    Effect.asVoid,
+  // `worktree remove` mutates shared metadata — serialized with create/prune.
+  return withWorktreeMutationLock(
+    execGit(["worktree", "remove", "--force", worktreePath], repoDir).pipe(
+      Effect.asVoid,
+    ),
   );
 };
 
@@ -465,74 +506,80 @@ export const pruneStale = (
   WorktreeError | WorktreeTimeoutError,
   FileSystem.FileSystem
 > =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
+  // `worktree prune` + the orphan sweep mutate shared metadata and inspect
+  // sibling paths — serialized with create/remove under the mutation mutex.
+  withWorktreeMutationLock(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
 
-    // Let git clean up metadata for worktrees whose directories are gone
-    yield* execGit(["worktree", "prune"], repoDir);
+      // Let git clean up metadata for worktrees whose directories are gone
+      yield* execGit(["worktree", "prune"], repoDir);
 
-    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+      const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
 
-    // Read directory entries — return null if directory doesn't exist
-    const entries: string[] | null = yield* fs.readDirectory(worktreesDir).pipe(
-      Effect.map((es): string[] | null => es),
-      Effect.catchSome((e) =>
-        e._tag === "SystemError" && e.reason === "NotFound"
-          ? Option.some(Effect.succeed(null as string[] | null))
-          : Option.none(),
-      ),
-      Effect.mapError((e) => new WorktreeError({ message: e.message })),
-    );
-
-    if (entries === null) return;
-
-    // `git worktree list` canonicalizes paths via realpath. If repoDir or
-    // .sandcastle is a symlink, joining the un-canonicalized prefix produces
-    // strings that never match git's output, and every active worktree looks
-    // orphaned. Resolve the prefix once so the Set lookup below works.
-    const realWorktreesDir = yield* fs
-      .realPath(worktreesDir)
-      .pipe(Effect.catchAll(() => Effect.succeed(worktreesDir)));
-
-    // Get the list of active worktree paths from git
-    const worktreeList = yield* execGit(
-      ["worktree", "list", "--porcelain"],
-      repoDir,
-    );
-    const activeWorktreePaths = new Set(
-      worktreeList
-        .split("\n")
-        .filter((line) => line.startsWith("worktree "))
-        .map((line) => line.slice("worktree ".length).trim()),
-    );
-
-    // Remove any directory under .sandcastle/worktrees/ that is not an active worktree
-    for (const entry of entries) {
-      const entryPath = join(realWorktreesDir, entry);
-      const isDir = yield* fs.stat(entryPath).pipe(
-        Effect.map((s) => s.type === "Directory"),
-        Effect.catchAll(() => Effect.succeed(false)),
-      );
-      if (isDir && isOrphanedWorktreePath(entryPath, activeWorktreePaths)) {
-        yield* fs.remove(entryPath, { recursive: true, force: true }).pipe(
-          Effect.mapError(
-            (e) =>
-              new WorktreeError({
-                message: `Failed to remove ${entryPath}: ${e.message}`,
-              }),
+      // Read directory entries — return null if directory doesn't exist
+      const entries: string[] | null = yield* fs
+        .readDirectory(worktreesDir)
+        .pipe(
+          Effect.map((es): string[] | null => es),
+          Effect.catchSome((e) =>
+            e._tag === "SystemError" && e.reason === "NotFound"
+              ? Option.some(Effect.succeed(null as string[] | null))
+              : Option.none(),
           ),
+          Effect.mapError((e) => new WorktreeError({ message: e.message })),
         );
+
+      if (entries === null) return;
+
+      // `git worktree list` canonicalizes paths via realpath. If repoDir or
+      // .sandcastle is a symlink, joining the un-canonicalized prefix produces
+      // strings that never match git's output, and every active worktree looks
+      // orphaned. Resolve the prefix once so the Set lookup below works.
+      const realWorktreesDir = yield* fs
+        .realPath(worktreesDir)
+        .pipe(Effect.catchAll(() => Effect.succeed(worktreesDir)));
+
+      // Get the list of active worktree paths from git
+      const worktreeList = yield* execGit(
+        ["worktree", "list", "--porcelain"],
+        repoDir,
+      );
+      const activeWorktreePaths = new Set(
+        worktreeList
+          .split("\n")
+          .filter((line) => line.startsWith("worktree "))
+          .map((line) => line.slice("worktree ".length).trim()),
+      );
+
+      // Remove any directory under .sandcastle/worktrees/ that is not an active worktree
+      for (const entry of entries) {
+        const entryPath = join(realWorktreesDir, entry);
+        const isDir = yield* fs.stat(entryPath).pipe(
+          Effect.map((s) => s.type === "Directory"),
+          Effect.catchAll(() => Effect.succeed(false)),
+        );
+        if (isDir && isOrphanedWorktreePath(entryPath, activeWorktreePaths)) {
+          yield* fs.remove(entryPath, { recursive: true, force: true }).pipe(
+            Effect.mapError(
+              (e) =>
+                new WorktreeError({
+                  message: `Failed to remove ${entryPath}: ${e.message}`,
+                }),
+            ),
+          );
+        }
       }
-    }
-  }).pipe(
-    withTimeout(
-      WORKTREE_TIMEOUT_MS,
-      () =>
-        new WorktreeTimeoutError({
-          message: `Worktree prune timed out after ${WORKTREE_TIMEOUT_MS}ms`,
-          timeoutMs: WORKTREE_TIMEOUT_MS,
-          path: repoDir,
-          operation: "prune",
-        }),
+    }).pipe(
+      withTimeout(
+        WORKTREE_TIMEOUT_MS,
+        () =>
+          new WorktreeTimeoutError({
+            message: `Worktree prune timed out after ${WORKTREE_TIMEOUT_MS}ms`,
+            timeoutMs: WORKTREE_TIMEOUT_MS,
+            path: repoDir,
+            operation: "prune",
+          }),
+      ),
     ),
   );
