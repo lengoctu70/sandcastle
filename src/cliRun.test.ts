@@ -2599,6 +2599,53 @@ describe("sandcastle status / retry / discard (CLI seam)", () => {
     expect(await exists(lockPath)).toBe(false);
   });
 
+  it("a held retry lock rejects discard before it deletes the preserved work", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+    expect(await exists(sourceWorktreePath(repoDir, 5))).toBe(true);
+
+    // Simulate a retry in progress in another process: a lock file naming a
+    // LIVE pid (this test process) must make discard refuse — deleting the
+    // worktree/branch mid-retry would corrupt the running workflow.
+    const lockPath = join(repoDir, ".sandcastle", "recovery", "issue-5.lock");
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+      }) + "\n",
+    );
+
+    try {
+      await runCli("discard 5 --yes", repoDir, env);
+      expect.fail("Expected discard to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      expect(stdout + stderr).toContain("retry");
+      expect(stdout + stderr).toContain(String(process.pid));
+    }
+
+    // Nothing was deleted — the record, the worktree, and the branch all
+    // stay put, and the foreign lock file is left alone.
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+    expect(await exists(sourceWorktreePath(repoDir, 5))).toBe(true);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toContain(
+      "sandcastle/issue-5",
+    );
+    expect(await exists(lockPath)).toBe(true);
+
+    // Once the holder is gone, discard proceeds normally.
+    await rm(lockPath);
+    await runCli("discard 5 --yes", repoDir, env);
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
+
   it("a stale retry lock from a dead process is broken instead of blocking retry", async () => {
     const { repoDir, logFile, env } = await makeFixture([ISSUE_5], {
       FAKE_CLAUDE_FAIL: "1",

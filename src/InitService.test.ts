@@ -428,11 +428,55 @@ describe("InitService scaffold", () => {
       join(dir, ".sandcastle", "main.mts"),
       "utf-8",
     );
-    expect(mainTs).toContain('grok("grok-4.6", { effort: "high" })');
+    // The default sandbox provider is docker — a container always execs
+    // through POSIX `sh`, so grok's execPlatform is pinned to "linux".
+    expect(mainTs).toContain(
+      'grok("grok-4.6", { effort: "high", execPlatform: "linux" })',
+    );
     const settings = JSON.parse(
       await readFile(join(dir, ".sandcastle", "settings.json"), "utf-8"),
     );
     expect(settings.effort).toBe("high");
+  });
+
+  it("pins execPlatform linux in the generated grok() call for container sandboxes", async () => {
+    // A Windows host running a docker/podman sandbox would otherwise
+    // default Grok's execPlatform to "win32" — passing a host temp path to
+    // --prompt-file that does not exist inside the container.
+    for (const providerName of ["docker", "podman"]) {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        agent: grokAgent,
+        model: "grok-4.6",
+        sandboxProvider: getSandboxProvider(providerName),
+      });
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain(
+        `grok("grok-4.6", { execPlatform: "linux" })`,
+      );
+    }
+  });
+
+  it("leaves grok's execPlatform unpinned for host mode", async () => {
+    // Host mode runs the agent through the host's own shell — on Windows
+    // that IS cmd.exe, so the provider must keep its process.platform
+    // default (temp prompt file + `& del`) rather than a POSIX pin.
+    const dir = await makeDir();
+    await runScaffold(dir, {
+      agent: grokAgent,
+      model: "grok-4.6",
+      sandboxProvider: getSandboxProvider("host"),
+      settings: { sandbox: "host" },
+    });
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain('grok("grok-4.6")');
+    expect(mainTs).not.toContain("execPlatform");
   });
 
   it("injects the selected effort into the generated pi() call as thinking", async () => {

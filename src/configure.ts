@@ -289,10 +289,21 @@ const resolveSharedFlagUpdate = (params: {
           : agentChanged
             ? Option.none()
             : Option.some(current.model);
+      // F037 parity with the static path below: when `--model` moves the
+      // model, an absent `--effort` must NOT replay the persisted effort as
+      // an explicit flag — it was verified against the OLD model, so it
+      // would either silently survive on an incompatible model or
+      // hard-error naming a flag the user never passed.
+      const modelChanged =
+        modelFlag._tag === "Some" &&
+        modelFlag.value.trim() !== current.model;
       const resolvedEffortFlag =
         effortFlag._tag === "Some"
           ? effortFlag
-          : clearEffort || agentChanged || current.effort === undefined
+          : clearEffort ||
+              agentChanged ||
+              modelChanged ||
+              current.effort === undefined
             ? Option.none()
             : Option.some(current.effort);
       const outcome = yield* resolveDiscoveredSelection({

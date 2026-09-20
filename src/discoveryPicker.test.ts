@@ -980,7 +980,11 @@ describe("resolveDiscoveredSelection — Devin selectors", () => {
     );
     expect(outcome).toEqual({
       kind: "selection",
-      selection: { model: "claude-opus-5", modelSource: "discovered" },
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        modelSource: "discovered",
+      },
     });
   });
 
@@ -991,7 +995,11 @@ describe("resolveDiscoveredSelection — Devin selectors", () => {
     );
     expect(outcome).toEqual({
       kind: "selection",
-      selection: { model: "claude-opus-5", modelSource: "discovered" },
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        modelSource: "discovered",
+      },
     });
   });
 
@@ -1005,6 +1013,7 @@ describe("resolveDiscoveredSelection — Devin selectors", () => {
     expect(outcome).toEqual({
       kind: "selection",
       selection: {
+        executable: "devin",
         model: "claude-opus-5",
         effort: "claude-opus-5-high",
         modelSource: "discovered",
@@ -1019,6 +1028,7 @@ describe("resolveDiscoveredSelection — Devin selectors", () => {
     expect(outcome).toEqual({
       kind: "selection",
       selection: {
+        executable: "devin",
         model: "gpt-5.2",
         effort: "MODEL_GPT_5_2_XHIGH",
         modelSource: "discovered",
@@ -1036,6 +1046,7 @@ describe("resolveDiscoveredSelection — Devin selectors", () => {
     expect(outcome).toEqual({
       kind: "selection",
       selection: {
+        executable: "devin",
         model: "claude-opus-5",
         effort: "claude-opus-5-max",
         modelSource: "discovered",
@@ -1062,7 +1073,11 @@ describe("resolveDiscoveredSelection — Devin selectors", () => {
     );
     expect(outcome).toEqual({
       kind: "selection",
-      selection: { model: "claude-opus-5", modelSource: "discovered" },
+      selection: {
+        executable: "devin",
+        model: "claude-opus-5",
+        modelSource: "discovered",
+      },
     });
     expect(
       statusMessages(entries(ref)).some((m) => m.includes("grok-next-beta")),

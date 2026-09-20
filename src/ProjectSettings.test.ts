@@ -240,9 +240,13 @@ describe("scaffold writes initial settings", () => {
     const loaded = await run(loadProjectSettings(dir));
     expect(loaded.agent).toBe("grok");
     expect(loaded.agentExecutable).toBe("agent");
-    // And the generated main passes it to the grok() factory options.
+    // And the generated main passes it to the grok() factory options. The
+    // scaffold's codegen provider is docker (the ScaffoldOptions default),
+    // so the container-exec pin rides along too.
     const main = await readFile(join(dir, ".sandcastle", "main.mts"), "utf-8");
-    expect(main).toContain('grok("grok-4.6", { executable: "agent" })');
+    expect(main).toContain(
+      'grok("grok-4.6", { executable: "agent", execPlatform: "linux" })',
+    );
   });
 
   it("defaults parallelism to 2 for parallel workflows and 1 otherwise", async () => {

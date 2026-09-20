@@ -30,7 +30,7 @@ import type {
  *
  * The module is Promise-based and Effect-free (like `githubIssues.ts`) so both
  * the run service and the CLI commands share one read/write path. Records are
- * machine-local bookkeeping — never issue-facing data — and the reader is
+ * host-local bookkeeping — never issue-facing data — and the reader is
  * deliberately tolerant: fields added later parse as absent, while the
  * essential identity/phase fields are validated so a truncated or hand-edited
  * file surfaces as `corrupt` rather than a half-populated state. Nothing in
@@ -506,7 +506,7 @@ export const listRecoveryStates = async (
  * leaves the previously written record intact (F064).
  *
  * Also keeps `recovery/` ignored by appending it to the scaffolded
- * `.sandcastle/.gitignore` — recovery state is machine-local.
+ * `.sandcastle/.gitignore` — recovery state is host-local.
  */
 export const writeRecoveryState = async (
   cwd: string,
