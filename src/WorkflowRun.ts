@@ -1,4 +1,5 @@
 import { exec, execFile } from "node:child_process";
+import { join, posix, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import { Cause, Effect, Exit } from "effect";
 import { FileSystem } from "@effect/platform";
@@ -42,7 +43,10 @@ import {
   type GithubIssueOps,
   type GhRunner,
 } from "./githubIssues.js";
+import { resolveEnv } from "./EnvResolver.js";
 import { getAgent, listAgents } from "./InitService.js";
+import { mergeProviderEnv } from "./mergeProviderEnv.js";
+import { patchGitMountsForWindows } from "./mountUtils.js";
 import {
   loadProjectSettingsAsync,
   MAX_PARALLELISM,
@@ -61,10 +65,17 @@ import {
 } from "./recovery.js";
 import { resolveCwd } from "./resolveCwd.js";
 import { assertResumeSessionExists } from "./resumePrecheck.js";
-import type { SandboxProvider } from "./SandboxProvider.js";
+import { resolveGitMounts, SANDBOX_REPO_DIR } from "./SandboxFactory.js";
+import type {
+  BindMountSandboxHandle,
+  IsolatedSandboxHandle,
+  NoSandboxHandle,
+  SandboxProvider,
+} from "./SandboxProvider.js";
 import { docker } from "./sandboxes/docker.js";
 import { noSandbox } from "./sandboxes/no-sandbox.js";
 import { podman } from "./sandboxes/podman.js";
+import { startSandbox } from "./startSandbox.js";
 import * as WorktreeManager from "./WorktreeManager.js";
 
 /**
@@ -108,7 +119,6 @@ import * as WorktreeManager from "./WorktreeManager.js";
  * workflow API is a later surface.
  */
 
-const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
@@ -161,6 +171,57 @@ export interface VerificationCommandResult {
   readonly durationMs: number;
   /** Tail of combined stdout+stderr — feeds reports and failure detail. */
   readonly outputTail: string;
+  /**
+   * `true` when the command was terminated for exceeding its timeout — the
+   * stage reports `"failed"`, but the timeout wording stays distinguishable
+   * in per-command results, reports, and failure guidance.
+   */
+  readonly timedOut?: boolean;
+}
+
+/**
+ * Captured outcome of one verification command as reported by a
+ * {@link VerificationExec} implementation — same shape as
+ * `DiscoveryExecResult`: non-zero exits, timeouts, and spawn failures are
+ * all data, never exceptions.
+ */
+export interface VerificationExecResult {
+  readonly stdout: string;
+  readonly stderr: string;
+  /** Exit code, or `null` when the process never reached a normal exit. */
+  readonly exitCode: number | null;
+  /** `true` when the command was terminated for exceeding `timeoutMs`. */
+  readonly timedOut?: boolean;
+  /**
+   * Set when the command could not be started at all — the OS error code
+   * (e.g. `"ENOENT"`) or the executor's own diagnostic (a dead sandbox
+   * handle, a transport failure).
+   */
+  readonly spawnError?: string;
+}
+
+/**
+ * The verification-execution boundary (F062): run one configured command to
+ * completion inside the bound execution environment and report its outcome.
+ *
+ * `options.cwd` is a host path. Host mode executes it directly; sandbox modes
+ * map it onto the path where the bound sandbox mounted/synced the worktree.
+ * Implementations never reject on command failure — a thrown error means the
+ * executor itself is broken and is recorded as a failed command.
+ */
+export type VerificationExec = (
+  command: string,
+  options: { readonly cwd: string; readonly timeoutMs: number },
+) => Promise<VerificationExecResult>;
+
+/**
+ * A {@link VerificationExec} bound to one stage's worktree plus the teardown
+ * that releases it. Host mode binds a no-op; docker/podman bind a sandbox
+ * started over the worktree, which `close` tears down.
+ */
+export interface BoundVerificationExec {
+  readonly exec: VerificationExec;
+  readonly close: () => Promise<void>;
 }
 
 /** Structured result of one `sandcastle run` invocation. */
@@ -236,6 +297,14 @@ export interface RunIssueWorkflowOptions {
   readonly discoveryExec?: DiscoveryExec;
   /** Per-command timeout for verification steps (default 10 minutes). */
   readonly verificationTimeoutMs?: number;
+  /**
+   * Verification-execution boundary — tests inject a fake. When unset, the
+   * executor is bound to `settings.sandbox`: host mode runs commands on the
+   * host worktree; docker/podman run them inside a sandbox bound to the
+   * worktree being verified (source stage → implementation worktree,
+   * integrated stage → integration worktree).
+   */
+  readonly verificationExec?: VerificationExec;
   /**
    * Shared FIFO lock serializing shared-repo git mutations across concurrent
    * queued runs (#20). A queue run (`runIssueQueueWorkflow`) creates one lock
@@ -875,6 +944,7 @@ const formatVerificationLines = (
   stageLabel: string,
   results: readonly VerificationCommandResult[] | undefined,
   configured: boolean,
+  environment?: string,
 ): string[] => {
   if (!configured) {
     return [`- ${stageLabel}: không có lệnh xác minh nào được cấu hình.`];
@@ -882,16 +952,19 @@ const formatVerificationLines = (
   if (results === undefined || results.length === 0) {
     return [`- ${stageLabel}: chưa chạy.`];
   }
+  const envSuffix = environment !== undefined ? ` (${environment})` : "";
   return [
-    `- ${stageLabel}:`,
+    `- ${stageLabel}${envSuffix}:`,
     ...results.map(
       (r) =>
         `  - \`${r.command}\` — ${
           r.status === "passed"
             ? "đã pass"
-            : r.status === "failed"
-              ? `thất bại (exit ${r.exitCode ?? "?"})`
-              : "bị bỏ qua"
+            : r.timedOut === true
+              ? "hết thời gian chờ (timeout)"
+              : r.status === "failed"
+                ? `thất bại (exit ${r.exitCode ?? "?"})`
+                : "bị bỏ qua"
         }`,
     ),
   ];
@@ -910,6 +983,12 @@ export const buildCompletionReport = (params: {
   readonly verification: readonly VerificationCommandResult[];
   readonly integrationVerification?: readonly VerificationCommandResult[];
   readonly verificationConfigured: boolean;
+  /**
+   * The execution environment the verification stages ran in — `"host"` or
+   * the sandbox name (`"docker"`/`"podman"`) — named on each stage heading
+   * so the report shows where commands executed.
+   */
+  readonly verificationEnvironment?: string;
   readonly cautions: readonly string[];
 }): string => {
   const {
@@ -922,6 +1001,7 @@ export const buildCompletionReport = (params: {
     verification,
     integrationVerification,
     verificationConfigured,
+    verificationEnvironment,
     cautions,
   } = params;
 
@@ -945,8 +1025,8 @@ ${changeBlock}
 **Tác động:** thay đổi đã nằm trên nhánh \`${targetBranch}\` của dự án — kiểm tra bằng \`git log\`/\`git show ${shortSha(landedSha)}\` nếu cần chi tiết.
 
 **Xác minh đã chạy:**
-${formatVerificationLines(`trên nhánh làm việc \`${sourceBranch}\``, verification, verificationConfigured).join("\n")}
-${formatVerificationLines("sau khi merge vào nhánh đích", integrationVerification, verificationConfigured).join("\n")}
+${formatVerificationLines(`trên nhánh làm việc \`${sourceBranch}\``, verification, verificationConfigured, verificationEnvironment).join("\n")}
+${formatVerificationLines("sau khi merge vào nhánh đích", integrationVerification, verificationConfigured, verificationEnvironment).join("\n")}
 
 **Lưu ý:**
 ${cautions.length > 0 ? cautions.map((c) => `- ${c}`).join("\n") : "- Không có."}
@@ -961,6 +1041,11 @@ export const buildFailureReport = (params: {
   readonly verification: readonly VerificationCommandResult[];
   readonly integrationVerification?: readonly VerificationCommandResult[];
   readonly verificationConfigured: boolean;
+  /**
+   * The execution environment the verification stages ran in — `"host"` or
+   * the sandbox name — named on each stage heading.
+   */
+  readonly verificationEnvironment?: string;
   readonly sourceBranch?: string;
   readonly worktreePath?: string;
   /** Attempt counters — shown so an exhausted repair reads as bounded, not lazy. */
@@ -973,6 +1058,7 @@ export const buildFailureReport = (params: {
     verification,
     integrationVerification,
     verificationConfigured,
+    verificationEnvironment,
     sourceBranch,
     worktreePath,
     attempts,
@@ -1003,60 +1089,271 @@ ${tail(error.trim() || "(không có chi tiết)")}
 \`\`\`
 
 ${attemptsLine}**Xác minh đã chạy:**
-${formatVerificationLines("trên nhánh làm việc", verification, verificationConfigured).join("\n")}
-${integrationVerification !== undefined ? formatVerificationLines("sau khi merge", integrationVerification, verificationConfigured).join("\n") : ""}
+${formatVerificationLines("trên nhánh làm việc", verification, verificationConfigured, verificationEnvironment).join("\n")}
+${integrationVerification !== undefined ? formatVerificationLines("sau khi merge", integrationVerification, verificationConfigured, verificationEnvironment).join("\n") : ""}
 
 **Trạng thái:** issue #${issue.number} vẫn mở — không có thay đổi nào được merge vào nhánh đích. ${recoveryLine}
 `;
 };
 
 // ---------------------------------------------------------------------------
-// Verification runner
+// Verification runner — execution environment binding (F062)
 // ---------------------------------------------------------------------------
 
+/** Cap on per-command stdout/stderr capture — tails only need enough for reports. */
+const VERIFICATION_STREAM_TAIL_CHARS = 1024 * 1024;
+
+/** How long to wait after SIGTERM before escalating to SIGKILL. */
+const SIGKILL_GRACE_MS = 500;
+
 /**
- * Run verification commands sequentially in `cwd`, stopping at the first
- * failure. Commands after a failure are recorded as `"skipped"` so the
- * per-command record is honest about what actually ran.
+ * The host {@link VerificationExec} — `child_process.exec` on the host with
+ * our own timeout so `timedOut` is honest (the `exec` `timeout` option only
+ * surfaces kills through the error object). SIGTERM first, then SIGKILL after
+ * a grace period. Stream capture is bounded to a rolling tail — a runaway
+ * command cannot exhaust memory.
+ */
+export const hostVerificationExec: VerificationExec = (command, options) =>
+  new Promise((resolve) => {
+    let timedOut = false;
+    let settled = false;
+    const settle = (result: VerificationExecResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const child = exec(
+      command,
+      {
+        cwd: options.cwd,
+        env: process.env,
+        // stdout/stderr are still buffered by exec — bound them like the old
+        // maxBuffer did so a flood of output fails the command honestly
+        // rather than growing memory without limit.
+        maxBuffer: VERIFICATION_STREAM_TAIL_CHARS,
+      },
+      (error, stdout, stderr) => {
+        const err = error as {
+          code?: unknown;
+          message?: string;
+        } | null;
+        settle({
+          stdout: stdout ?? "",
+          stderr: stderr ?? "",
+          exitCode:
+            err === null ? 0 : typeof err.code === "number" ? err.code : null,
+          ...(timedOut ? { timedOut: true } : {}),
+          ...(err !== null &&
+            typeof err.code === "string" &&
+            err.code.length > 0
+            ? { spawnError: err.code }
+            : {}),
+        });
+      },
+    );
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      const killTimer = setTimeout(
+        () => child.kill("SIGKILL"),
+        SIGKILL_GRACE_MS,
+      );
+      killTimer.unref();
+    }, options.timeoutMs);
+    timer.unref();
+  });
+
+/**
+ * Bind a {@link VerificationExec} to `sandbox` for one verification stage
+ * (F062 — "verify the correct state in the configured execution
+ * environment").
+ *
+ * - `none` (host mode): commands run on the host; `options.cwd` is the host
+ *   worktree path, used verbatim. `close` is a no-op.
+ * - `bind-mount` (docker/podman): a sandbox is started over `worktreePath`
+ *   with the same mount wiring `wt.run` uses — the worktree at
+ *   `SANDBOX_REPO_DIR`, the repo's git mounts at identical absolute paths —
+ *   and `exec` maps the host `cwd` onto the sandbox-side mount so commands
+ *   run inside the sandbox against that exact worktree. `close` tears the
+ *   sandbox down; an expired command also closes it, since a runtime `exec`
+ *   has no reliable in-container kill path.
+ * - `isolated`: the worktree's committed state is synced into the sandbox;
+ *   commands run against the synced copy at the provider's worktree path.
+ */
+export const bindVerificationExec = async (options: {
+  readonly sandbox: SandboxProvider;
+  /** Host-side repo root — the `.git` anchor for bind-mount git mounts. */
+  readonly hostRepoDir: string;
+  /** Host-side path of the worktree whose state this stage verifies. */
+  readonly worktreePath: string;
+  /** Environment injected into the sandbox (`.sandcastle/.env` + providers). */
+  readonly env: Record<string, string>;
+}): Promise<BoundVerificationExec> => {
+  const { sandbox, hostRepoDir, worktreePath, env } = options;
+
+  if (sandbox.tag === "none") {
+    return { exec: hostVerificationExec, close: async () => {} };
+  }
+
+  let handle:
+    | BindMountSandboxHandle
+    | IsolatedSandboxHandle
+    | NoSandboxHandle;
+  if (sandbox.tag === "bind-mount") {
+    const gitPath = join(hostRepoDir, ".git");
+    const rawGitMounts = await runEffect(resolveGitMounts(gitPath));
+    const gitMounts = await runEffect(
+      patchGitMountsForWindows(rawGitMounts, worktreePath, SANDBOX_REPO_DIR),
+    );
+    const started = await runEffect(
+      startSandbox({
+        provider: sandbox,
+        hostRepoDir,
+        env,
+        worktreeOrRepoPath: worktreePath,
+        gitMounts,
+        repoDir: SANDBOX_REPO_DIR,
+      }),
+    );
+    handle = started.handle;
+  } else {
+    // Isolated providers can't bind-mount a host worktree — sync the
+    // worktree's committed state in (same as the agent run does).
+    const started = await runEffect(
+      startSandbox({
+        provider: sandbox,
+        hostRepoDir: worktreePath,
+        env,
+      }),
+    );
+    handle = started.handle;
+  }
+
+  const sandboxWorktreePath = handle.worktreePath;
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await handle.close();
+  };
+
+  // The caller always passes a host path at-or-under the bound worktree;
+  // inside the sandbox that path is the provider's worktree mount (or a path
+  // below it). Anything outside the mount collapses to the mount root.
+  const toSandboxCwd = (hostCwd: string): string => {
+    const rel = relative(worktreePath, hostCwd);
+    // `rel` escaping the worktree ("..", "../sib") or absolute (a different
+    // Windows drive yields "D:\..." back) can't be mapped — run at the
+    // mount root instead.
+    if (
+      rel === "" ||
+      rel === ".." ||
+      rel.startsWith(`..${sep}`) ||
+      rel.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/.test(rel)
+    ) {
+      return sandboxWorktreePath;
+    }
+    return posix.join(sandboxWorktreePath, ...rel.split(sep));
+  };
+
+  const exec: VerificationExec = (command, execOptions) =>
+    new Promise((resolve) => {
+      let settled = false;
+      const settle = (result: VerificationExecResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      };
+      const timer = setTimeout(() => {
+        // A container runtime's `exec` has no abort path that reliably
+        // reaches the in-container process — tearing the sandbox down is the
+        // guaranteed kill. The command resolves immediately as timed-out.
+        settle({
+          stdout: "",
+          stderr: "",
+          exitCode: null,
+          timedOut: true,
+          spawnError:
+            `quá thời gian chờ ${execOptions.timeoutMs}ms — ` +
+            `sandbox ${sandbox.name} đã bị dừng`,
+        });
+        void close().catch(() => {
+          // best-effort teardown — the caller's finally also closes
+        });
+      }, execOptions.timeoutMs);
+      timer.unref();
+      void handle
+        .exec(command, { cwd: toSandboxCwd(execOptions.cwd) })
+        .then(
+          (res) =>
+            settle({
+              stdout: res.stdout,
+              stderr: res.stderr,
+              exitCode: res.exitCode,
+            }),
+          (e) =>
+            settle({
+              stdout: "",
+              stderr: "",
+              exitCode: null,
+              spawnError: e instanceof Error ? e.message : String(e),
+            }),
+        );
+    });
+
+  return { exec, close };
+};
+
+/**
+ * Run verification commands sequentially through `options.exec` (default:
+ * the host executor), stopping at the first failure. Commands after a
+ * failure are recorded as `"skipped"` so the per-command record is honest
+ * about what actually ran. `options.cwd` is the host path of the state being
+ * verified — the executor owns the environment mapping.
  */
 export const runVerificationCommands = async (
   commands: readonly string[],
-  cwd: string,
-  timeoutMs: number = VERIFICATION_TIMEOUT_MS,
+  options: {
+    readonly cwd: string;
+    readonly timeoutMs?: number;
+    readonly exec?: VerificationExec;
+  },
 ): Promise<VerificationCommandResult[]> => {
+  const exec = options.exec ?? hostVerificationExec;
+  const timeoutMs = options.timeoutMs ?? VERIFICATION_TIMEOUT_MS;
   const results: VerificationCommandResult[] = [];
   for (const command of commands) {
     const started = Date.now();
+    let res: VerificationExecResult;
     try {
-      const { stdout, stderr } = await execAsync(command, {
-        cwd,
-        env: process.env,
-        timeout: timeoutMs,
-        maxBuffer: 32 * 1024 * 1024,
-      });
-      results.push({
-        command,
-        status: "passed",
-        exitCode: 0,
-        durationMs: Date.now() - started,
-        outputTail: tail(`${stdout}${stderr}`),
-      });
+      res = await exec(command, { cwd: options.cwd, timeoutMs });
     } catch (e) {
-      const err = e as {
-        code?: unknown;
-        stdout?: string;
-        stderr?: string;
+      // An executor that throws (dead sandbox handle, transport error) is
+      // still an honest failed command — never an implicit pass.
+      res = {
+        stdout: "",
+        stderr: e instanceof Error ? e.message : String(e),
+        exitCode: null,
       };
-      results.push({
-        command,
-        status: "failed",
-        exitCode: typeof err.code === "number" ? err.code : null,
-        durationMs: Date.now() - started,
-        outputTail: tail(
-          `${err.stdout ?? ""}${err.stderr ?? ""}` ||
-            (e instanceof Error ? e.message : String(e)),
-        ),
-      });
+    }
+    results.push({
+      command,
+      // A timed-out command never reports "passed", even when the killed
+      // process happened to exit 0 on its way down.
+      status: res.exitCode === 0 && res.timedOut !== true ? "passed" : "failed",
+      exitCode: res.exitCode,
+      durationMs: Date.now() - started,
+      outputTail: tail(
+        [res.stdout, res.stderr].filter((s) => s.length > 0).join("\n") ||
+          res.spawnError ||
+          "",
+      ),
+      ...(res.timedOut === true ? { timedOut: true } : {}),
+    });
+    if (res.exitCode !== 0 || res.timedOut === true) {
       for (const rest of commands.slice(results.length)) {
         results.push({
           command: rest,
@@ -1076,17 +1373,45 @@ const hasFailedVerification = (
   results: readonly VerificationCommandResult[],
 ): boolean => results.some((r) => r.status === "failed");
 
-/** Aggregate stage status for settings + the result record. */
-const aggregateVerificationStatus = (
+/** Per-command failure wording — keeps timeouts distinct from plain exits. */
+const verificationFailureDetail = (
+  r: VerificationCommandResult,
+): string =>
+  r.timedOut === true
+    ? "hết thời gian chờ (timeout)"
+    : `thất bại (exit ${r.exitCode ?? "?"})`;
+
+/**
+ * Aggregate stage status for settings + the result record.
+ *
+ * `"passed"` is only produced by a complete run: every configured command
+ * executed and none failed or was skipped (ADR 0024 — "missing or skipped
+ * verification is never reported as passed"). Empty results — commands
+ * configured but never run this run — fall back to a non-outcome marker;
+ * a stale `"passed"`/`"failed"` carried in settings is about different code
+ * and is never carried forward (F033).
+ */
+export const aggregateVerificationStatus = (
   configuredCount: number,
   results: readonly VerificationCommandResult[],
   configuredButEmptyStatus: VerificationStatus | undefined,
-): VerificationStatus =>
-  configuredCount === 0
-    ? (configuredButEmptyStatus ?? "unavailable")
-    : hasFailedVerification(results)
-      ? "failed"
-      : "passed";
+): VerificationStatus => {
+  if (configuredCount === 0 || results.length === 0) {
+    return configuredButEmptyStatus === "skipped" ||
+      configuredButEmptyStatus === "unavailable"
+      ? configuredButEmptyStatus
+      : "unavailable";
+  }
+  // A "skipped" entry only exists behind a real failure — partial execution
+  // can never reach "passed".
+  if (hasFailedVerification(results) || results.some((r) => r.status === "skipped")) {
+    return "failed";
+  }
+  // Fewer results than configured with no failure marker means incomplete
+  // evidence (e.g. the configured command list changed between runs).
+  if (results.length < configuredCount) return "unavailable";
+  return "passed";
+};
 
 /** Best-effort `settings.verificationStatus` write — never sinks a run. */
 const persistVerificationStatus = async (
@@ -1349,6 +1674,45 @@ export const runIssueWorkflow = async (
   // host-side session storage — needed by the resume precheck for repairs.
   const hostRepoDir = await runEffect(resolveCwd(cwd));
 
+  // How reports and status lines name the environment verification runs in.
+  const verificationEnvironment = settings.sandbox;
+  const verificationEnvWhere =
+    settings.sandbox === "host" ? "trên host" : `trong sandbox ${settings.sandbox}`;
+
+  // Lazily resolved env for verification sandboxes — `.sandcastle/.env` +
+  // provider env, the same merge `wt.run` applies. Host mode and injected
+  // executors never touch it.
+  let verificationEnvPromise: Promise<Record<string, string>> | undefined;
+  const verificationSandboxEnv = (): Promise<Record<string, string>> =>
+    (verificationEnvPromise ??= runEffect(resolveEnv(hostRepoDir)).then(
+      (resolvedEnv) =>
+        mergeProviderEnv({
+          resolvedEnv,
+          agentProviderEnv: agents.implementer.provider.env,
+          sandboxProviderEnv: sandbox.env,
+        }),
+    ));
+
+  /**
+   * Bind the verification executor for one stage's worktree: the injected
+   * boundary when present, else the configured sandbox over `worktreePath`
+   * (host mode needs no sandbox at all). The caller owns `close` — always in
+   * a `finally` so a thrown stage can't leak a container.
+   */
+  const verificationExecFor = async (
+    worktreePath: string,
+  ): Promise<BoundVerificationExec> => {
+    if (options.verificationExec !== undefined) {
+      return { exec: options.verificationExec, close: async () => {} };
+    }
+    return bindVerificationExec({
+      sandbox,
+      hostRepoDir,
+      worktreePath,
+      env: sandbox.tag === "none" ? {} : await verificationSandboxEnv(),
+    });
+  };
+
   // A retry lands on the branch the failed run was targeting, even when the
   // checkout has since moved — the landing uses `update-ref` CAS then.
   const targetBranch =
@@ -1418,11 +1782,15 @@ export const runIssueWorkflow = async (
   let phase: WorkflowRunPhase = "implementation";
   let wt: Worktree | undefined;
   let integrationWt: Worktree | undefined;
-  // A retry that re-enters at integration carries the recorded source-stage
-  // verification forward so reports still show what was checked.
+  // A retry carries the recorded verification results forward so reports and
+  // the re-written recovery record still show what was checked — source stage
+  // and integrated stage stay separate arrays.
   let verification: VerificationCommandResult[] =
     resume !== undefined ? [...resume.verification] : [];
-  let integrationVerification: VerificationCommandResult[] | undefined;
+  let integrationVerification: VerificationCommandResult[] | undefined =
+    resume?.integrationVerification !== undefined
+      ? [...resume.integrationVerification]
+      : undefined;
   let integrationBranch: string | undefined;
   let integrationPath: string | undefined;
 
@@ -1606,6 +1974,7 @@ export const runIssueWorkflow = async (
       verification,
       integrationVerification,
       verificationConfigured: verificationConfigured(),
+      verificationEnvironment,
       sourceBranch,
       worktreePath: wt?.worktreePath,
       attempts,
@@ -1674,9 +2043,11 @@ export const runIssueWorkflow = async (
       integrationBranch,
       commits: allCommits,
       verification,
+      // The freshest stage's evidence wins — an integrated-stage failure must
+      // not hide behind earlier source-stage results (F033).
       verificationStatus: aggregateVerificationStatus(
         settings.verificationCommands.length,
-        verification,
+        integrationVerification ?? verification,
         settings.verificationStatus,
       ),
       ...(integrationVerification !== undefined
@@ -1922,67 +2293,106 @@ export const runIssueWorkflow = async (
   ) {
     phase = "verification";
     if (verificationConfigured()) {
-      status("Đang chạy lệnh xác minh…");
-      verification = await runVerificationCommands(
-        settings.verificationCommands,
-        wt.worktreePath,
-        verificationTimeoutMs,
-      );
-      await persistVerificationStatus(
-        cwd,
-        hasFailedVerification(verification) ? "failed" : "passed",
-      );
-
-      while (hasFailedVerification(verification)) {
-        const failed = verification.find((r) => r.status === "failed")!;
-        if (attempts.verificationRepair >= MAX_VERIFICATION_REPAIR_ATTEMPTS) {
-          return fail(
-            new Error(
-              `Lệnh xác minh vẫn thất bại sau ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS} ` +
-                `lần sửa tự động: \`${failed.command}\` (exit ${failed.exitCode ?? "?"})\n${failed.outputTail}`,
-            ),
-          );
-        }
-        attempts.verificationRepair++;
-        const resumeSession = await resumableSession(
-          agents.implementer.provider,
-        );
-        status(
-          `Xác minh thất bại — agent đang sửa trong cùng worktree ` +
-            `(lần ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
-            `${resumeSession !== undefined ? ", tiếp tục phiên agent" : ", phiên mới"})…`,
-          "warn",
-        );
-        try {
-          const repair = await wt.run({
-            agent: agents.implementer.provider,
-            sandbox,
-            prompt: buildVerificationRepairPrompt({
-              context: promptContext,
-              failure: failed,
-              attempt: attempts.verificationRepair,
-              maxAttempts: MAX_VERIFICATION_REPAIR_ATTEMPTS,
-              continuingSession: resumeSession !== undefined,
-            }),
-            name: `issue-${issue.number}`,
-            maxIterations: 1,
-            completionSignal: DEFAULT_COMPLETION_SIGNAL,
-            ...(resumeSession !== undefined ? { resumeSession } : {}),
-          });
-          recordAgentRun(repair);
-        } catch (e) {
-          return fail(e);
-        }
-        status("Đang chạy lại lệnh xác minh sau khi sửa…");
+      status(`Đang chạy lệnh xác minh ${verificationEnvWhere}…`);
+      // Commands run through the environment bound to THIS worktree — host
+      // exec for host mode, a fresh sandbox for docker/podman — never bare
+      // host execAsync (F062).
+      let boundSource: BoundVerificationExec;
+      try {
+        boundSource = await verificationExecFor(wt.worktreePath);
+      } catch (e) {
+        return fail(e);
+      }
+      try {
         verification = await runVerificationCommands(
           settings.verificationCommands,
-          wt.worktreePath,
-          verificationTimeoutMs,
+          {
+            cwd: wt.worktreePath,
+            timeoutMs: verificationTimeoutMs,
+            exec: boundSource.exec,
+          },
         );
         await persistVerificationStatus(
           cwd,
-          hasFailedVerification(verification) ? "failed" : "passed",
+          aggregateVerificationStatus(
+            settings.verificationCommands.length,
+            verification,
+            settings.verificationStatus,
+          ),
         );
+
+        while (hasFailedVerification(verification)) {
+          const failed = verification.find((r) => r.status === "failed")!;
+          if (attempts.verificationRepair >= MAX_VERIFICATION_REPAIR_ATTEMPTS) {
+            return fail(
+              new Error(
+                `Lệnh xác minh ${verificationFailureDetail(failed)} sau ` +
+                  `${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS} ` +
+                  `lần sửa tự động: \`${failed.command}\`\n${failed.outputTail}`,
+              ),
+            );
+          }
+          attempts.verificationRepair++;
+          const resumeSession = await resumableSession(
+            agents.implementer.provider,
+          );
+          status(
+            `Xác minh thất bại — agent đang sửa trong cùng worktree ` +
+              `(lần ${attempts.verificationRepair}/${MAX_VERIFICATION_REPAIR_ATTEMPTS}` +
+              `${resumeSession !== undefined ? ", tiếp tục phiên agent" : ", phiên mới"})…`,
+            "warn",
+          );
+          try {
+            const repair = await wt.run({
+              agent: agents.implementer.provider,
+              sandbox,
+              prompt: buildVerificationRepairPrompt({
+                context: promptContext,
+                failure: failed,
+                attempt: attempts.verificationRepair,
+                maxAttempts: MAX_VERIFICATION_REPAIR_ATTEMPTS,
+                continuingSession: resumeSession !== undefined,
+              }),
+              name: `issue-${issue.number}`,
+              maxIterations: 1,
+              completionSignal: DEFAULT_COMPLETION_SIGNAL,
+              ...(resumeSession !== undefined ? { resumeSession } : {}),
+            });
+            recordAgentRun(repair);
+          } catch (e) {
+            return fail(e);
+          }
+          status(`Đang chạy lại lệnh xác minh ${verificationEnvWhere} sau khi sửa…`);
+          // Rebind: a command that timed out tore its sandbox down (runtime
+          // exec has no in-container kill), so the re-run needs a fresh one.
+          try {
+            await boundSource.close().catch(() => {});
+            boundSource = await verificationExecFor(wt.worktreePath);
+          } catch (e) {
+            return fail(e);
+          }
+          verification = await runVerificationCommands(
+            settings.verificationCommands,
+            {
+              cwd: wt.worktreePath,
+              timeoutMs: verificationTimeoutMs,
+              exec: boundSource.exec,
+            },
+          );
+          await persistVerificationStatus(
+            cwd,
+            aggregateVerificationStatus(
+              settings.verificationCommands.length,
+              verification,
+              settings.verificationStatus,
+            ),
+          );
+        }
+      } finally {
+        await boundSource.close().catch(() => {
+          // A torn-down/limping sandbox must not sink the run — the results
+          // already recorded carry the honest outcome.
+        });
       }
     } else {
       status(
@@ -2068,26 +2478,47 @@ export const runIssueWorkflow = async (
 
         phase = "integration-verification";
         if (verificationConfigured()) {
-          status("Đang xác minh lại kết quả sau khi merge…");
-          integrationVerification = await runVerificationCommands(
-            settings.verificationCommands,
-            integPath,
-            verificationTimeoutMs,
+          status(
+            `Đang xác minh lại kết quả sau khi merge ${verificationEnvWhere}…`,
           );
-          await persistVerificationStatus(
-            cwd,
-            hasFailedVerification(integrationVerification)
-              ? "failed"
-              : "passed",
-          );
+          // Same executor binding as the source stage, but bound to the
+          // INTEGRATION worktree — the merged state is what gets verified.
+          let boundInteg: BoundVerificationExec;
+          try {
+            boundInteg = await verificationExecFor(integPath);
+          } catch (e) {
+            return fail(e);
+          }
+          try {
+            integrationVerification = await runVerificationCommands(
+              settings.verificationCommands,
+              {
+                cwd: integPath,
+                timeoutMs: verificationTimeoutMs,
+                exec: boundInteg.exec,
+              },
+            );
+            await persistVerificationStatus(
+              cwd,
+              aggregateVerificationStatus(
+                settings.verificationCommands.length,
+                integrationVerification,
+                settings.verificationStatus,
+              ),
+            );
+          } finally {
+            await boundInteg.close().catch(() => {
+              // best-effort teardown
+            });
+          }
           const failed = integrationVerification.find(
             (r) => r.status === "failed",
           );
           if (failed !== undefined) {
             return fail(
               new Error(
-                `Lệnh xác minh thất bại sau khi merge: \`${failed.command}\` ` +
-                  `(exit ${failed.exitCode ?? "?"})\n${failed.outputTail}`,
+                `Lệnh xác minh ${verificationFailureDetail(failed)} sau khi merge: ` +
+                  `\`${failed.command}\`\n${failed.outputTail}`,
               ),
             );
           }
@@ -2240,6 +2671,7 @@ export const runIssueWorkflow = async (
     verification,
     integrationVerification,
     verificationConfigured: verificationConfigured(),
+    verificationEnvironment,
     cautions,
   });
 
@@ -2322,6 +2754,8 @@ export interface RunIssueQueueOptions {
   readonly discoveryExec?: DiscoveryExec;
   /** Per-command timeout for verification steps (default 10 minutes). */
   readonly verificationTimeoutMs?: number;
+  /** Verification-execution boundary — forwarded to every queued issue's run. */
+  readonly verificationExec?: VerificationExec;
 }
 
 /** Structured result of one queued `sandcastle run --all` invocation. */
@@ -2458,6 +2892,7 @@ export const runIssueQueueWorkflow = async (
           ghRunner: options.ghRunner,
           discoveryExec: options.discoveryExec,
           verificationTimeoutMs: options.verificationTimeoutMs,
+          verificationExec: options.verificationExec,
           sharedLock: lock,
           // One preflight per queue — the per-issue run skips its own probes.
           preflight: { settings, gh },

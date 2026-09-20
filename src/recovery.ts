@@ -182,6 +182,8 @@ const asVerificationResults = (
       durationMs: typeof obj["durationMs"] === "number" ? obj["durationMs"] : 0,
       outputTail:
         typeof obj["outputTail"] === "string" ? obj["outputTail"] : "",
+      // Optional in the record shape — older recovery files simply lack it.
+      ...(obj["timedOut"] === true ? { timedOut: true as const } : {}),
     });
   }
   return out;

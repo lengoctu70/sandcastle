@@ -1,13 +1,28 @@
-import { exec } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { exec, execSync } from "node:child_process";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { DiscoveryExec } from "./discovery/contract.js";
-import type { GithubIssue, GhRunner } from "./githubIssues.js";
+import type { GhRunner, GithubIssue } from "./githubIssues.js";
+import { SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 import {
+  createBindMountSandboxProvider,
+  type BindMountCreateOptions,
+} from "./SandboxProvider.js";
+import { noSandbox } from "./sandboxes/no-sandbox.js";
+import {
+  aggregateVerificationStatus,
+  bindVerificationExec,
   buildCompletionReport,
   buildFailureReport,
   buildImplementationPrompt,
@@ -15,9 +30,11 @@ import {
   buildPlanningPrompt,
   buildReviewPrompt,
   buildVerificationRepairPrompt,
+  hostVerificationExec,
   PHASE_LABEL,
   runIssueWorkflow,
   runVerificationCommands,
+  type VerificationExec,
   WorkflowRunError,
 } from "./WorkflowRun.js";
 
@@ -384,7 +401,9 @@ describe("runVerificationCommands", () => {
   // Commands stay portable (echo/exit work on both sh and cmd).
   it("runs commands in order and records pass/fail per command", async () => {
     const dir = await mkdtemp(join(tmpdir(), "verify-"));
-    const results = await runVerificationCommands(["echo a", "echo b"], dir);
+    const results = await runVerificationCommands(["echo a", "echo b"], {
+      cwd: dir,
+    });
     expect(results.map((r) => r.status)).toEqual(["passed", "passed"]);
     expect(results[0]!.exitCode).toBe(0);
   });
@@ -393,7 +412,7 @@ describe("runVerificationCommands", () => {
     const dir = await mkdtemp(join(tmpdir(), "verify-"));
     const results = await runVerificationCommands(
       ["exit 1", "echo a", "echo b"],
-      dir,
+      { cwd: dir },
     );
     expect(results.map((r) => r.status)).toEqual([
       "failed",
@@ -408,11 +427,545 @@ describe("runVerificationCommands", () => {
     const dir = await mkdtemp(join(tmpdir(), "verify-"));
     const results = await runVerificationCommands(
       ["echo out && echo err 1>&2 && exit 1"],
-      dir,
+      { cwd: dir },
     );
     expect(results[0]!.status).toBe("failed");
     expect(results[0]!.outputTail).toContain("out");
     expect(results[0]!.outputTail).toContain("err");
+  });
+
+  it("runs commands through the injected executor in order with the given cwd", async () => {
+    const seen: { command: string; cwd: string; timeoutMs: number }[] = [];
+    const exec: VerificationExec = async (command, options) => {
+      seen.push({ command, cwd: options.cwd, timeoutMs: options.timeoutMs });
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+    const results = await runVerificationCommands(["a", "b"], {
+      cwd: "/stage/worktree",
+      timeoutMs: 5000,
+      exec,
+    });
+    expect(results.map((r) => r.status)).toEqual(["passed", "passed"]);
+    expect(seen.map((s) => s.command)).toEqual(["a", "b"]);
+    expect(
+      seen.every((s) => s.cwd === "/stage/worktree" && s.timeoutMs === 5000),
+    ).toBe(true);
+  });
+
+  it("joins stdout and stderr with a newline delimiter", async () => {
+    const exec: VerificationExec = async () => ({
+      stdout: "out",
+      stderr: "err",
+      exitCode: 1,
+    });
+    const results = await runVerificationCommands(["x"], {
+      cwd: "/x",
+      exec,
+    });
+    expect(results[0]!.status).toBe("failed");
+    expect(results[0]!.outputTail).toBe("out\nerr");
+  });
+
+  it("marks a timed-out command failed even when the executor reports exit 0", async () => {
+    const exec: VerificationExec = async () => ({
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: true,
+    });
+    const results = await runVerificationCommands(["slow", "never-ran"], {
+      cwd: "/x",
+      exec,
+    });
+    expect(results[0]!.status).toBe("failed");
+    expect(results[0]!.timedOut).toBe(true);
+    expect(results[1]!.status).toBe("skipped");
+  });
+
+  it("turns a throwing executor into a failed command, never a pass", async () => {
+    const exec: VerificationExec = async () => {
+      throw new Error("sandbox handle is dead");
+    };
+    const results = await runVerificationCommands(["x", "y"], {
+      cwd: "/x",
+      exec,
+    });
+    expect(results[0]!.status).toBe("failed");
+    expect(results[0]!.exitCode).toBeNull();
+    expect(results[0]!.outputTail).toContain("sandbox handle is dead");
+    expect(results[1]!.status).toBe("skipped");
+  });
+
+  it("returns empty results for an empty command list", async () => {
+    expect(await runVerificationCommands([], { cwd: "/x" })).toEqual([]);
+  });
+});
+
+describe("aggregateVerificationStatus", () => {
+  const passed = {
+    command: "a",
+    status: "passed" as const,
+    exitCode: 0,
+    durationMs: 1,
+    outputTail: "",
+  };
+
+  it("never produces passed without executed evidence", () => {
+    expect(aggregateVerificationStatus(0, [], undefined)).toBe("unavailable");
+    // Configured-but-not-run: a stale pass is not carried forward.
+    expect(aggregateVerificationStatus(3, [], "passed")).toBe("unavailable");
+    // Non-outcome markers survive so "user skipped"/"unavailable" stay honest.
+    expect(aggregateVerificationStatus(3, [], "skipped")).toBe("skipped");
+    expect(aggregateVerificationStatus(3, [], "unavailable")).toBe(
+      "unavailable",
+    );
+  });
+
+  it("reports failed on failure or partial (skipped) execution", () => {
+    expect(
+      aggregateVerificationStatus(
+        1,
+        [
+          {
+            command: "a",
+            status: "failed",
+            exitCode: 1,
+            durationMs: 1,
+            outputTail: "boom",
+          },
+        ],
+        undefined,
+      ),
+    ).toBe("failed");
+    // A skipped entry means partial execution — still not a pass.
+    expect(
+      aggregateVerificationStatus(
+        2,
+        [
+          passed,
+          {
+            command: "b",
+            status: "skipped",
+            exitCode: null,
+            durationMs: 0,
+            outputTail: "",
+          },
+        ],
+        undefined,
+      ),
+    ).toBe("failed");
+  });
+
+  it("reports passed only when every configured command ran and passed", () => {
+    expect(aggregateVerificationStatus(1, [passed], undefined)).toBe("passed");
+    // Fewer results than configured = incomplete evidence.
+    expect(aggregateVerificationStatus(2, [passed], undefined)).toBe(
+      "unavailable",
+    );
+  });
+});
+
+describe("hostVerificationExec", () => {
+  it("executes on the host in the given cwd", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "verify-host-"));
+    const res = await hostVerificationExec(
+      'node -e "console.log(process.cwd())"',
+      { cwd: dir, timeoutMs: 10_000 },
+    );
+    expect(res.exitCode).toBe(0);
+    // Compare canonical paths — macOS tmpdir is a /var → /private/var symlink.
+    expect(await realpath(res.stdout.trim())).toBe(await realpath(dir));
+  });
+
+  it("kills the command on timeout and flags timedOut", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "verify-host-"));
+    const res = await hostVerificationExec(
+      'node -e "setTimeout(() => {}, 60000)"',
+      { cwd: dir, timeoutMs: 100 },
+    );
+    expect(res.timedOut).toBe(true);
+    expect(res.exitCode).not.toBe(0);
+  });
+});
+
+describe("bindVerificationExec", () => {
+  it("binds the host executor for the no-sandbox provider", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "verify-none-"));
+    const bound = await bindVerificationExec({
+      sandbox: noSandbox(),
+      hostRepoDir: dir,
+      worktreePath: dir,
+      env: {},
+    });
+    try {
+      const res = await bound.exec("echo hi", { cwd: dir, timeoutMs: 10_000 });
+      expect(res.exitCode).toBe(0);
+      expect(res.stdout.trim()).toBe("hi");
+    } finally {
+      await bound.close();
+    }
+  });
+
+  it("bind-mount: starts a sandbox over the worktree and maps cwd into it", async () => {
+    // A real `.git` dir gives resolveGitMounts something to inspect.
+    const repo = await mkdtemp(join(tmpdir(), "verify-sb-"));
+    await mkdir(join(repo, ".git"));
+
+    const execCalls: { command: string; cwd?: string }[] = [];
+    let createOptions: BindMountCreateOptions | undefined;
+    let closed = false;
+    const provider = createBindMountSandboxProvider({
+      name: "fake-docker",
+      create: async (opts) => {
+        createOptions = opts;
+        return {
+          worktreePath: SANDBOX_REPO_DIR,
+          exec: async (command, options) => {
+            execCalls.push({ command, cwd: options?.cwd });
+            return { stdout: "ok", stderr: "", exitCode: 0 };
+          },
+          copyFileIn: async () => {},
+          copyFileOut: async () => {},
+          close: async () => {
+            closed = true;
+          },
+        };
+      },
+    });
+
+    const bound = await bindVerificationExec({
+      sandbox: provider,
+      hostRepoDir: repo,
+      worktreePath: repo,
+      env: { TOKEN: "x" },
+    });
+    try {
+      const res = await bound.exec("npm test", {
+        cwd: repo,
+        timeoutMs: 1000,
+      });
+      expect(res).toEqual({ stdout: "ok", stderr: "", exitCode: 0 });
+      // The worktree root maps onto the sandbox worktree mount.
+      expect(execCalls[0]).toEqual({
+        command: "npm test",
+        cwd: SANDBOX_REPO_DIR,
+      });
+      // …and paths below it map relative to that mount.
+      await bound.exec("pwd", {
+        cwd: join(repo, "sub", "dir"),
+        timeoutMs: 1000,
+      });
+      expect(execCalls[1]!.cwd).toBe(`${SANDBOX_REPO_DIR}/sub/dir`);
+      // Paths outside the mount collapse to the mount root.
+      await bound.exec("pwd", { cwd: tmpdir(), timeoutMs: 1000 });
+      expect(execCalls[2]!.cwd).toBe(SANDBOX_REPO_DIR);
+    } finally {
+      await bound.close();
+    }
+    // The sandbox received the worktree mount + env, and close reached it.
+    expect(createOptions?.worktreePath).toBe(repo);
+    expect(createOptions?.env).toEqual({ TOKEN: "x" });
+    expect(
+      createOptions?.mounts.some(
+        (m) => m.hostPath === repo && m.sandboxPath === SANDBOX_REPO_DIR,
+      ),
+    ).toBe(true);
+    expect(closed).toBe(true);
+    // close is idempotent.
+    await bound.close();
+  });
+
+  it("bind-mount: an exec timeout resolves as timedOut and tears the sandbox down", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "verify-sb-"));
+    await mkdir(join(repo, ".git"));
+    let closed = false;
+    const provider = createBindMountSandboxProvider({
+      name: "fake-docker",
+      create: async () => ({
+        worktreePath: SANDBOX_REPO_DIR,
+        // Never resolves — the runtime has no in-container kill, so the
+        // executor must time out on its own clock.
+        exec: () => new Promise(() => {}),
+        copyFileIn: async () => {},
+        copyFileOut: async () => {},
+        close: async () => {
+          closed = true;
+        },
+      }),
+    });
+    const bound = await bindVerificationExec({
+      sandbox: provider,
+      hostRepoDir: repo,
+      worktreePath: repo,
+      env: {},
+    });
+    const res = await bound.exec("hang", { cwd: repo, timeoutMs: 25 });
+    expect(res.timedOut).toBe(true);
+    expect(res.exitCode).toBeNull();
+    // Teardown is fired on timeout (best-effort async — poll briefly).
+    for (let i = 0; i < 20 && !closed; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(closed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runIssueWorkflow — injected execution deps over real temporary repositories
+// ---------------------------------------------------------------------------
+
+describe("runIssueWorkflow (real repo, injected gh + verification exec)", () => {
+  const ISSUE_5 = {
+    number: 5,
+    title: "Add a greeting file",
+    body: "Please add a greeting.",
+    state: "OPEN",
+    labels: [{ name: "Sandcastle" }],
+    url: "https://example.test/issues/5",
+  };
+
+  const initRepo = async (dir: string) => {
+    execSync("git init -b main", { cwd: dir, stdio: "ignore" });
+    execSync('git config user.email "test@test.com"', {
+      cwd: dir,
+      stdio: "ignore",
+    });
+    execSync('git config user.name "Test"', { cwd: dir, stdio: "ignore" });
+    await writeFile(join(dir, "hello.txt"), "hello\n");
+    execSync('git add -A && git commit -m "initial"', {
+      cwd: dir,
+      stdio: "ignore",
+    });
+  };
+
+  const writeSettings = async (
+    dir: string,
+    verificationCommands: readonly string[],
+  ) => {
+    await mkdir(join(dir, ".sandcastle"), { recursive: true });
+    await writeFile(
+      join(dir, ".sandcastle", "settings.json"),
+      JSON.stringify({
+        version: 1,
+        agent: "opencode",
+        model: "fake-model",
+        modelSource: "manual-unverified",
+        workflow: "simple-loop",
+        sandbox: "host",
+        verificationCommands,
+        parallelism: 1,
+        issueTracker: "github-issues",
+      }),
+    );
+  };
+
+  /**
+   * Fake `opencode` — the non-resumable provider's print-mode contract:
+   * prompt is the last argv element; writes agent-work.txt and commits in
+   * cwd; `# Verification repair` prompts additionally create verify-ok.flag.
+   */
+  const writeFakeOpencode = async (dir: string) => {
+    const shim = join(dir, "opencode");
+    await writeFile(
+      shim,
+      `#!/usr/bin/env node
+const fs = require("fs");
+const cp = require("child_process");
+const path = require("path");
+const prompt = process.argv[process.argv.length - 1] || "";
+const cwd = process.cwd();
+// Unique content per invocation — every repair run must produce a commit.
+const tag = Date.now() + "-" + Math.random().toString(36).slice(2);
+if (prompt.includes("# Verification repair")) {
+  fs.writeFileSync(path.join(cwd, "verify-ok.flag"), "ok " + tag + "\\n");
+}
+fs.writeFileSync(path.join(cwd, "agent-work.txt"), "implemented " + tag + "\\n");
+cp.execSync("git add -A && git commit -m \\"agent work\\"", { cwd, stdio: "ignore" });
+console.log(JSON.stringify({ type: "step_start", sessionID: "oc-1" }));
+console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <promise>COMPLETE</promise>" } }));
+`,
+    );
+    await chmod(shim, 0o755);
+  };
+
+  /** Fake gh boundary — answers the exact calls the run workflow makes. */
+  const ghRunner: GhRunner = async (args) => {
+    const key = args.join(" ");
+    const ok = (stdout: string) => ({ stdout, stderr: "", exitCode: 0 });
+    if (key.startsWith("label list")) {
+      return ok(JSON.stringify([{ name: "Sandcastle" }]));
+    }
+    if (key.startsWith("issue list") || key.startsWith("issue view")) {
+      return ok(JSON.stringify(key.startsWith("issue list") ? [ISSUE_5] : ISSUE_5));
+    }
+    if (key.startsWith("issue comment")) return ok("commented");
+    if (key.startsWith("issue close")) return ok("closed");
+    return { stdout: "", stderr: `unexpected gh args: ${key}`, exitCode: 1 };
+  };
+  const discoveryExec: DiscoveryExec = async () => ({
+    stdout: "gh version 2.90.0\n  ✓ Logged in to github.com as test",
+    stderr: "",
+    exitCode: 0,
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const makeRepo = async () => {
+    const repoDir = await mkdtemp(join(tmpdir(), "wf-repo-"));
+    await initRepo(repoDir);
+    const shimDir = await mkdtemp(join(tmpdir(), "wf-shims-"));
+    await writeFakeOpencode(shimDir);
+    // The agent executable resolves through PATH at run time.
+    vi.stubEnv("PATH", `${shimDir}:${process.env.PATH}`);
+    return repoDir;
+  };
+
+  it("binds the injected executor to each stage's worktree — source then integrated", async () => {
+    const repoDir = await makeRepo();
+    await writeSettings(repoDir, ["check-one", "check-two"]);
+
+    const calls: { command: string; cwd: string }[] = [];
+    const verificationExec: VerificationExec = async (command, options) => {
+      calls.push({ command, cwd: options.cwd });
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+
+    const result = await runIssueWorkflow({
+      cwd: repoDir,
+      issueNumber: 5,
+      ghRunner,
+      discoveryExec,
+      verificationExec,
+    });
+
+    expect(result.outcome).toBe("landed");
+    // Two stages × two commands; stage 1 binds the implementation worktree,
+    // stage 2 the (different) integration worktree — same command order.
+    expect(calls.map((c) => c.command)).toEqual([
+      "check-one",
+      "check-two",
+      "check-one",
+      "check-two",
+    ]);
+    expect(calls[0]!.cwd).toBe(result.worktreePath);
+    expect(calls[1]!.cwd).toBe(result.worktreePath);
+    expect(calls[2]!.cwd).not.toBe(result.worktreePath);
+    expect(calls[2]!.cwd).toContain("issue-5-integrate");
+    expect(calls[3]!.cwd).toBe(calls[2]!.cwd);
+
+    // Source and integrated evidence stay in separate result arrays.
+    expect(result.verification.map((r) => r.status)).toEqual([
+      "passed",
+      "passed",
+    ]);
+    expect(result.integrationVerification?.map((r) => r.status)).toEqual([
+      "passed",
+      "passed",
+    ]);
+    expect(result.verificationStatus).toBe("passed");
+    // …and the environment is named in the posted report.
+    expect(result.reportBody).toContain("(host)");
+  });
+
+  it("integrated-stage failure: distinct phase, separate recovery evidence, nothing lands", async () => {
+    const repoDir = await makeRepo();
+    await writeSettings(repoDir, ["check"]);
+
+    // Source stage passes; the integrated stage fails.
+    let n = 0;
+    const calls: string[] = [];
+    const verificationExec: VerificationExec = async (command, options) => {
+      n += 1;
+      calls.push(options.cwd);
+      return n === 1
+        ? { stdout: "", stderr: "", exitCode: 0 }
+        : { stdout: "", stderr: "integrated boom", exitCode: 3 };
+    };
+
+    const result = await runIssueWorkflow({
+      cwd: repoDir,
+      issueNumber: 5,
+      ghRunner,
+      discoveryExec,
+      verificationExec,
+    });
+
+    expect(result.outcome).toBe("failed");
+    // The failure is identified as the integrated stage — the phase Ticket 35
+    // consumes for repair targeting.
+    expect(result.failurePhase).toBe("integration-verification");
+    expect(calls.length).toBe(2);
+    expect(result.verification[0]!.status).toBe("passed");
+    expect(result.integrationVerification?.[0]?.status).toBe("failed");
+    expect(result.integrationVerification?.[0]?.exitCode).toBe(3);
+    expect(result.verificationStatus).toBe("failed");
+    expect(result.reportBody).toContain("sau khi merge");
+    expect(result.reportBody).toContain("(host)");
+
+    // The recovery record keeps the two stages in separate fields.
+    const recovery = JSON.parse(
+      await readFile(
+        join(repoDir, ".sandcastle", "recovery", "issue-5.json"),
+        "utf-8",
+      ),
+    );
+    expect(recovery.failurePhase).toBe("integration-verification");
+    expect(recovery.verification[0].status).toBe("passed");
+    expect(recovery.integrationVerification[0].status).toBe("failed");
+    expect(recovery.integrationVerification[0].timedOut).toBeUndefined();
+
+    // Nothing merged into main; the issue stayed open.
+    const files = execSync("git ls-tree --name-only main", {
+      cwd: repoDir,
+      encoding: "utf-8",
+    });
+    expect(files).not.toContain("agent-work.txt");
+    const settings = JSON.parse(
+      await readFile(join(repoDir, ".sandcastle", "settings.json"), "utf-8"),
+    );
+    expect(settings.verificationStatus).toBe("failed");
+  });
+
+  it("a timeout is failed, retried through bounded repair, and named in the report", async () => {
+    const repoDir = await makeRepo();
+    await writeSettings(repoDir, ["slow-check"]);
+
+    const calls: string[] = [];
+    const verificationExec: VerificationExec = async (command, options) => {
+      calls.push(options.cwd);
+      return { stdout: "", stderr: "", exitCode: null, timedOut: true };
+    };
+
+    const result = await runIssueWorkflow({
+      cwd: repoDir,
+      issueNumber: 5,
+      ghRunner,
+      discoveryExec,
+      verificationExec,
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.failurePhase).toBe("verification");
+    // Initial run + one re-run per bounded repair (2) — all bound to the
+    // source worktree; the integrated stage was never reached.
+    expect(calls.length).toBe(3);
+    expect(calls.every((cwd) => cwd === result.worktreePath)).toBe(true);
+    expect(result.integrationVerification).toBeUndefined();
+    expect(result.verification[0]!.timedOut).toBe(true);
+    expect(result.verificationStatus).toBe("failed");
+    // Timeout wording is distinguishable from a plain non-zero exit.
+    expect(result.reportBody).toContain("hết thời gian chờ");
+
+    const recovery = JSON.parse(
+      await readFile(
+        join(repoDir, ".sandcastle", "recovery", "issue-5.json"),
+        "utf-8",
+      ),
+    );
+    // timedOut survives the recovery-record round-trip.
+    expect(recovery.verification[0].timedOut).toBe(true);
   });
 });
 
