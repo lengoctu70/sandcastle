@@ -161,6 +161,95 @@ describe("writeRecoveryState durability", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Post-landing record schema (#37) — additive `landingState`/`landedSha`/
+// `reportBody`: old records parse as pre-landing; a landed record missing
+// its report material is corrupt, never silently downgraded.
+// ---------------------------------------------------------------------------
+
+describe("post-landing recovery record schema", () => {
+  const landedState = (issueNumber: number): RecoveryState => ({
+    ...makeState(issueNumber),
+    failurePhase: "reporting",
+    landingState: "landed-awaiting-report",
+    landedSha: "0123456789abcdef",
+    reportBody: "## ✅ Sandcastle đã hoàn thành\n\n…",
+  });
+
+  it("round-trips a landed-awaiting-report record intact", async () => {
+    const dir = await makeDir();
+    await writeRecoveryState(dir, landedState(5));
+    const read = await readRecoveryState(dir, 5);
+    expect(read).toMatchObject({
+      kind: "ok",
+      state: {
+        issue: { number: 5 },
+        failurePhase: "reporting",
+        landingState: "landed-awaiting-report",
+        landedSha: "0123456789abcdef",
+      },
+    });
+    if (read.kind === "ok") {
+      expect(read.state.reportBody).toContain("Sandcastle đã hoàn thành");
+    }
+  });
+
+  it("a record without landingState still parses as pre-landing", async () => {
+    const dir = await makeDir();
+    await writeRecoveryState(dir, makeState(5));
+    const read = await readRecoveryState(dir, 5);
+    expect(read.kind).toBe("ok");
+    if (read.kind === "ok") {
+      expect(read.state.landingState).toBeUndefined();
+      expect(read.state.landedSha).toBeUndefined();
+      expect(read.state.reportBody).toBeUndefined();
+    }
+  });
+
+  it("an unknown landingState value is corrupt", async () => {
+    const dir = await makeDir();
+    const path = recoveryStatePath(dir, 5);
+    await mkdir(join(dir, ".sandcastle", "recovery"), { recursive: true });
+    await writeFile(
+      path,
+      JSON.stringify({
+        ...makeState(5),
+        landingState: "landed-unclosed", // not a real state
+        landedSha: "abc",
+        reportBody: "body",
+      }),
+    );
+    const read = await readRecoveryState(dir, 5);
+    expect(read.kind).toBe("corrupt");
+    if (read.kind === "corrupt") {
+      expect(read.detail).toContain("landingState");
+    }
+    // A corrupt record is never silently deleted.
+    expect(await exists(path)).toBe(true);
+  });
+
+  it("a landed record missing its report material is corrupt", async () => {
+    const dir = await makeDir();
+    const path = recoveryStatePath(dir, 5);
+    await mkdir(join(dir, ".sandcastle", "recovery"), { recursive: true });
+    // `landingState` without `reportBody` can never finish the GitHub phase
+    // on retry — it must surface as corrupt, not degrade to a re-merge.
+    await writeFile(
+      path,
+      JSON.stringify({
+        ...makeState(5),
+        landingState: "landed-awaiting-report",
+        landedSha: "abc",
+      }),
+    );
+    const read = await readRecoveryState(dir, 5);
+    expect(read.kind).toBe("corrupt");
+    if (read.kind === "corrupt") {
+      expect(read.detail).toContain("landedSha");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Per-issue retry exclusion (F065)
 // ---------------------------------------------------------------------------
 

@@ -1486,3 +1486,189 @@ describe("sandcastle status / retry / discard (CLI seam)", () => {
     expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Post-landing recovery (#37/F013): once the code has landed on the target
+// branch, GitHub completion (report → close) is a durable recovery state of
+// its own. A report/close failure keeps the record + source branch; `retry`
+// finishes only the GitHub steps — never an agent, never a re-merge.
+// ---------------------------------------------------------------------------
+
+describe("post-landing GitHub completion recovery (CLI seam)", () => {
+  it("report failure keeps a landed-awaiting-report record; retry posts the stored report then closes", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5], {
+      FAKE_GH_COMMENT_FAIL: "1",
+    });
+    await writeSettings(repoDir);
+
+    // The run lands the code, attempts the report (fails), never closes —
+    // and leaves a durable landed record instead of clearing everything.
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+    expect(stdout).toContain("Không đăng được báo cáo");
+    expect(stdout).toContain("retry 5");
+
+    // Code IS on main — this is not a pre-landing failure.
+    const landedSha = await git(repoDir, "rev-parse refs/heads/main");
+    expect(await git(repoDir, "ls-tree --name-only main")).toContain(
+      "agent-work.txt",
+    );
+
+    // ADR 0023 ordering under failure: the comment was attempted, the close
+    // was NOT (a report failure never authorizes closing first).
+    const runLog = await readLog(logFile);
+    expect(runLog.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
+    expect(runLog.some((l) => l.startsWith("gh issue close 5"))).toBe(false);
+
+    // The durable record distinguishes landed-awaiting-report and carries
+    // the exact report body + landed sha; the source branch survives.
+    const recovery = JSON.parse(
+      await readFile(recoveryPath(repoDir, 5), "utf-8"),
+    );
+    expect(recovery).toMatchObject({
+      failurePhase: "reporting",
+      landingState: "landed-awaiting-report",
+      landedSha,
+      sourceBranch: "sandcastle/issue-5",
+      targetBranch: "main",
+      issue: { number: 5 },
+    });
+    expect(recovery.reportBody).toContain("Sandcastle đã hoàn thành");
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toContain(
+      "sandcastle/issue-5",
+    );
+
+    // `status` reports the landed state honestly — not a stale record.
+    const statusOut = await runCli("status", repoDir, env);
+    expect(statusOut.stdout).toContain("chờ đăng báo cáo");
+    expect(statusOut.stdout).not.toContain("Lỗi thời");
+
+    // Retry with gh healthy: no agent, no re-merge, no re-selection — the
+    // stored report is posted, then the issue closes, then cleanup runs.
+    const env2 = { ...env, FAKE_GH_COMMENT_FAIL: "0" };
+    const before = await readLog(logFile);
+    const { stdout: retryOut } = await runCli("retry 5", repoDir, env2);
+
+    const delta = (await readLog(logFile)).slice(before.length);
+    expect(delta.filter((l) => l === "AGENT" || l === "AGENT_BEGIN 5").length).toBe(
+      0,
+    );
+    expect(delta.some((l) => l.startsWith("gh issue list"))).toBe(false);
+    expect(delta.some((l) => l.startsWith("gh label list"))).toBe(false);
+    const commentIdx = delta.findIndex((l) => l.startsWith("gh issue comment 5"));
+    const closeIdx = delta.findIndex((l) => l.startsWith("gh issue close 5"));
+    expect(commentIdx).toBeGreaterThan(-1);
+    expect(closeIdx).toBeGreaterThan(commentIdx); // report before close (ADR 0023)
+
+    // The reposted body is the stored report verbatim.
+    const raw = await readFile(logFile, "utf-8");
+    const bodies = raw
+      .split("--- GH-BODY ---\n")
+      .slice(1)
+      .map((b) => b.split("\n--- /GH-BODY ---")[0]);
+    expect(bodies.length).toBe(2);
+    expect(bodies[1]).toBe(recovery.reportBody);
+
+    // Fully complete: record cleared, source branch deleted, worktree gone.
+    expect(retryOut).toContain("đã được đóng");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toBe("");
+    const worktrees = await git(repoDir, "worktree list --porcelain");
+    expect(worktrees.match(/^worktree /gm)?.length).toBe(1);
+  });
+
+  it("close failure keeps a landed-awaiting-close record; retry does not repost the report", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5], {
+      FAKE_GH_CLOSE_FAIL: "1",
+    });
+    await writeSettings(repoDir);
+
+    const { stdout } = await runCli("run --issue 5", repoDir, env);
+    expect(stdout).toContain("Không đóng được issue");
+    expect(stdout).toContain("retry 5");
+
+    // Report posted, close attempted and failed.
+    const runLog = await readLog(logFile);
+    expect(runLog.some((l) => l.startsWith("gh issue comment 5"))).toBe(true);
+    expect(runLog.some((l) => l.startsWith("gh issue close 5"))).toBe(true);
+
+    const recovery = JSON.parse(
+      await readFile(recoveryPath(repoDir, 5), "utf-8"),
+    );
+    expect(recovery.landingState).toBe("landed-awaiting-close");
+    expect(typeof recovery.reportBody).toBe("string");
+    // Cleanup is deferred: branch + record survive while close is pending.
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toContain(
+      "sandcastle/issue-5",
+    );
+
+    // A retry while close still fails stays awaiting-close — idempotent.
+    const before1 = await readLog(logFile);
+    await runCli("retry 5", repoDir, env);
+    const delta1 = (await readLog(logFile)).slice(before1.length);
+    expect(delta1.filter((l) => l.startsWith("gh issue comment")).length).toBe(
+      0,
+    );
+    expect(delta1.filter((l) => l.startsWith("gh issue close 5")).length).toBe(
+      1,
+    );
+    const stillPending = JSON.parse(
+      await readFile(recoveryPath(repoDir, 5), "utf-8"),
+    );
+    expect(stillPending.landingState).toBe("landed-awaiting-close");
+    expect(stillPending.retryCount).toBe(1);
+
+    // gh healthy now: close succeeds, no duplicate report is ever posted,
+    // and cleanup runs only after the close.
+    const env2 = { ...env, FAKE_GH_CLOSE_FAIL: "0" };
+    const before2 = await readLog(logFile);
+    const { stdout: retryOut } = await runCli("retry 5", repoDir, env2);
+    const delta2 = (await readLog(logFile)).slice(before2.length);
+    expect(delta2.filter((l) => l.startsWith("gh issue comment")).length).toBe(
+      0,
+    );
+    expect(delta2.filter((l) => l.startsWith("gh issue close 5")).length).toBe(
+      1,
+    );
+    expect(delta2.some((l) => l.startsWith("AGENT"))).toBe(false);
+
+    const raw = await readFile(logFile, "utf-8");
+    expect(raw.split("--- GH-BODY ---").length - 1).toBe(1); // report posted exactly once overall
+    expect(retryOut).toContain("đã được đóng");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toBe("");
+  });
+
+  it("issue already closed on GitHub: retry finishes cleanup without another close call", async () => {
+    const { repoDir, logFile, issuesFile, env } = await makeFixture(
+      [ISSUE_5],
+      { FAKE_GH_CLOSE_FAIL: "1" },
+    );
+    await writeSettings(repoDir);
+
+    await runCli("run --issue 5", repoDir, env);
+    expect(
+      JSON.parse(await readFile(recoveryPath(repoDir, 5), "utf-8"))
+        .landingState,
+    ).toBe("landed-awaiting-close");
+
+    // The issue got closed elsewhere (manual close, or a crashed process
+    // that had already closed it) — the record's remaining work is cleanup.
+    await writeFile(
+      issuesFile,
+      JSON.stringify([{ ...ISSUE_5, state: "CLOSED" }]),
+    );
+
+    const before = await readLog(logFile);
+    const { stdout } = await runCli("retry 5", repoDir, {
+      ...env,
+      FAKE_GH_CLOSE_FAIL: "0",
+    });
+    const delta = (await readLog(logFile)).slice(before.length);
+    expect(delta.some((l) => l.startsWith("gh issue comment"))).toBe(false);
+    expect(delta.some((l) => l.startsWith("gh issue close"))).toBe(false);
+    expect(delta.some((l) => l.startsWith("AGENT"))).toBe(false);
+    expect(stdout).toContain("Hoàn thành issue #5");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toBe("");
+  });
+});

@@ -1,4 +1,5 @@
 import { exec, execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { Cause, Effect, Exit } from "effect";
 import { FileSystem } from "@effect/platform";
@@ -56,6 +57,7 @@ import {
   clearRecoveryState,
   probeRecoveryArtifacts,
   writeRecoveryState,
+  type RecoveryLandingState,
   type RecoveryState,
 } from "./recovery.js";
 import { resolveCwd } from "./resolveCwd.js";
@@ -1005,7 +1007,11 @@ export const runIssueWorkflow = async (
           `Nếu issue không còn tồn tại, chạy \`sandcastle discard ${resume.issue.number}\` để xóa bản ghi phục hồi.`,
       );
     }
-    if (issue.state !== "OPEN") {
+    // A landed record (landingState set, #37) tolerates a closed issue: the
+    // close already happened on GitHub — retry then finishes only the
+    // deferred cleanup. For a pre-landing record a closed issue means the
+    // work may have landed elsewhere, so continuing is unsafe (stale).
+    if (issue.state !== "OPEN" && resume.landingState === undefined) {
       throw new WorkflowRunError(
         `Issue #${issue.number} đã ở trạng thái "${issue.state || "unknown"}" — ` +
           "bản ghi phục hồi cho issue này đã lỗi thời (có thể công việc đã được merge hoặc issue đã đóng). " +
@@ -1398,6 +1404,286 @@ export const runIssueWorkflow = async (
     };
   };
 
+  // ---- Post-landing GitHub completion (ADR 0023, F013/#37) ------------------
+  //
+  // Reached two ways: inline right after a fresh landing, and at the top of
+  // a retry whose record says the work already landed (`landingState` set).
+  // Both funnel through this one closure so the ordering rules live in a
+  // single place:
+  //
+  //   1. A durable `landed-awaiting-report` record (carrying the exact
+  //      report body + landed sha) exists BEFORE `postComment` is attempted,
+  //      and transitions to `landed-awaiting-close` once the report posts —
+  //      a crash or GitHub failure at any point leaves a record retry can
+  //      finish from.
+  //   2. The issue is closed only after the report is posted — a report
+  //      failure NEVER authorizes closing first (ADR 0023; F045's fix is
+  //      durable resume, not close-before-report).
+  //   3. The source branch and the recovery record are removed only AFTER
+  //      report + close both succeeded (spec #24: cleanup is the last step,
+  //      never the precondition of reporting).
+  //
+  // On a post-landing resume the report body comes from the record verbatim
+  // instead of being rebuilt — the worktree and integration state it was
+  // derived from may already be gone, and re-posting the identical body
+  // keeps the step idempotent.
+  const finishGitHubCompletion = async (params: {
+    /** The target branch's tip after landing — what the report announced. */
+    readonly landedSha: string;
+    /** The exact Vietnamese completion report to post. */
+    readonly reportBody: string;
+    /** `true` on a `landed-awaiting-close` resume — the report must NOT be reposted. */
+    readonly reportAlreadyPosted: boolean;
+    /** `false` when the issue is already closed on GitHub — the close step is then already satisfied. */
+    readonly issueOpen: boolean;
+    readonly verification: readonly VerificationCommandResult[];
+    readonly integrationVerification?: readonly VerificationCommandResult[];
+    readonly commits: readonly { readonly sha: string }[];
+    readonly landedCommits: readonly string[];
+    readonly changeStat?: string;
+    /**
+     * The implementation worktree path from the run/record. Cleanup stats
+     * it: still on disk AND dirty → preserved (the source branch stays
+     * checked out there and is kept); otherwise it is removed so the
+     * source branch can be deleted.
+     */
+    readonly worktreePath?: string;
+    readonly completionSignalSeen: boolean;
+    readonly sessionId?: string;
+    readonly logFilePath?: string;
+    readonly attempts: WorkflowRunAttempts;
+  }): Promise<WorkflowRunResult> => {
+    phase = "reporting";
+    let reportPosted = params.reportAlreadyPosted;
+    // An issue already closed on GitHub counts as close-complete.
+    let issueClosed = !params.issueOpen;
+    let ghError: string | undefined;
+    let recoveryWriteError: string | undefined;
+
+    // Snapshot which preserved artifacts still exist at entry — the record
+    // carries only what remains, so a retry never claims a removed worktree.
+    const worktreeOnDisk =
+      params.worktreePath !== undefined &&
+      (await stat(params.worktreePath)
+        .then((s) => s.isDirectory())
+        .catch(() => false));
+
+    const persistLanded = async (
+      landingState: RecoveryLandingState,
+      detail: string,
+    ): Promise<void> => {
+      const state: RecoveryState = {
+        version: RECOVERY_STATE_VERSION,
+        issue,
+        sourceBranch,
+        targetBranch,
+        targetBaseSha,
+        ...(worktreeOnDisk ? { worktreePath: params.worktreePath } : {}),
+        failurePhase: "reporting",
+        error: detail,
+        verification: params.verification,
+        ...(params.integrationVerification !== undefined
+          ? { integrationVerification: params.integrationVerification }
+          : {}),
+        commits: params.commits,
+        ...(params.sessionId !== undefined
+          ? { sessionId: params.sessionId }
+          : {}),
+        ...(params.logFilePath !== undefined
+          ? { logFilePath: params.logFilePath }
+          : {}),
+        attempts: params.attempts,
+        retryCount: (resume?.retryCount ?? 0) + (resume !== undefined ? 1 : 0),
+        failedAt: new Date().toISOString(),
+        landingState,
+        landedSha: params.landedSha,
+        reportBody: params.reportBody,
+      };
+      // A failed write must not sink the run — but it is surfaced, since
+      // without the record `sandcastle retry` cannot finish the GitHub phase.
+      const writeError = await writeRecoveryState(cwd, state).then(
+        () => undefined,
+        (e) => (e instanceof Error ? e.message : String(e)),
+      );
+      if (writeError !== undefined) {
+        recoveryWriteError = writeError;
+        status(
+          `Không ghi được bản ghi phục hồi cho issue #${issue.number}: ${writeError}`,
+          "warn",
+        );
+      }
+    };
+
+    if (!reportPosted) {
+      // Persist BEFORE the mutation so a crash or gh failure leaves a
+      // resumable record (F013).
+      await persistLanded(
+        "landed-awaiting-report",
+        "đã merge vào nhánh đích — đang chờ đăng báo cáo hoàn thành lên GitHub",
+      );
+      status("Đang đăng báo cáo hoàn thành lên issue…");
+      try {
+        await gh.postComment(issue.number, params.reportBody);
+        reportPosted = true;
+      } catch (e) {
+        ghError = e instanceof Error ? e.message : String(e);
+      }
+      // Transition the record the moment the post settles — on success only
+      // the close is left; on failure the record keeps the report material
+      // and the real error for `status`/`retry`.
+      await persistLanded(
+        reportPosted ? "landed-awaiting-close" : "landed-awaiting-report",
+        reportPosted
+          ? "báo cáo đã đăng — đang chờ đóng issue"
+          : `Không đăng được báo cáo hoàn thành: ${ghError ?? ""}`,
+      );
+    }
+    if (reportPosted && !issueClosed) {
+      status(`Đang đóng issue #${issue.number}…`);
+      try {
+        await gh.closeIssue(issue.number);
+        issueClosed = true;
+      } catch (e) {
+        ghError = e instanceof Error ? e.message : String(e);
+        await persistLanded(
+          "landed-awaiting-close",
+          `Không đóng được issue: ${ghError}`,
+        );
+      }
+    }
+
+    // Source-branch + worktree + record cleanup — only once the required
+    // GitHub completion succeeded (report posted AND issue closed — an
+    // issue closed externally still leaves the report owing).
+    let preservedWorktreePath: string | undefined = worktreeOnDisk
+      ? params.worktreePath
+      : undefined;
+    if (issueClosed && reportPosted) {
+      if (preservedWorktreePath !== undefined) {
+        const wtPath = preservedWorktreePath;
+        // Same policy as Worktree.close(): a dirty worktree is preserved
+        // (it may hold uncommitted user-visible state); a clean one goes.
+        // An unreadable worktree is preserved too — never delete what we
+        // cannot inspect.
+        const dirty = await runEffect(
+          WorktreeManager.hasUncommittedChanges(wtPath),
+        ).catch(() => true);
+        if (!dirty) {
+          await gitQuiet(["worktree", "remove", "--force", wtPath], cwd);
+          await gitQuiet(["worktree", "prune"], cwd);
+          const lingering = await stat(wtPath)
+            .then((s) => s.isDirectory())
+            .catch(() => false);
+          if (!lingering) preservedWorktreePath = undefined;
+        }
+      }
+      if (preservedWorktreePath === undefined) {
+        // The worktree is gone (or never kept), so nothing checks the source
+        // branch out anymore — its content is on the target, so force-delete
+        // is safe (and required: `-d` would refuse when the active checkout
+        // isn't the target).
+        await gitQuiet(["branch", "-D", sourceBranch], cwd);
+      }
+      await clearRecoveryState(cwd, issue.number);
+    }
+
+    const baseMessage = `Hoàn thành issue #${issue.number} — đã merge vào \`${targetBranch}\` (\`${shortSha(params.landedSha)}\`).`;
+    const retryHint =
+      recoveryWriteError !== undefined
+        ? ` (Không ghi được bản ghi phục hồi — \`sandcastle retry ${issue.number}\` sẽ không dùng được: ${firstLine(recoveryWriteError)}; hoàn tất thủ công trên GitHub.)`
+        : ` Chạy \`sandcastle retry ${issue.number}\` để hoàn tất (không cần chạy lại agent hay merge lại).`;
+    const message = !reportPosted
+      ? `${baseMessage} Không đăng được báo cáo lên GitHub: ${ghError ?? ""} — ` +
+        `issue ${params.issueOpen ? "vẫn mở" : "đã đóng sẵn"}.${retryHint}`
+      : !issueClosed
+        ? `${baseMessage} Không đóng được issue trên GitHub: ${ghError ?? ""}.${retryHint}`
+        : `${baseMessage} Issue đã được đóng.`;
+
+    return {
+      outcome: "landed",
+      issue,
+      sourceBranch,
+      targetBranch,
+      ...(params.worktreePath !== undefined
+        ? { worktreePath: params.worktreePath }
+        : {}),
+      ...(preservedWorktreePath !== undefined ? { preservedWorktreePath } : {}),
+      commits: params.commits,
+      verification: params.verification,
+      verificationStatus: aggregateVerificationStatus(
+        settings.verificationCommands.length,
+        params.integrationVerification ?? params.verification,
+        settings.verificationStatus,
+      ),
+      ...(params.integrationVerification !== undefined
+        ? { integrationVerification: params.integrationVerification }
+        : {}),
+      completionSignalSeen: params.completionSignalSeen,
+      landedSha: params.landedSha,
+      landedCommits: params.landedCommits,
+      changeStat: params.changeStat,
+      reportPosted,
+      issueClosed,
+      reportBody: params.reportBody,
+      logFilePath: params.logFilePath,
+      sessionId: params.sessionId,
+      attempts: params.attempts,
+      message,
+    };
+  };
+
+  // ---- Post-landing resume entry (#37) ---------------------------------------
+  //
+  // The record says the work already reached the target branch — only GitHub
+  // completion remains. Retry NEVER invokes an implementation or repair
+  // agent and never repeats integration here: it re-posts the stored report
+  // (`landed-awaiting-report`) or just closes the issue
+  // (`landed-awaiting-close`), then runs the deferred source cleanup.
+  if (
+    resume !== undefined &&
+    resume.landingState !== undefined &&
+    // `parseRecoveryState` guarantees both are present when landingState is
+    // set — the checks only narrow the types here.
+    resume.landedSha !== undefined &&
+    resume.reportBody !== undefined
+  ) {
+    // `landedCommits`/`changeStat` are rebuilt best-effort for the result;
+    // the report itself comes from the record verbatim.
+    const resumeBase = resume.targetBaseSha ?? resume.landedSha;
+    const landedCommits = await git(
+      ["log", "--format=%h %s", `${resumeBase}..${resume.landedSha}`],
+      cwd,
+    )
+      .then((out) => out.split("\n").filter((l) => l.trim().length > 0))
+      .catch(() => [] as string[]);
+    const changeStat = await git(
+      ["diff", "--stat", resumeBase, resume.landedSha],
+      cwd,
+    ).catch(() => "");
+    return finishGitHubCompletion({
+      landedSha: resume.landedSha,
+      reportBody: resume.reportBody,
+      reportAlreadyPosted: resume.landingState === "landed-awaiting-close",
+      issueOpen: issue.state === "OPEN",
+      verification: resume.verification,
+      ...(resume.integrationVerification !== undefined
+        ? { integrationVerification: resume.integrationVerification }
+        : {}),
+      commits: resume.commits,
+      landedCommits,
+      changeStat: changeStat.trim().length > 0 ? changeStat : undefined,
+      ...(resume.worktreePath !== undefined
+        ? { worktreePath: resume.worktreePath }
+        : {}),
+      completionSignalSeen: false,
+      ...(resume.sessionId !== undefined ? { sessionId: resume.sessionId } : {}),
+      ...(resume.logFilePath !== undefined
+        ? { logFilePath: resume.logFilePath }
+        : {}),
+      attempts: resume.attempts,
+    });
+  }
+
   // ---- Retry resume: validate the preserved artifacts, seed commits ---------
   //
   // A stale record never silently proceeds and is never deleted here — the
@@ -1789,22 +2075,24 @@ export const runIssueWorkflow = async (
   const landedTargetSha: string = landedSha;
   const finalIntegrationBaseSha: string = integrationBaseSha ?? landedSha;
 
-  // ---- Success cleanup — integration + implementation state --------------------
+  // ---- Post-landing: report → close → cleanup (ADR 0023 ordering, F013/#37) ---
+  //
+  // The integration worktree/branch is derived state — always discarded here.
+  // The implementation worktree is also closed now: nothing in the GitHub
+  // phase needs it (the report body below captures every artifact as text),
+  // and per the spec successful integration cleanup may run early only when
+  // it does not remove data needed to finish the GitHub phase.
+  //
+  // What must NOT happen before report + close succeed is the source-branch
+  // deletion and the recovery-record removal — both moved into
+  // `finishGitHubCompletion`, which also persists the durable
+  // `landed-awaiting-*` record before the first `gh` mutation.
 
   await cleanupIntegration();
   const closeResult = await wt.close().catch(() => ({
     preservedWorktreePath: wt?.worktreePath,
   }));
   const preservedWorktreePath = closeResult.preservedWorktreePath;
-  if (preservedWorktreePath === undefined) {
-    // Worktree removed — the source branch's content is now on the target, so
-    // force-delete is safe (and required: `-d` would refuse when the current
-    // checkout isn't the target).
-    await gitQuiet(["branch", "-D", sourceBranch], cwd);
-  }
-  await clearRecoveryState(cwd, issue.number);
-
-  // ---- Report, then close (ADR 0023 ordering) ---------------------------------
 
   phase = "reporting";
   const landedCommits = await git(
@@ -1859,62 +2147,26 @@ export const runIssueWorkflow = async (
     cautions,
   });
 
-  let reportPosted = false;
-  let issueClosed = false;
-  let ghError: string | undefined;
-  status("Đang đăng báo cáo hoàn thành lên issue…");
-  try {
-    await gh.postComment(issue.number, reportBody);
-    reportPosted = true;
-  } catch (e) {
-    ghError = e instanceof Error ? e.message : String(e);
-  }
-  if (reportPosted) {
-    status(`Đang đóng issue #${issue.number}…`);
-    try {
-      await gh.closeIssue(issue.number);
-      issueClosed = true;
-    } catch (e) {
-      ghError = e instanceof Error ? e.message : String(e);
-    }
-  }
-
-  const baseMessage = `Hoàn thành issue #${issue.number} — đã merge vào \`${targetBranch}\` (\`${shortSha(landedTargetSha)}\`).`;
-  const message = issueClosed
-    ? `${baseMessage} Issue đã được đóng.`
-    : reportPosted
-      ? `${baseMessage} Không đóng được issue trên GitHub: ${ghError ?? ""} — hãy đóng thủ công.`
-      : `${baseMessage} Không đăng được báo cáo lên GitHub: ${ghError ?? ""} — issue vẫn mở, hãy đăng báo cáo và đóng thủ công.`;
-
-  return {
-    outcome: "landed",
-    issue,
-    sourceBranch,
-    targetBranch,
-    worktreePath: wt.worktreePath,
-    ...(preservedWorktreePath !== undefined ? { preservedWorktreePath } : {}),
-    commits: allCommits,
+  return finishGitHubCompletion({
+    landedSha: landedTargetSha,
+    reportBody,
+    reportAlreadyPosted: false,
+    issueOpen: true,
     verification,
-    verificationStatus: aggregateVerificationStatus(
-      settings.verificationCommands.length,
-      integrationVerification ?? verification,
-      settings.verificationStatus,
-    ),
     ...(integrationVerification !== undefined
       ? { integrationVerification }
       : {}),
-    completionSignalSeen: lastCompletionSignal !== undefined,
-    landedSha: landedTargetSha,
+    commits: allCommits,
     landedCommits,
     changeStat: changeStat.trim().length > 0 ? changeStat : undefined,
-    reportPosted,
-    issueClosed,
-    reportBody,
-    logFilePath: lastLogFilePath,
-    sessionId: lastSessionId,
+    worktreePath: wt.worktreePath,
+    completionSignalSeen: lastCompletionSignal !== undefined,
+    ...(lastSessionId !== undefined ? { sessionId: lastSessionId } : {}),
+    ...(lastLogFilePath !== undefined
+      ? { logFilePath: lastLogFilePath }
+      : {}),
     attempts,
-    message,
-  };
+  });
 };
 
 // ---------------------------------------------------------------------------
