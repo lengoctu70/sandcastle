@@ -1709,6 +1709,106 @@ describe("sandcastle run --all (queued issues, #20)", () => {
     const { stdout } = await runCli("run --all", repoDir, env);
     expect(stdout).toContain("Không có issue nào đang mở");
   });
+
+  it("skips an issue that already has a recovery record and directs to `sandcastle retry` (#38/F042)", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5, ISSUE_7], {
+      FAKE_AGENT_PER_ISSUE_FILE: "1",
+      FAKE_AGENT_FAIL_ISSUE: "5",
+    });
+    await writeSettings(repoDir);
+
+    // First fail issue 5 — its branch, worktree, and durable record are
+    // preserved exactly as a real failure leaves them.
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+
+    // The agent is healthy again: `--all` must skip #5 (the record means
+    // preserved work — never reimplement) while #7 runs the full pipeline.
+    const env2 = { ...env, FAKE_AGENT_FAIL_ISSUE: "" };
+    const before = await readLog(logFile);
+    const { stdout } = await runCli("run --all", repoDir, env2);
+
+    const delta = (await readLog(logFile)).slice(before.length);
+    // #5 was skipped BEFORE any task work: no agent ran for it and the
+    // issue was never even re-viewed — the record check comes first.
+    expect(delta.some((l) => l.startsWith("AGENT_BEGIN 5"))).toBe(false);
+    expect(delta.some((l) => l.startsWith("gh issue view 5"))).toBe(false);
+    // The skip is announced with the explicit retry path.
+    expect(stdout).toContain("bỏ qua");
+    expect(stdout).toContain("sandcastle retry 5");
+
+    // #7 landed normally; #5's preserved artifacts are untouched.
+    expect(delta.some((l) => l.startsWith("gh issue close 7"))).toBe(true);
+    const files = await git(repoDir, "ls-tree --name-only main");
+    expect(files).toContain("agent-work-7.txt");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+    expect(await git(repoDir, "branch --list sandcastle/issue-5")).toContain(
+      "sandcastle/issue-5",
+    );
+  });
+
+  it("mixed queue: skipped, landed, and failed issues are each named correctly in the summary", async () => {
+    const { repoDir, logFile, env } = await makeFixture(
+      [ISSUE_5, ISSUE_7, ISSUE_9],
+      { FAKE_AGENT_PER_ISSUE_FILE: "1", FAKE_AGENT_FAIL_ISSUE: "5" },
+    );
+    await writeSettings(repoDir);
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+
+    // Queue: #5 skipped (record), #7 lands, #9 fails — writing its record.
+    const env2 = { ...env, FAKE_AGENT_FAIL_ISSUE: "9" };
+    try {
+      await runCli("run --all", repoDir, env2);
+      expect.fail("Expected the mixed queue run to exit non-zero");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const out = stdout + stderr;
+      expect(out).toContain("#5");
+      expect(out).toContain("#7");
+      expect(out).toContain("#9");
+      expect(out).toContain("bỏ qua");
+      expect(out).toContain("sandcastle retry");
+      expect(out).toContain("thất bại");
+      // Only #9 actually failed — and its record WAS written, so the
+      // retry/recovery claim is honest for it.
+      expect(out).toContain("giữ recovery state");
+    }
+
+    const log = await readLog(logFile);
+    expect(log.some((l) => l.startsWith("gh issue close 7"))).toBe(true);
+    expect(log.some((l) => l.startsWith("gh issue close 9"))).toBe(false);
+    expect(await exists(recoveryPath(repoDir, 9))).toBe(true);
+  });
+
+  it("never claims recovery state for a queue failure whose record write failed (#38/F046)", async () => {
+    const { repoDir, env } = await makeFixture([ISSUE_5], {
+      FAKE_AGENT_FAIL_ISSUE: "5",
+    });
+    await writeSettings(repoDir);
+    // `.sandcastle/recovery` as a plain FILE — writeRecoveryState's mkdir
+    // cannot create the directory, so the failure leaves no durable record
+    // and the summary must not promise `retry` a state that isn't there.
+    await writeFile(join(repoDir, ".sandcastle", "recovery"), "not a dir");
+
+    try {
+      await runCli("run --all", repoDir, env);
+      expect.fail("Expected the queue run to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const out = stdout + stderr;
+      expect(out).toContain("thất bại");
+      expect(out).not.toContain("giữ recovery state");
+      expect(out).toContain("không có bản ghi phục hồi");
+    }
+    // Truly nothing persisted — `retry` would find no record.
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2144,6 +2244,11 @@ describe("sandcastle status / retry / discard (CLI seam)", () => {
     const statusOut = await runCli("status", repoDir, env);
     expect(statusOut.stdout).toContain("BỊ HỎNG");
     expect(statusOut.stdout).toContain("issue-9.json");
+    // F071: the only listed entry is corrupt — `status` must NOT send the
+    // user into a discard loop (`discard` refuses corrupt records). The
+    // advice names the real cleanup path instead: manual file removal.
+    expect(statusOut.stdout).not.toContain("Dùng `sandcastle discard");
+    expect(statusOut.stdout).toContain("xóa tệp thủ công");
 
     try {
       await runCli("retry 9", repoDir, env);
@@ -2161,6 +2266,73 @@ describe("sandcastle status / retry / discard (CLI seam)", () => {
     }
     // The corrupt record is never silently deleted.
     expect(await exists(corruptPath)).toBe(true);
+
+    // The documented exit path — removing the file by hand — resolves it.
+    await rm(corruptPath);
+    const clean = await runCli("status", repoDir, env);
+    expect(clean.stdout).toContain("Không có tác vụ thất bại");
+  });
+
+  it("missing target branch: status and discard show unknown comparison, never 0 unmerged commits (#38/F030)", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    // A real failure: the run committed work on the source branch, then
+    // verification failed — the branch holds genuine unmerged commits.
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    expect(
+      Number(await git(repoDir, "rev-list --count main..sandcastle/issue-5")),
+    ).toBeGreaterThan(0);
+
+    // The recorded target branch is gone (deleted/renamed elsewhere).
+    await execAsync("git branch -m main main-renamed", { cwd: repoDir });
+
+    // `status` must say the comparison state is UNKNOWN — it can neither
+    // claim "0 unmerged commits" nor flag the work as landed/stale.
+    const statusOut = await runCli("status", repoDir, env);
+    expect(statusOut.stdout).toContain("Issue #5");
+    expect(statusOut.stdout).toMatch(/không xác định/i);
+    expect(statusOut.stdout).not.toContain("0 commit chưa merge");
+    expect(statusOut.stdout).not.toContain("đã merge ở nơi khác");
+
+    // `discard` shows the same honest unknown in its confirmation preview —
+    // the user is told the true unmerged count could not be determined
+    // before deleting a branch that may hold real work.
+    const { stdout } = await runCli("discard 5 --yes", repoDir, env);
+    expect(stdout).toMatch(/không xác định/i);
+    expect(stdout).not.toContain("0 commit chưa merge");
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
+  });
+
+  it("zero-commit implementation failure: status describes it as incomplete, not landed or stale (#38/F072)", async () => {
+    const { repoDir, env } = await makeFixture([ISSUE_5], {
+      FAKE_CLAUDE_FAIL: "1",
+    });
+    await writeSettings(repoDir);
+
+    // The agent crashed before committing — the record exists but no commit
+    // was ever produced (failurePhase implementation, commits []).
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    const recovery = JSON.parse(
+      await readFile(recoveryPath(repoDir, 5), "utf-8"),
+    );
+    expect(recovery.failurePhase).toBe("implementation");
+    expect(recovery.commits).toEqual([]);
+
+    // `status` describes the work as INCOMPLETE — an empty target..source
+    // range on a run that never committed is not "merged elsewhere" and not
+    // stale, so the user is not nudged toward discarding it under a false
+    // diagnosis.
+    const statusOut = await runCli("status", repoDir, env);
+    expect(statusOut.stdout).toContain("Issue #5");
+    expect(statusOut.stdout).toContain("Chưa hoàn thành");
+    expect(statusOut.stdout).not.toContain("Lỗi thời");
+    expect(statusOut.stdout).not.toContain("đã merge ở nơi khác");
   });
 
   it("stale record (worktree and branch gone): status marks it, retry diagnoses and preserves the record", async () => {
@@ -2469,12 +2641,14 @@ describe("post-landing GitHub completion recovery (CLI seam)", () => {
     const { stdout: retryOut } = await runCli("retry 5", repoDir, env2);
 
     const delta = (await readLog(logFile)).slice(before.length);
-    expect(delta.filter((l) => l === "AGENT" || l === "AGENT_BEGIN 5").length).toBe(
-      0,
-    );
+    expect(
+      delta.filter((l) => l === "AGENT" || l === "AGENT_BEGIN 5").length,
+    ).toBe(0);
     expect(delta.some((l) => l.startsWith("gh issue list"))).toBe(false);
     expect(delta.some((l) => l.startsWith("gh label list"))).toBe(false);
-    const commentIdx = delta.findIndex((l) => l.startsWith("gh issue comment 5"));
+    const commentIdx = delta.findIndex((l) =>
+      l.startsWith("gh issue comment 5"),
+    );
     const closeIdx = delta.findIndex((l) => l.startsWith("gh issue close 5"));
     expect(commentIdx).toBeGreaterThan(-1);
     expect(closeIdx).toBeGreaterThan(commentIdx); // report before close (ADR 0023)
@@ -2559,10 +2733,9 @@ describe("post-landing GitHub completion recovery (CLI seam)", () => {
   });
 
   it("issue already closed on GitHub: retry finishes cleanup without another close call", async () => {
-    const { repoDir, logFile, issuesFile, env } = await makeFixture(
-      [ISSUE_5],
-      { FAKE_GH_CLOSE_FAIL: "1" },
-    );
+    const { repoDir, logFile, issuesFile, env } = await makeFixture([ISSUE_5], {
+      FAKE_GH_CLOSE_FAIL: "1",
+    });
     await writeSettings(repoDir);
 
     await runCli("run --issue 5", repoDir, env);

@@ -1445,6 +1445,12 @@ const runCommand = Command.make(
           case "no-issues":
             yield* d.status(result.message, "info");
             break;
+          case "skipped":
+            // Nothing failed, but ≥1 issue was left for `sandcastle retry`
+            // because it already has a recovery record — surface the summary
+            // as a warning so the pending preserved work isn't missed.
+            yield* d.status(result.message, "warn");
+            break;
           case "failed":
             // Per-issue failure reports were already posted; landed issues
             // stay landed. Exit non-zero so scripts/CI observe the failures.
@@ -1505,6 +1511,11 @@ const runWorkflowAndReport = (
       case "no-issues":
         yield* d.status(result.message, "info");
         break;
+      case "skipped":
+        // Only queue runs produce "skipped" — a standalone run never does;
+        // handled for completeness so the union stays exhaustive.
+        yield* d.status(result.message, "warn");
+        break;
       case "failed":
         // The failure report was already posted to the issue; the process
         // exits non-zero so scripts/CI observe the failed run.
@@ -1551,12 +1562,12 @@ const formatRecoveryEntry = async (
       : // Post-landing record (#37): the work is already on the target
         // branch — what remains is a GitHub step, not a failure phase.
         `  Đã merge vào \`${s.targetBranch}\`` +
-          (s.landedSha !== undefined ? ` (${s.landedSha.slice(0, 8)})` : "") +
-          ` — ${
-            s.landingState === "landed-awaiting-report"
-              ? "chờ đăng báo cáo hoàn thành rồi đóng issue"
-              : "báo cáo đã đăng — chờ đóng issue"
-          } lúc ${s.failedAt}${retrySuffix}`,
+        (s.landedSha !== undefined ? ` (${s.landedSha.slice(0, 8)})` : "") +
+        ` — ${
+          s.landingState === "landed-awaiting-report"
+            ? "chờ đăng báo cáo hoàn thành rồi đóng issue"
+            : "báo cáo đã đăng — chờ đóng issue"
+        } lúc ${s.failedAt}${retrySuffix}`,
     `  Nhánh \`${s.sourceBranch}\`${probe.branchExists ? "" : " (đã mất)"}` +
       ` · Worktree \`${s.worktreePath ?? "—"}\`` +
       (s.worktreePath !== undefined && !probe.worktreeExists
@@ -1587,6 +1598,30 @@ const formatRecoveryEntry = async (
       stale.push("worktree đã mất — retry sẽ dựng lại từ nhánh");
     }
     if (stale.length > 0) lines.push(`  ⚠ Lỗi thời: ${stale.join("; ")}.`);
+    // A comparison that could not run is UNKNOWN, never "0 unmerged commits"
+    // (F030) — and an empty range on a run that never committed is
+    // INCOMPLETE work, not landed or stale (F072).
+    if (probe.comparison === "target-missing") {
+      lines.push(
+        "  ⚠ Không xác định được số commit chưa merge — nhánh đích " +
+          `\`${s.targetBranch}\` không còn; kiểm tra thủ công trước khi discard.`,
+      );
+    } else if (probe.comparison === "unknown") {
+      lines.push(
+        "  ⚠ Không xác định được số commit chưa merge — không so sánh được " +
+          `với nhánh đích \`${s.targetBranch}\`; kiểm tra thủ công trước khi discard.`,
+      );
+    } else if (
+      probe.comparison === "ok" &&
+      probe.branchExists &&
+      probe.preservedCommits.length === 0 &&
+      s.commits.length === 0
+    ) {
+      lines.push(
+        "  Chưa hoàn thành: lần chạy chưa tạo commit nào trên nhánh " +
+          "— không phải đã merge hay lỗi thời.",
+      );
+    }
   }
   return lines.join("\n");
 };
@@ -1606,9 +1641,21 @@ const statusCommand = Command.make("status", {}, () =>
         yield* Effect.promise(() => formatRecoveryEntry(cwd, entry)),
       );
     }
-    yield* d.text(
-      "Dùng `sandcastle retry <số-issue>` để tiếp tục, hoặc `sandcastle discard <số-issue>` để xóa công việc được giữ lại.",
-    );
+    // Name only commands that can actually handle each entry kind (F071):
+    // `retry`/`discard` work on parseable records; a corrupt record can
+    // neither resume nor be probed for safe deletion, so its exit path is
+    // manual file cleanup — never a discard loop that always refuses.
+    if (entries.some((e) => e.kind === "ok")) {
+      yield* d.text(
+        "Dùng `sandcastle retry <số-issue>` để tiếp tục, hoặc `sandcastle discard <số-issue>` để xóa công việc được giữ lại.",
+      );
+    }
+    if (entries.some((e) => e.kind === "corrupt")) {
+      yield* d.text(
+        "Bản ghi BỊ HỎNG không dùng được với `retry`/`discard` — " +
+          "sửa hoặc xóa tệp thủ công theo đường dẫn in ở trên.",
+      );
+    }
   }),
 );
 
@@ -1725,7 +1772,16 @@ const discardCommand = Command.make(
       yield* d.text(
         `  • Nhánh \`${state.sourceBranch}\`` +
           (probe.branchExists
-            ? ` (${probe.preservedCommits.length} commit chưa merge)`
+            ? probe.comparison === "ok"
+              ? ` (${probe.preservedCommits.length} commit chưa merge)`
+              : // A failed comparison is UNKNOWN — never "0 commits" (F030):
+                // the branch may hold real unmerged work the user is about
+                // to delete, so the prompt must say so explicitly.
+                ` (số commit chưa merge không xác định — ` +
+                (probe.comparison === "target-missing"
+                  ? `nhánh đích \`${state.targetBranch}\` không còn`
+                  : `không so sánh được với nhánh đích \`${state.targetBranch}\``) +
+                `)`
             : " (đã mất)"),
       );
       if (state.worktreePath !== undefined) {

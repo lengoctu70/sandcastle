@@ -746,11 +746,31 @@ export interface RecoveryArtifacts {
   readonly worktreeUsable: boolean;
   /** `refs/heads/<targetBranch>` still resolves. */
   readonly targetBranchExists: boolean;
-  /** Commits on the source branch that are not on the target branch. */
+  /**
+   * How the `target..source` rev-list comparison ended — kept separate from
+   * the commit list itself so a FAILED comparison is never conflated with an
+   * empty range (F030):
+   * - `"ok"` — the comparison ran; `preservedCommits` is authoritative
+   *   (including an empty list = genuinely zero unmerged commits).
+   * - `"target-missing"` — the recorded target branch no longer resolves
+   *   (deleted or renamed), so nothing can be said about unmerged commits.
+   * - `"source-missing"` — the source branch is gone; nothing to compare.
+   * - `"unknown"` — `git rev-list` itself failed for another reason.
+   */
+  readonly comparison: "ok" | "target-missing" | "source-missing" | "unknown";
+  /**
+   * Commits on the source branch that are not on the target branch. Only
+   * meaningful when {@link comparison} is `"ok"` — it is `[]` whenever the
+   * comparison could not run, which must never be read as "no unmerged work".
+   */
   readonly preservedCommits: readonly string[];
   /**
-   * The source branch has no commits the target lacks — the work either
-   * already landed elsewhere or was never committed. A stale signal.
+   * The comparison ran cleanly, the `target..source` range is empty, AND the
+   * run recorded commits — i.e. work the run produced is absent from the
+   * range, so it either already landed elsewhere or the branch was reset.
+   * Deliberately `false` when the comparison could not run (unknown ≠ empty,
+   * F030) and when the run never produced a commit at all (incomplete ≠
+   * landed, F072).
    */
   readonly landedOrEmpty: boolean;
 }
@@ -788,29 +808,47 @@ export const probeRecoveryArtifacts = async (
     }
   }
 
-  const preservedCommits = branchExists
-    ? ((
-        await gitOrUndefined(
-          [
-            "rev-list",
-            "--reverse",
-            `${state.targetBranch}..${state.sourceBranch}`,
-          ],
-          cwd,
-        )
-      )
-        ?.split("\n")
+  // The comparison result is tracked separately from the commit list: a
+  // missing target branch or a failed `rev-list` is UNKNOWN state, not an
+  // empty range — reporting it as `[]` would let `landedOrEmpty` and the
+  // discard prompt claim "0 unmerged commits" while real work exists (F030).
+  let comparison: RecoveryArtifacts["comparison"];
+  let preservedCommits: readonly string[] = [];
+  if (!branchExists) {
+    comparison = "source-missing";
+  } else if (!targetBranchExists) {
+    comparison = "target-missing";
+  } else {
+    const revList = await gitOrUndefined(
+      ["rev-list", "--reverse", `${state.targetBranch}..${state.sourceBranch}`],
+      cwd,
+    );
+    if (revList === undefined) {
+      comparison = "unknown";
+    } else {
+      comparison = "ok";
+      preservedCommits = revList
+        .split("\n")
         .map((l) => l.trim())
-        .filter((l) => l.length > 0) ?? [])
-    : [];
+        .filter((l) => l.length > 0);
+    }
+  }
 
   return {
     branchExists,
     worktreeExists,
     worktreeUsable,
     targetBranchExists,
+    comparison,
     preservedCommits,
-    landedOrEmpty: branchExists && preservedCommits.length === 0,
+    // "Landed elsewhere" is only provable when the comparison ran AND the
+    // run actually produced commits — an empty range on a run that never
+    // committed (e.g. an implementation-phase crash, F072) is incomplete
+    // work, not landed work.
+    landedOrEmpty:
+      comparison === "ok" &&
+      preservedCommits.length === 0 &&
+      state.commits.length > 0,
   };
 };
 

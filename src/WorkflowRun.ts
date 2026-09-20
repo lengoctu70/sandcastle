@@ -62,6 +62,7 @@ import {
   RECOVERY_STATE_VERSION,
   clearRecoveryState,
   probeRecoveryArtifacts,
+  readRecoveryState,
   writeRecoveryState,
   type RecoveryLandingState,
   type RecoveryState,
@@ -242,7 +243,13 @@ export interface BoundVerificationExec {
 
 /** Structured result of one `sandcastle run` invocation. */
 export interface WorkflowRunResult {
-  readonly outcome: "landed" | "failed" | "no-issues";
+  /**
+   * `"skipped"` is only ever produced inside {@link runIssueQueueWorkflow}
+   * for an issue that already has a recovery record — the queue refuses to
+   * reimplement preserved work and directs the user to `sandcastle retry`
+   * (ADR 0024). A standalone `runIssueWorkflow` never returns it.
+   */
+  readonly outcome: "landed" | "failed" | "no-issues" | "skipped";
   /** The phase a failure stopped at — set when outcome is "failed". */
   readonly failurePhase?: WorkflowRunPhase;
   /** The immutable selected issue identity (absent for "no-issues"). */
@@ -2427,7 +2434,9 @@ export const runIssueWorkflow = async (
         ? { worktreePath: resume.worktreePath }
         : {}),
       completionSignalSeen: false,
-      ...(resume.sessionId !== undefined ? { sessionId: resume.sessionId } : {}),
+      ...(resume.sessionId !== undefined
+        ? { sessionId: resume.sessionId }
+        : {}),
       ...(resume.logFilePath !== undefined
         ? { logFilePath: resume.logFilePath }
         : {}),
@@ -2447,18 +2456,36 @@ export const runIssueWorkflow = async (
     preservedWorktreeUsable = artifacts.worktreeUsable;
     preservedCommits.push(...artifacts.preservedCommits);
     if (!preservedWorktreeUsable && preservedCommits.length === 0) {
-      // No committed work on the branch (never committed, reset, or already
-      // merged elsewhere) and no usable worktree — nothing to continue.
+      // An empty `preservedCommits` is only one of three honest diagnoses —
+      // a comparison that could not run (missing/renamed target, git
+      // failure) is UNKNOWN, and a run that never committed is INCOMPLETE:
+      // neither may be reported as "already merged elsewhere" (F030/F072).
+      const diagnosis = !artifacts.branchExists
+        ? `đã lỗi thời: nhánh \`${sourceBranch}\` không còn tồn tại`
+        : artifacts.comparison === "target-missing"
+          ? `không xác định được trạng thái: nhánh đích \`${resume.targetBranch}\` ` +
+            "không còn — không so sánh được số commit chưa merge"
+          : artifacts.comparison !== "ok"
+            ? `không xác định được trạng thái: không so sánh được nhánh ` +
+              `\`${sourceBranch}\` với nhánh đích \`${resume.targetBranch}\``
+            : resume.commits.length === 0
+              ? `chưa hoàn thành: lần chạy chưa tạo commit nào trên nhánh ` +
+                `\`${sourceBranch}\` (công việc chưa từng tồn tại — không phải đã merge)`
+              : `đã lỗi thời: nhánh \`${sourceBranch}\` không còn commit nào ` +
+                "chưa merge (có thể đã merge ở nơi khác hoặc đã bị reset)";
+      const guidance =
+        artifacts.comparison !== "ok" && artifacts.branchExists
+          ? // Unknown is never "nothing to continue" — the branch may still
+            // hold unmerged work; it needs a human look, not a blind claim.
+            ". Kiểm tra nhánh thủ công trước — nếu cần xóa bản ghi, " +
+            `chạy \`sandcastle discard ${issue.number}\`.`
+          : `. Không có công việc nào để tiếp tục — chạy \`sandcastle discard ${issue.number}\` để xóa bản ghi.`;
       throw new WorkflowRunError(
-        `Bản ghi phục hồi cho issue #${issue.number} đã lỗi thời: ` +
-          (artifacts.branchExists
-            ? `nhánh \`${sourceBranch}\` không còn commit nào chưa merge ` +
-              "(có thể đã merge ở nơi khác hoặc đã bị reset)"
-            : `nhánh \`${sourceBranch}\` không còn tồn tại`) +
+        `Bản ghi phục hồi cho issue #${issue.number} ${diagnosis}` +
           (resume.worktreePath !== undefined
             ? `, và worktree \`${resume.worktreePath}\` đã mất`
             : "") +
-          `. Không có công việc nào để tiếp tục — chạy \`sandcastle discard ${issue.number}\` để xóa bản ghi.`,
+          guidance,
       );
     }
     if (
@@ -3147,9 +3174,7 @@ export const runIssueWorkflow = async (
     worktreePath: wt.worktreePath,
     completionSignalSeen: lastCompletionSignal !== undefined,
     ...(lastSessionId !== undefined ? { sessionId: lastSessionId } : {}),
-    ...(lastLogFilePath !== undefined
-      ? { logFilePath: lastLogFilePath }
-      : {}),
+    ...(lastLogFilePath !== undefined ? { logFilePath: lastLogFilePath } : {}),
     attempts,
   });
 };
@@ -3182,11 +3207,14 @@ export interface RunIssueQueueOptions {
 /** Structured result of one queued `sandcastle run --all` invocation. */
 export interface WorkflowQueueResult {
   /**
-   * `"landed"` — every queued issue landed. `"failed"` — at least one issue
-   * failed (per-issue results carry the details; landed issues still landed
-   * and were closed). `"no-issues"` — the eligible list was empty.
+   * `"landed"` — every queued issue landed. `"skipped"` — nothing failed
+   * but at least one issue was skipped because it already has a recovery
+   * record (`sandcastle retry` continues it — ADR 0024). `"failed"` — at
+   * least one issue failed (per-issue results carry the details; landed
+   * issues still landed and were closed). `"no-issues"` — the eligible list
+   * was empty.
    */
-  readonly outcome: "landed" | "failed" | "no-issues";
+  readonly outcome: "landed" | "failed" | "no-issues" | "skipped";
   /** The concurrency bound actually applied (1–4). */
   readonly parallelism: number;
   /** Per-issue results in queue order (issue number ascending). */
@@ -3237,10 +3265,15 @@ const mapWithConcurrency = async <A, R>(
  * integrate → re-verify → land section are serialized, which is also what
  * protects the common target branch from merge races.
  *
- * A failing issue never aborts the others: in-flight issues finish and the
- * queue continues, then the Vietnamese summary names landed vs failed
- * issues. The outcome is `"failed"` when at least one issue failed, so the
- * CLI can exit non-zero while landed issues stay landed.
+ * An issue that already has a recovery record is never reimplemented here
+ * (F042, ADR 0024): the worker checks `readRecoveryState` before creating
+ * any task work and skips it with a `sandcastle retry` instruction instead
+ * — `"skipped"`. A failing issue never aborts the others: in-flight issues
+ * finish and the queue continues, then the Vietnamese summary names landed,
+ * skipped, and failed issues — claiming "recovery state để retry" only for
+ * failures whose record actually exists on disk (F046). The outcome is
+ * `"failed"` when at least one issue failed, so the CLI can exit non-zero
+ * while landed issues stay landed.
  */
 export const runIssueQueueWorkflow = async (
   options: RunIssueQueueOptions,
@@ -3302,6 +3335,42 @@ export const runIssueQueueWorkflow = async (
     async (issue) => {
       const issueStatus = (message: string, severity: Severity = "info") =>
         status(`[#${issue.number}] ${message}`, severity);
+      // Recovery gate (F042, ADR 0024): a durable record means preserved work
+      // exists for this issue — the queue must skip it and point at
+      // `sandcastle retry`, never implicitly consume the record or start the
+      // implementation over. The check runs inside the worker, right before
+      // the issue's turn, so a record written while earlier issues ran is
+      // still honored; it is read-only and needs no lock.
+      const existing = await readRecoveryState(cwd, issue.number);
+      if (existing.kind !== "missing") {
+        const message =
+          existing.kind === "ok"
+            ? `Issue #${issue.number} đã có công việc được giữ lại — bỏ qua, ` +
+              "không chạy lại từ đầu. Chạy " +
+              `\`sandcastle retry ${issue.number}\` để tiếp tục, hoặc ` +
+              `\`sandcastle discard ${issue.number}\` để xóa.`
+            : `Issue #${issue.number} có bản ghi phục hồi bị hỏng — bỏ qua, ` +
+              "không chạy lại từ đầu. `sandcastle retry`/`discard` không xử " +
+              `lý được bản ghi hỏng — sửa hoặc xóa tệp thủ công: ${existing.path} ` +
+              `(${firstLine(existing.detail)}).`;
+        issueStatus(message, "warn");
+        return {
+          outcome: "skipped" as const,
+          issue,
+          commits: [],
+          verification: [],
+          completionSignalSeen: false,
+          reportPosted: false,
+          issueClosed: false,
+          attempts: {
+            implementation: 0,
+            verificationRepair: 0,
+            mergeConflictRepair: 0,
+            integrationRebuild: 0,
+          },
+          message,
+        };
+      }
       try {
         // The per-issue run is the unchanged single-issue pipeline: own branch,
         // worktree, integration worktree, verification, landing, report, and
@@ -3326,6 +3395,8 @@ export const runIssueQueueWorkflow = async (
       } catch (e) {
         // A pre-pipeline failure (e.g. the issue went stale between listing and
         // its turn) must not abort the queue — record it as a failed issue.
+        // NOTE: this path writes NO recovery record — the summary must not
+        // claim one exists (F046); the read-back below keeps it honest.
         const detail = e instanceof Error ? e.message : String(e);
         issueStatus(`Thất bại: ${firstLine(detail)}`, "warn");
         return {
@@ -3350,7 +3421,8 @@ export const runIssueQueueWorkflow = async (
   );
 
   const landed = results.filter((r) => r.outcome === "landed");
-  const failed = results.filter((r) => r.outcome !== "landed");
+  const skipped = results.filter((r) => r.outcome === "skipped");
+  const failed = results.filter((r) => r.outcome === "failed");
   const targetBranch = results
     .map((r) => r.targetBranch)
     .find((b): b is string => b !== undefined);
@@ -3359,18 +3431,60 @@ export const runIssueQueueWorkflow = async (
   const landedTarget =
     targetBranch !== undefined ? ` vào \`${targetBranch}\`` : "";
 
+  // "Giữ recovery state để retry" may only be claimed for a failure that
+  // actually left a readable record (F046): a pre-pipeline throw never
+  // writes one, and `writeRecoveryState` itself can fail — `retry` would
+  // then report "no record found", so the summary reads the durable state
+  // back instead of assuming.
+  const failedWithRecord: WorkflowRunResult[] = [];
+  const failedNoRecord: WorkflowRunResult[] = [];
+  for (const r of failed) {
+    const n = r.issue?.number;
+    const rec =
+      n === undefined
+        ? ({ kind: "missing" } as const)
+        : await readRecoveryState(cwd, n);
+    (rec.kind === "ok" ? failedWithRecord : failedNoRecord).push(r);
+  }
+
+  const detailParts: string[] = [];
+  if (landed.length > 0) {
+    detailParts.push(`đã merge${landedTarget}: ${issueList(landed)}`);
+  }
+  if (skipped.length > 0) {
+    detailParts.push(
+      `bỏ qua ${issueList(skipped)} — đã có bản ghi phục hồi; ` +
+        "chạy `sandcastle retry <số-issue>` để tiếp tục công việc được giữ lại",
+    );
+  }
+  if (failedWithRecord.length > 0) {
+    detailParts.push(
+      `thất bại: ${issueList(failedWithRecord)} ` +
+        "(vẫn mở, giữ recovery state để retry)",
+    );
+  }
+  if (failedNoRecord.length > 0) {
+    detailParts.push(
+      `thất bại: ${issueList(failedNoRecord)} ` +
+        "(vẫn mở — không có bản ghi phục hồi khả dụng nên `sandcastle retry` " +
+        "không dùng được; kiểm tra lỗi rồi chạy lại)",
+    );
+  }
+
   const message =
-    failed.length === 0
-      ? `Hoàn thành tất cả ${landed.length} issue — đã merge${landedTarget}: ${issueList(landed)}.`
+    failed.length === 0 && skipped.length === 0
+      ? `Hoàn thành tất cả ${landed.length} issue — ${detailParts.join("; ")}.`
       : landed.length === 0
-        ? `Cả ${failed.length} issue đều thất bại: ${issueList(failed)} — không có thay đổi nào được merge. ` +
-          "Các issue vẫn mở và giữ recovery state để retry."
+        ? `Không có issue nào được merge — ${detailParts.join("; ")}.`
         : `Hoàn thành ${landed.length}/${results.length} issue — ` +
-          `đã merge${landedTarget}: ${issueList(landed)}; ` +
-          `thất bại: ${issueList(failed)} (vẫn mở, giữ recovery state để retry).`;
+          `${detailParts.join("; ")}.`;
 
   return {
-    outcome: failed.length === 0 ? "landed" : "failed",
+    // A skip is not a failure — preserved work stays untouched under its
+    // record and the message names the `retry` path. The queue fails only
+    // when an issue actually failed.
+    outcome:
+      failed.length > 0 ? "failed" : skipped.length > 0 ? "skipped" : "landed",
     parallelism,
     results,
     message,

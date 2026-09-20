@@ -21,6 +21,11 @@ import {
 } from "./SandboxProvider.js";
 import { noSandbox } from "./sandboxes/no-sandbox.js";
 import {
+  RECOVERY_STATE_VERSION,
+  writeRecoveryState,
+  type RecoveryState,
+} from "./recovery.js";
+import {
   aggregateVerificationStatus,
   bindVerificationExec,
   buildCompletionReport,
@@ -33,6 +38,7 @@ import {
   fencedBlock,
   hostVerificationExec,
   PHASE_LABEL,
+  runIssueQueueWorkflow,
   runIssueWorkflow,
   runVerificationCommands,
   type VerificationExec,
@@ -1140,6 +1146,113 @@ console.log(JSON.stringify({ type: "text", part: { type: "text", text: "done <pr
     );
     // timedOut survives the recovery-record round-trip.
     expect(recovery.verification[0].timedOut).toBe(true);
+  });
+
+  it("queue: an issue with a recovery record is skipped toward retry, never reimplemented", async () => {
+    const repoDir = await makeRepo();
+    await writeSettings(repoDir, []);
+    // A durable record as a failed run would have left it (F042): the queue
+    // must skip this issue and direct the user to `sandcastle retry` — never
+    // re-select it and start implementation over.
+    const state: RecoveryState = {
+      version: RECOVERY_STATE_VERSION,
+      // Parsed GithubIssue shape (labels as strings — the gh JSON shape the
+      // fixture ISSUE_5 uses is the wire format, not the parsed model).
+      issue: {
+        number: ISSUE_5.number,
+        title: ISSUE_5.title,
+        body: ISSUE_5.body,
+        state: ISSUE_5.state,
+        labels: ["Sandcastle"],
+        url: ISSUE_5.url,
+      },
+      sourceBranch: "sandcastle/issue-5",
+      targetBranch: "main",
+      failurePhase: "verification",
+      error: "boom",
+      verification: [],
+      commits: [{ sha: "deadbeef" }],
+      attempts: {
+        implementation: 1,
+        verificationRepair: 0,
+        mergeConflictRepair: 0,
+        integrationRebuild: 0,
+      },
+      retryCount: 0,
+      failedAt: new Date().toISOString(),
+    };
+    await writeRecoveryState(repoDir, state);
+
+    const statuses: string[] = [];
+    const result = await runIssueQueueWorkflow({
+      cwd: repoDir,
+      ghRunner,
+      discoveryExec,
+      onStatus: (m) => statuses.push(m),
+    });
+
+    expect(result.outcome).toBe("skipped");
+    expect(result.results.length).toBe(1);
+    expect(result.results[0]!.outcome).toBe("skipped");
+    expect(result.results[0]!.issue?.number).toBe(5);
+    // The per-issue message names the exact command; the summary names the
+    // retry path generically.
+    expect(result.results[0]!.message).toContain("sandcastle retry 5");
+    expect(result.message).toContain("sandcastle retry");
+    // No task work was created: no worktree, no branch, no agent invocation —
+    // the record is only consumed by `sandcastle retry`, never by the queue.
+    expect(statuses.some((m) => m.includes("bỏ qua"))).toBe(true);
+    expect(
+      execSync("git worktree list --porcelain", {
+        cwd: repoDir,
+        encoding: "utf-8",
+      }).match(/^worktree /gm)?.length,
+    ).toBe(1);
+    expect(
+      execSync("git branch --list sandcastle/issue-5", {
+        cwd: repoDir,
+        encoding: "utf-8",
+      }),
+    ).toBe("");
+    // The record itself is untouched.
+    const read = JSON.parse(
+      await readFile(
+        join(repoDir, ".sandcastle", "recovery", "issue-5.json"),
+        "utf-8",
+      ),
+    );
+    expect(read.issue.number).toBe(5);
+  });
+
+  it("queue: the summary never claims recovery for a failure whose record write failed", async () => {
+    const repoDir = await makeRepo();
+    await writeSettings(repoDir, ["check"]);
+    // `.sandcastle/recovery` exists as a FILE — `writeRecoveryState`'s mkdir
+    // cannot create the directory, so no durable record is ever written and
+    // the summary must not promise `retry` a state that does not exist
+    // (F046).
+    await writeFile(join(repoDir, ".sandcastle", "recovery"), "not a dir");
+    const verificationExec: VerificationExec = async () => ({
+      stdout: "",
+      stderr: "boom",
+      exitCode: 1,
+    });
+
+    const result = await runIssueQueueWorkflow({
+      cwd: repoDir,
+      ghRunner,
+      discoveryExec,
+      verificationExec,
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.results[0]!.outcome).toBe("failed");
+    expect(result.message).toContain("thất bại");
+    expect(result.message).not.toContain("giữ recovery state");
+    expect(result.message).toContain("không có bản ghi phục hồi");
+    expect(result.results[0]!.message).toContain(
+      "Không ghi được bản ghi phục hồi",
+    );
   });
 });
 
