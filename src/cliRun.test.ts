@@ -1,10 +1,11 @@
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import {
   access,
   chmod,
   mkdir,
   mkdtemp,
   readFile,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1330,5 +1331,97 @@ describe("sandcastle status / retry / discard (CLI seam)", () => {
       expect(stdout + stderr).toContain("discard");
     }
     expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+  });
+
+  it("a held retry lock rejects a concurrent retry before it mutates worktree or git index (#36/F065)", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5]);
+    const verifyCmd = `echo VERIFY >> "${logFile}" && false`;
+    await writeSettings(repoDir, { verificationCommands: [verifyCmd] });
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+
+    // Simulate a second process already retrying: a lock file naming a LIVE
+    // pid (this test process) must be refused, not broken or deleted.
+    const lockPath = join(repoDir, ".sandcastle", "recovery", "issue-5.lock");
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+      }) + "\n",
+    );
+
+    const before = await readLog(logFile);
+    try {
+      await runCli("retry 5", repoDir, env);
+      expect.fail("Expected retry to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      // The refusal names the lock file and the holding pid, and explains
+      // how to clear a stale lock.
+      expect(stdout + stderr).toContain("issue-5.lock");
+      expect(stdout + stderr).toContain(String(process.pid));
+    }
+
+    // The rejection happened BEFORE the workflow could mutate anything: no
+    // agent ran and no GitHub mutation was attempted.
+    const delta = (await readLog(logFile)).slice(before.length);
+    expect(
+      delta.filter((l) => l === "AGENT" || l.startsWith("AGENT_RESUME")).length,
+    ).toBe(0);
+    expect(delta.some((l) => l.startsWith("gh "))).toBe(false);
+    // The foreign lock and the recovery record are both left alone.
+    expect(await exists(lockPath)).toBe(true);
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+
+    // Removing the stale lock file (the documented cleanup) unblocks retry:
+    // the next attempt gets past the lock and runs the workflow — then
+    // releases its own lock even though the run fails again.
+    await rm(lockPath);
+    await expect(runCli("retry 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    const delta2 = (await readLog(logFile)).slice(before.length + delta.length);
+    expect(delta2.some((l) => l.startsWith("AGENT") || l === "VERIFY")).toBe(
+      true,
+    );
+    expect(await exists(lockPath)).toBe(false);
+  });
+
+  it("a stale retry lock from a dead process is broken instead of blocking retry", async () => {
+    const { repoDir, logFile, env } = await makeFixture([ISSUE_5], {
+      FAKE_CLAUDE_FAIL: "1",
+    });
+    await writeSettings(repoDir);
+
+    await expect(runCli("run --issue 5", repoDir, env)).rejects.toMatchObject({
+      code: 1,
+    });
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(true);
+
+    // A crashed retry leaves a lock naming a dead pid — get one by letting a
+    // trivial child exit first.
+    const deadPid = await new Promise<number>((resolve, reject) => {
+      const child = spawn(process.execPath, ["-e", ""]);
+      child.on("exit", () => resolve(child.pid!));
+      child.on("error", reject);
+    });
+    const lockPath = join(repoDir, ".sandcastle", "recovery", "issue-5.lock");
+    await writeFile(
+      lockPath,
+      JSON.stringify({ pid: deadPid, startedAt: new Date().toISOString() }) +
+        "\n",
+    );
+
+    // The agent is healthy now: retry breaks the stale lock, lands, and
+    // removes its own lock file on the way out.
+    const env2 = { ...env, FAKE_CLAUDE_FAIL: "0" };
+    const { stdout } = await runCli("retry 5", repoDir, env2);
+    expect(stdout).toContain("Hoàn thành issue #5");
+    expect(await exists(lockPath)).toBe(false);
+    expect(await exists(recoveryPath(repoDir, 5))).toBe(false);
   });
 });

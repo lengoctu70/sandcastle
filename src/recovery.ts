@@ -11,6 +11,7 @@ import {
 import { isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 
+import { atomicWriteFile } from "./atomicFile.js";
 import type { GithubIssue } from "./githubIssues.js";
 import type {
   VerificationCommandResult,
@@ -414,8 +415,14 @@ export const listRecoveryStates = async (
 };
 
 /**
- * Persist a recovery record. Also keeps `recovery/` ignored by appending it to
- * the scaffolded `.sandcastle/.gitignore` — recovery state is machine-local.
+ * Persist a recovery record. The record is written through
+ * {@link atomicWriteFile} — a same-directory temp file, fsynced, then
+ * atomically renamed into place — so an interruption can never leave the
+ * sole durable record truncated or half-written, and a failed replacement
+ * leaves the previously written record intact (F064).
+ *
+ * Also keeps `recovery/` ignored by appending it to the scaffolded
+ * `.sandcastle/.gitignore` — recovery state is machine-local.
  */
 export const writeRecoveryState = async (
   cwd: string,
@@ -423,10 +430,17 @@ export const writeRecoveryState = async (
 ): Promise<void> => {
   const dir = recoveryDir(cwd);
   await mkdir(dir, { recursive: true });
-  await writeFile(
-    recoveryStatePath(cwd, state.issue.number),
-    JSON.stringify(state, null, 2) + "\n",
-  );
+  const path = recoveryStatePath(cwd, state.issue.number);
+  try {
+    await atomicWriteFile(path, JSON.stringify(state, null, 2) + "\n");
+  } catch (e) {
+    throw new Error(
+      `Không ghi được bản ghi phục hồi tại "${path}": ` +
+        `${e instanceof Error ? e.message : String(e)}. ` +
+        "Bản ghi cũ (nếu có) được giữ nguyên — kiểm tra quyền ghi và dung " +
+        "lượng ổ đĩa rồi chạy lại.",
+    );
+  }
   const gitignorePath = join(cwd, ".sandcastle", ".gitignore");
   try {
     const content = await readFile(gitignorePath, "utf-8");
@@ -450,6 +464,186 @@ export const clearRecoveryState = async (
   await rm(recoveryStatePath(cwd, issueNumber), { force: true }).catch(
     () => {},
   );
+};
+
+// ---------------------------------------------------------------------------
+// Per-issue retry exclusion (F065)
+//
+// `sandcastle retry <N>` mutates the preserved worktree and the repository's
+// Git index — two concurrent retries for the same issue would collide on
+// both. The lock is a lock FILE at `.sandcastle/recovery/issue-<N>.lock`
+// created with `O_EXCL` (`wx`), which is atomic on every supported platform
+// (no lockfile dependency). The `.lock` suffix keeps it out of the
+// `listRecoveryStates` `.json` glob, so a held lock never surfaces as a
+// corrupt record.
+//
+// The file records the holder's pid + start time for diagnostics. A lock
+// whose recorded process is gone is treated as stale: it is re-inspected by
+// inode (to be sure it is still the same file) and removed, then acquisition
+// is retried once. A lock held by a live process — or one whose contents
+// cannot be attributed to a process at all — rejects the retry with a
+// {@link RetryLockHeldError} that names the lock file for manual cleanup;
+// an unattributable file is never silently deleted.
+// ---------------------------------------------------------------------------
+
+/** Absolute path of the per-issue retry lock file. */
+export const retryLockPath = (cwd: string, issueNumber: number): string =>
+  join(recoveryDir(cwd), `issue-${issueNumber}.lock`);
+
+/**
+ * Raised when another process already holds the retry lock for an issue —
+ * or when a leftover lock file cannot be attributed to a process. The
+ * message names the lock path so a stale file can be removed by hand.
+ */
+export class RetryLockHeldError extends Error {
+  readonly _tag: "RetryLockHeldError" = "RetryLockHeldError";
+  constructor(
+    readonly lockPath: string,
+    readonly issueNumber: number,
+    readonly holderDetail: string,
+  ) {
+    super(
+      `Đã có một tiến trình retry khác đang giữ khóa cho issue #${issueNumber} ` +
+        `(${holderDetail}) — chạy đồng thời hai lần retry trên cùng một ` +
+        "worktree sẽ làm hỏng Git index và commit. Đợi tiến trình kia xong; " +
+        `nếu nó đã dừng đột ngột, xóa tệp khóa \`${lockPath}\` rồi chạy lại ` +
+        `\`sandcastle retry ${issueNumber}\`.`,
+    );
+    this.name = "RetryLockHeldError";
+  }
+}
+
+/** A held retry lock. Call {@link RetryLock.release} exactly once. */
+export interface RetryLock {
+  /** Path of the lock file this process created. */
+  readonly path: string;
+  /**
+   * Remove the lock file — but only while it still holds THIS acquisition's
+   * payload, so a release can never delete a newer holder's lock.
+   */
+  readonly release: () => Promise<void>;
+}
+
+interface LockPayload {
+  readonly pid: number;
+  readonly startedAt?: string;
+}
+
+const parseLockPayload = (content: string): LockPayload | undefined => {
+  try {
+    const raw: unknown = JSON.parse(content);
+    if (
+      typeof raw === "object" &&
+      raw !== null &&
+      typeof (raw as Record<string, unknown>)["pid"] === "number"
+    ) {
+      const pid = (raw as Record<string, unknown>)["pid"] as number;
+      const startedAt = (raw as Record<string, unknown>)["startedAt"];
+      return {
+        pid,
+        ...(typeof startedAt === "string" ? { startedAt } : {}),
+      };
+    }
+  } catch {
+    // Unparseable — the holder cannot be identified.
+  }
+  return undefined;
+};
+
+/**
+ * Is `pid` a live process? Signal 0 probes existence without delivering a
+ * signal; EPERM means the process exists but is owned by someone else (still
+ * held), ESRCH means it is gone (stale lock).
+ */
+const pidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+const describeHolder = (payload: LockPayload | undefined): string =>
+  payload === undefined
+    ? "tệp khóa không đọc được tiến trình giữ"
+    : `pid ${payload.pid}` +
+      (payload.startedAt !== undefined
+        ? `, bắt đầu lúc ${payload.startedAt}`
+        : "");
+
+/**
+ * Acquire the per-issue retry lock. Resolves with a {@link RetryLock} once
+ * the lock file is created; rejects with {@link RetryLockHeldError} when
+ * another live process holds it, or with the raw filesystem error when the
+ * lock file cannot be created at all.
+ *
+ * This is an advisory lock: the stale-breaking path re-stats by inode before
+ * unlinking, which narrows — but cannot fully eliminate — the window where a
+ * lock is replaced between inspection and removal. Callers must treat
+ * acquisition as the single retry gate: acquire BEFORE mutating the worktree
+ * or Git index, and release when done (including on failure).
+ */
+export const acquireRetryLock = async (
+  cwd: string,
+  issueNumber: number,
+): Promise<RetryLock> => {
+  const dir = recoveryDir(cwd);
+  await mkdir(dir, { recursive: true });
+  const path = retryLockPath(cwd, issueNumber);
+  const payload =
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) +
+    "\n";
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // O_EXCL create — atomic cross-platform; fails EEXIST when held.
+      await writeFile(path, payload, { flag: "wx" });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+
+      const [content, st] = await Promise.all([
+        readFile(path, "utf-8").catch(() => undefined),
+        stat(path).catch(() => undefined),
+      ]);
+      const holder =
+        content !== undefined ? parseLockPayload(content) : undefined;
+
+      if (
+        attempt === 0 &&
+        holder !== undefined &&
+        !pidAlive(holder.pid) &&
+        st !== undefined
+      ) {
+        // Stale lock from a dead process. Re-stat and remove ONLY if it is
+        // still the exact file we inspected — if another process already
+        // broke it and wrote its own, the inode/mtime differ and the next
+        // loop iteration will see that live lock and refuse.
+        const again = await stat(path).catch(() => undefined);
+        if (
+          again !== undefined &&
+          again.ino === st.ino &&
+          again.mtimeMs === st.mtimeMs
+        ) {
+          await rm(path, { force: true }).catch(() => {});
+        }
+        continue;
+      }
+      throw new RetryLockHeldError(path, issueNumber, describeHolder(holder));
+    }
+
+    return {
+      path,
+      release: async () => {
+        const current = await readFile(path, "utf-8").catch(() => undefined);
+        // Gone already, or still ours → remove. Anything else means another
+        // holder replaced it — leave that file alone.
+        if (current === undefined || current === payload) {
+          await rm(path, { force: true }).catch(() => {});
+        }
+      },
+    };
+  }
 };
 
 // ---------------------------------------------------------------------------
