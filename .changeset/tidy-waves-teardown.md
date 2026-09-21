@@ -1,5 +1,0 @@
----
-"@lengoctu70/sandcastle": patch
----
-
-Make host-mode agent invocation outcomes and teardown truthful. An early child exit while the prompt is being written now surfaces as a handled invocation failure instead of an unhandled `EPIPE` crash, and a process killed by a signal reports a non-zero exit code (128 + signal, e.g. 137/143) rather than a disguised success. Each invocation now owns an internal abort controller: caller cancellation, idle timeout, and the ADR 0019 completion timeout all abort the spawned process tree and wait — bounded — for it to fully settle before `invokeAgent` returns, so lifecycle Git operations (`checkout --detach`, merge, branch cleanup) never overlap a live agent tree. The silence-based completion window is unchanged: trailing output still resets it and no absolute deadline was added. Completion-signal detection now accumulates across the whole streamed conversation, so a signal seen in an earlier turn survives a later result event that drops it. On POSIX, teardown no longer attempts `kill(-pid)` for non-detached children whose pid may have been recycled as an unrelated process group.

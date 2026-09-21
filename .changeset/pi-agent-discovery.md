@@ -1,5 +1,0 @@
----
-"@lengoctu70/sandcastle": minor
----
-
-Add Pi to host-mode agent discovery. `sandcastle init --agent pi --sandbox host` now probes the `pi` executable through the same injectable process boundary as Codex — fingerprinting `pi --help` for the `pi - AI coding assistant` line (the bare `pi --version` carries no product string), treating `pi --list-models`' "No models available" message as the unauthenticated signal, and parsing its live provider/model table so you pick from models your configured providers can actually serve, grouped by model provider. Pi's thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) surface as effort choices with `medium` as the default, and `pi auth check --provider <p> --json --no-refresh` supplies read-only auth evidence per discovered provider. The selection persists to `settings.json` as `modelSource: "discovered"` and generates `pi("<provider>/<model>", { thinking: "<level>" })` in `main.mts`. `PiOptions.thinking` now accepts `"max"`, matching the CLI's level set.

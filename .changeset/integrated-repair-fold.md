@@ -1,5 +1,0 @@
----
-"@lengoctu70/sandcastle": patch
----
-
-A verification failure that appears only in the integrated tree is now repairable instead of an immediate stop (ADR 0024). The merger-role agent repairs the already-merged state inside the integration worktree — same bounded pattern as source-stage repair, with the integrated failure's exact command and head+tail diagnostic fenced into the prompt — for at most two attempts, each re-running all configured verification commands on the merged tree. Every committed repair is folded back onto the source branch with a fast-forward merge, so the fix survives the disposable integration worktree, is included when a target-drift rebuild re-merges, and is what a later `sandcastle retry` integrates — a retry never replays the unchanged merge known to fail. A repair that leaves the worktree dirty fails honestly rather than landing unverified state. The recovery record and run reports carry the new `integrationVerificationRepair` attempt counter alongside the existing budgets.
